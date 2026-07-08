@@ -1,13 +1,22 @@
 # Actions are SHA-pinned in the workflows; dependabot proposes the bumps so
 # pinning does not mean freezing. Cargo updates surface supply-chain-relevant
 # dependency changes for review instead of resolving silently.
+#
+# Updates arrive as one grouped PR per ecosystem, monthly: enough to stay
+# current, without a branch spray after every upstream release.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      crates:
+        patterns: ["*"]
