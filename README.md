@@ -4,6 +4,8 @@
 
 **Check an iPhone sysdiagnose for traces of known mercenary spyware - entirely in your browser.**
 
+**Live: https://ianonymous3000.github.io/tracescan/**
+
 Trace makes credible spyware forensics accessible to people who have never opened a terminal, without asking them to trust anyone with their data. Parsing and indicator matching run as a Rust/WebAssembly module inside the browser tab. **There is no upload endpoint - the privacy claim is architectural, not a policy promise**, and you can verify it yourself: load the page, turn on Airplane Mode, and scan.
 
 ## How it works
