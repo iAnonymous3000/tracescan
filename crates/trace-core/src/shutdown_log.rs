@@ -15,9 +15,9 @@
 //! starts again low), which is more stable across iOS versions than any
 //! particular phase-marker line.
 
-use crate::heuristics::{path_flag, PathFlag};
+use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
-use crate::report::{ArtifactSummary, Finding, Severity};
+use crate::report::{ArtifactSummary, Finding};
 use regex_lite::Regex;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,26 +111,8 @@ pub fn analyze(
             ));
         }
 
-        match path_flag(proc_path) {
-            Some(PathFlag::Staging) => findings.push(Finding::heuristic(
-                Severity::Suspicious,
-                path,
-                format!(
-                    "A process ran from {} - this staging directory is strongly associated with Pegasus infections in published research (Kaspersky iShutdown, 2024)",
-                    proc_path
-                ),
-                evidence.clone(),
-            )),
-            Some(PathFlag::UnusualLocation) => findings.push(Finding::heuristic(
-                Severity::Note,
-                path,
-                format!(
-                    "A process ran from an unusual location ({}) - often benign, but worth review alongside other findings",
-                    proc_path
-                ),
-                evidence.clone(),
-            )),
-            None => {}
+        if let Some(f) = path_flag_finding(path, proc_path, "A process ran from", &evidence) {
+            findings.push(f);
         }
     }
 
@@ -148,6 +130,7 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Severity;
 
     const SAMPLE: &str = "\
 %%%%% Entering phase: Waiting for apps to exit

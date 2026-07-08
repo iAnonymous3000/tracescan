@@ -14,7 +14,7 @@ Trace makes credible spyware forensics accessible to people who have never opene
 2. AirDrop the `sysdiagnose_….tar.gz` file to a computer.
 3. Drag it into the Trace page. Analysis takes well under two minutes.
 
-The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory (hard-capped, so a crafted archive cannot exhaust it), and nothing leaves the machine. Three artifact types are analyzed:
+The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory (hard-capped, so a crafted archive cannot exhaust it), and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. Three artifact types are analyzed:
 
 | Artifact | Signal |
 |---|---|
@@ -46,7 +46,7 @@ cargo run --release --example scan -- <sysdiagnose.tar.gz> web/iocs/*.stix2
 cd e2e && npm install && npx playwright install chromium && npm test
 ```
 
-Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` (fixtures), and Node (E2E only). The demo fixtures are synthetic sysdiagnose archives, generated deterministically; the "infected" one seeds a real Pegasus process-name indicator so the genuine match path is exercised end-to-end.
+Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` and `bsdtar` (fixtures; bsdtar is the macOS default tar), and Node (E2E only). The demo fixtures are synthetic sysdiagnose archives, generated deterministically; the "infected" one seeds a real Pegasus process-name indicator so the genuine match path is exercised end-to-end.
 
 Layout:
 

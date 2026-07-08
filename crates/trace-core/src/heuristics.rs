@@ -1,5 +1,8 @@
 //! Path-based heuristic classification shared by all three artifact parsers,
-//! so the definition of "suspicious location" cannot drift between surfaces.
+//! so the definition of "suspicious location" - and the finding text it
+//! produces - cannot drift between surfaces.
+
+use crate::report::{Finding, Severity};
 
 /// How a process path should be flagged, if at all.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -24,6 +27,35 @@ pub fn path_flag(path: &str) -> Option<PathFlag> {
         return Some(PathFlag::UnusualLocation);
     }
     None
+}
+
+/// Builds the standard finding for a flagged path. `subject` opens the
+/// sentence and names the surface, e.g. "A process ran from".
+pub fn path_flag_finding(
+    artifact: &str,
+    proc_path: &str,
+    subject: &str,
+    evidence: &serde_json::Value,
+) -> Option<Finding> {
+    let finding = match path_flag(proc_path)? {
+        PathFlag::Staging => Finding::heuristic(
+            Severity::Suspicious,
+            artifact,
+            format!(
+                "{subject} {proc_path} - this staging directory is strongly associated with Pegasus infections in published research (Kaspersky iShutdown, 2024)"
+            ),
+            evidence.clone(),
+        ),
+        PathFlag::UnusualLocation => Finding::heuristic(
+            Severity::Note,
+            artifact,
+            format!(
+                "{subject} an unusual location ({proc_path}) - often benign, but worth review alongside other findings"
+            ),
+            evidence.clone(),
+        ),
+    };
+    Some(finding)
 }
 
 #[cfg(test)]

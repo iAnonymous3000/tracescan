@@ -50,11 +50,31 @@ function showSection(name) {
   $('#about').hidden = name === 'scanning';
 }
 
+// Returning from results, keyboard focus lands on the next action instead
+// of being lost on the removed button.
+function backToLanding() {
+  showSection('landing');
+  $('#dropzone').focus();
+}
+
 /* ---------- indicator loading ---------- */
+
+// The scanner rejects anything without an objects array, so a live file
+// that fails this must fall back to the bundled snapshot - accepting it
+// would take scanning down entirely (e.g. a valid-JSON rate-limit page).
+function isStixBundle(text) {
+  try {
+    return Array.isArray(JSON.parse(text).objects);
+  } catch {
+    return false;
+  }
+}
 
 async function loadIndicators() {
   const manifest = await (await fetch('./iocs/manifest.json')).json();
-  for (const set of manifest.sets) {
+  // Sets refresh in parallel: on a network that silently drops the requests,
+  // sequential 6-second timeouts would stall the panel for their sum.
+  state.stix = await Promise.all(manifest.sets.map(async (set) => {
     let text = null;
     let loaded_from = 'bundled';
     let date = manifest.bundled_date;
@@ -63,20 +83,22 @@ async function loadIndicators() {
     try {
       const r = await fetchWithTimeout(set.url, 6000);
       if (r.ok) {
-        text = await r.text();
-        JSON.parse(text); // sanity: don't accept a non-JSON error page
-        loaded_from = 'live';
-        date = new Date().toISOString().slice(0, 10);
-        etag = r.headers.get('etag');
-        last_modified = r.headers.get('last-modified');
+        const live = await r.text();
+        if (isStixBundle(live)) {
+          text = live;
+          loaded_from = 'live';
+          date = new Date().toISOString().slice(0, 10);
+          etag = r.headers.get('etag');
+          last_modified = r.headers.get('last-modified');
+        }
       }
     } catch { /* offline or blocked - bundled snapshot below */ }
     if (!text) {
       text = await (await fetch(set.file)).text();
     }
     const sha256 = await sha256hex(text);
-    state.stix.push({ ...set, text, loaded_from, date, sha256, etag, last_modified });
-  }
+    return { ...set, text, loaded_from, date, sha256, etag, last_modified };
+  }));
 }
 
 function newScanner() {
@@ -185,8 +207,18 @@ async function handleFile(file) {
     let report;
     if (worker) {
       state.lastScanVia = 'worker';
-      report = await scanWithWorker(file);
-    } else {
+      try {
+        report = await scanWithWorker(file);
+      } catch (err) {
+        // A crashed worker (worker is now null) is an environment problem,
+        // not a verdict about the file: retry the same scan inline rather
+        // than asking the user to reload. Scan errors keep the worker and
+        // are rethrown - retrying those would just fail the same way.
+        if (worker) throw err;
+        report = null;
+      }
+    }
+    if (!report) {
       state.lastScanVia = 'inline';
       report = await scanInline(file);
     }
@@ -376,7 +408,7 @@ function renderReport(report) {
     </div>
     <p class="fine">The exported report contains scan results and device metadata only - never the archive itself. Share it with a helpline to speed up triage.</p>`;
   $('#export-btn').addEventListener('click', exportReport);
-  $('#rescan-btn').addEventListener('click', () => showSection('landing'));
+  $('#rescan-btn').addEventListener('click', backToLanding);
   showSection('results');
   // Move focus to the verdict so screen readers announce the outcome.
   $('#results').focus();
@@ -389,7 +421,7 @@ function renderError(err) {
     <p>Make sure you're choosing the original <code>sysdiagnose_….tar.gz</code> file, not an unpacked folder or a renamed copy. Nothing was uploaded; you can simply try again.</p>
   </div>
   <div class="actions"><button class="btn secondary" id="rescan-btn">Back</button></div>`;
-  $('#rescan-btn').addEventListener('click', () => showSection('landing'));
+  $('#rescan-btn').addEventListener('click', backToLanding);
   showSection('results');
 }
 
@@ -443,9 +475,16 @@ function wireUi() {
     if (e.target === dialog) dialog.close();
   });
 
+  // A failed fixture fetch must surface, not die as a silent rejection
+  // leaving the button apparently dead.
   const demo = (path, name) => async () => {
-    const blob = await (await fetch(path)).blob();
-    handleFile(new File([blob], name));
+    try {
+      const r = await fetch(path);
+      if (!r.ok) throw new Error(`the demo file could not be loaded (HTTP ${r.status})`);
+      handleFile(new File([await r.blob()], name));
+    } catch (err) {
+      renderError(err);
+    }
   };
   $('#demo-clean').addEventListener('click',
     demo('./fixtures/sysdiagnose_demo_clean.tar.gz', 'sysdiagnose_demo_clean.tar.gz'));

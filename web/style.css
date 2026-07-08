@@ -72,8 +72,12 @@ h1, h2, h3 { line-height: 1.25; }
   padding: 10px 0;
   font-size: 0.92rem;
 }
-.privacy-strip .wrap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); flex: none; }
+/* Dot column + content column: keeps the dot beside the first text line on
+   any width (a wrapping flex row stranded it on a line of its own), and the
+   verify button starts under the text, not under the dot. */
+.privacy-strip .wrap { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+.privacy-strip .linklike { grid-column: 2; justify-self: start; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); align-self: start; margin-top: 7px; }
 .dot.offline { background: #c9a227; }
 
 .linklike {

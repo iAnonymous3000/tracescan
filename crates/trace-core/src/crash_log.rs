@@ -3,7 +3,7 @@
 //! are checked against indicators; historically, crashes of implant processes
 //! (and of media/message daemons they exploit) have been detection signals.
 
-use crate::heuristics::{path_flag, PathFlag};
+use crate::heuristics::{path_flag, path_flag_finding, PathFlag};
 use crate::ioc::{basename, IocDb, IocKind};
 use crate::report::{ArtifactSummary, DeviceInfo, Finding, Severity};
 use regex_lite::Regex;
@@ -18,6 +18,25 @@ fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 fn panic_pid_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"pid (\d+)[:\s]+\(?([A-Za-z0-9_.-]+)\)?").unwrap())
+}
+
+fn date_suffix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"-\d{4}-\d{2}-\d{2}").unwrap())
+}
+
+/// Crash file names encode the crashing process ("bh-2026-07-01-120311.ips").
+/// Process names can themselves contain hyphens (Pegasus's published
+/// indicators include 'Diagnostics-2543'), so the name is recovered by
+/// stripping the trailing date-time stamp, not by cutting at the first
+/// hyphen - the latter would silently miss such indicators.
+fn filename_process(fname: &str) -> Option<&str> {
+    let stem = fname.strip_suffix(".ips").unwrap_or(fname);
+    let name = match date_suffix_re().find(stem) {
+        Some(m) => &stem[..m.start()],
+        None => stem,
+    };
+    (name.len() > 1).then_some(name)
 }
 
 pub fn analyze(
@@ -92,13 +111,11 @@ pub fn analyze(
         }
     }
 
-    // The filename itself encodes the crashing process ("bh-2026-07-01-….ips"),
-    // which survives even when the JSON fails to parse.
+    // The filename itself encodes the crashing process, which survives even
+    // when the JSON fails to parse.
     let fname = basename(path);
-    if let Some(prefix) = fname.split('-').next() {
-        if !prefix.is_empty() && prefix.len() > 1 {
-            candidates.insert(prefix.to_string());
-        }
+    if let Some(name) = filename_process(fname) {
+        candidates.insert(name.to_string());
     }
 
     let status = if header.is_some() || body.is_some() {
@@ -139,32 +156,20 @@ pub fn analyze(
         }
     }
 
-    let proc_path_flag = proc_path.as_deref().and_then(path_flag);
-    if proc_path_flag == Some(PathFlag::Staging) || panic_staging {
-        let where_seen = if proc_path_flag == Some(PathFlag::Staging) {
-            proc_path.clone().unwrap_or_default()
-        } else {
-            "the kernel panic report".to_string()
-        };
+    // Same yardstick as the ps and shutdown.log surfaces.
+    if let Some(f) = proc_path
+        .as_deref()
+        .and_then(|p| path_flag_finding(path, p, "The crashing process ran from", &evidence_base))
+    {
+        findings.push(f);
+    }
+    // A staging path seen only inside a kernel panic string has no process
+    // path to cite; suppressed when the path-based flag already raised it.
+    if panic_staging && proc_path.as_deref().and_then(path_flag) != Some(PathFlag::Staging) {
         findings.push(Finding::heuristic(
             Severity::Suspicious,
             path,
-            format!(
-                "Crash log references {} - the roleaccountd.staging directory is strongly associated with Pegasus infections in published research",
-                where_seen
-            ),
-            evidence_base.clone(),
-        ));
-    } else if proc_path_flag == Some(PathFlag::UnusualLocation) {
-        // Same yardstick as the ps and shutdown.log surfaces: a crash of a
-        // binary running from a writable system location is worth a note.
-        findings.push(Finding::heuristic(
-            Severity::Note,
-            path,
-            format!(
-                "The crashing process ran from an unusual location ({}) - often benign, but worth review alongside other findings",
-                proc_path.as_deref().unwrap_or_default()
-            ),
+            "A kernel panic report references the roleaccountd.staging directory - it is strongly associated with Pegasus infections in published research (Kaspersky iShutdown, 2024)".into(),
             evidence_base.clone(),
         ));
     }
@@ -308,6 +313,49 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Note);
         assert!(findings[0].summary.contains("/private/var/tmp/agent"));
+    }
+
+    #[test]
+    fn filename_process_recovers_hyphenated_names() {
+        assert_eq!(
+            filename_process("bh-2026-07-01-120311.ips"),
+            Some("bh"),
+            "plain name before the date stamp"
+        );
+        assert_eq!(
+            filename_process("Diagnostics-2543-2026-07-01-120311.ips"),
+            Some("Diagnostics-2543"),
+            "hyphenated process names must survive"
+        );
+        assert_eq!(filename_process("no-date-stamp.ips"), Some("no-date-stamp"));
+        assert_eq!(filename_process("x.ips"), None, "too short to be a name");
+    }
+
+    #[test]
+    fn unparseable_crash_still_matches_hyphenated_name_from_filename() {
+        // A real Pegasus indicator style name with a hyphen; the JSON body is
+        // garbage, so the filename is the only signal left.
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[process:name='Diagnostics-2543']"}]}"#,
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/Diagnostics-2543-2026-07-01-120311.ips",
+            "not json at all",
+            &db,
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.severity == Severity::Match)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -29,7 +29,10 @@ jobs:
             url=$(echo "$row" | base64 -d | jq -r .url)
             file=$(echo "$row" | base64 -d | jq -r .file)
             curl -fsSL --max-time 60 "$url" -o /tmp/new.stix2
-            jq empty /tmp/new.stix2  # refuse to snapshot a non-JSON error page
+            # Refuse anything the scanner would reject: it must be JSON and
+            # must carry the STIX objects array (same check the app applies
+            # to live fetches before trusting them).
+            jq -e '.objects | type == "array"' /tmp/new.stix2 > /dev/null
             if ! cmp -s /tmp/new.stix2 "web/$file"; then
               cp /tmp/new.stix2 "web/$file"
               changed=1

@@ -46,7 +46,7 @@ jobs:
         run: wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
 
       - name: Drop build metadata from the site artifact
-        run: rm -f web/pkg/.gitignore web/pkg/package.json
+        run: rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts
 
       - name: Version the service worker cache per deploy
         run: |

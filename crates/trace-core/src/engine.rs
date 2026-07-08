@@ -168,6 +168,18 @@ impl Engine {
                 collector.dropped_artifacts
             ));
         }
+        // A raw tar that stops before its end-of-archive marker may have been
+        // truncated in transit; whatever followed the cut-off was never seen,
+        // so the scan must not read as complete. Only flagged when the stream
+        // parsed as a tar at all - for arbitrary non-archive bytes the
+        // "doesn't look like a sysdiagnose" verdict is the honest one.
+        // (A truncated .tar.gz already fails hard at gzip finish above.)
+        if !collector.terminated_cleanly() && (collector.entries > 0 || !collector.files.is_empty())
+        {
+            scan_limits.push(
+                "The archive ended before its end-of-archive marker, so it may be incomplete; anything after the cut-off was not analyzed.".into(),
+            );
+        }
 
         Ok(Report {
             tool: ToolInfo {
@@ -349,6 +361,35 @@ mod tests {
             .map(|m| m.kind.as_str())
             .collect();
         assert_eq!(missing, vec!["shutdown_log", "crash_log"]);
+    }
+
+    #[test]
+    fn truncated_raw_tar_is_marked_incomplete() {
+        // Clean build minus the end-of-archive marker and half the last
+        // entry: what a cut-off transfer of a raw tar looks like.
+        let full = build_archive(false);
+        let mut engine = Engine::new();
+        engine.push(&full[..full.len() - 1600]).unwrap();
+        let report = engine.finish().unwrap();
+        assert!(
+            report
+                .scan_limits
+                .iter()
+                .any(|l| l.contains("end-of-archive")),
+            "a truncated raw tar must surface as an incomplete scan"
+        );
+    }
+
+    #[test]
+    fn non_archive_bytes_do_not_read_as_truncated() {
+        // Arbitrary non-tar bytes must stay on the "not a sysdiagnose"
+        // path (zero artifacts, no scan limits), not become "inconclusive".
+        let mut engine = Engine::new();
+        engine.push(&[0x50, 0x4b, 0x03, 0x04]).unwrap(); // zip magic
+        engine.push(&[0xABu8; 2048]).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.stats.artifacts_found, 0);
+        assert!(report.scan_limits.is_empty());
     }
 
     #[test]

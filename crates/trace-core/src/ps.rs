@@ -3,9 +3,9 @@
 //! COMMAND column is located by its header offset so commands containing
 //! spaces survive, since column counts vary across iOS versions.
 
-use crate::heuristics::{path_flag, PathFlag};
+use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
-use crate::report::{ArtifactSummary, Finding, Severity};
+use crate::report::{ArtifactSummary, Finding};
 use serde_json::json;
 
 pub fn analyze(
@@ -32,7 +32,7 @@ pub fn analyze(
     let mut past_header = false;
     for line in content.lines() {
         if !past_header {
-            past_header = std::ptr::eq(line, header) || line == header;
+            past_header = line == header;
             continue;
         }
         if line.trim().is_empty() {
@@ -70,26 +70,8 @@ pub fn analyze(
                 ));
             }
         }
-        match path_flag(argv0) {
-            Some(PathFlag::Staging) => findings.push(Finding::heuristic(
-                Severity::Suspicious,
-                path,
-                format!(
-                    "A process was running from {} - this staging directory is strongly associated with Pegasus infections in published research",
-                    argv0
-                ),
-                evidence.clone(),
-            )),
-            Some(PathFlag::UnusualLocation) => findings.push(Finding::heuristic(
-                Severity::Note,
-                path,
-                format!(
-                    "A process was running from an unusual location ({}) - often benign, but worth review alongside other findings",
-                    argv0
-                ),
-                evidence.clone(),
-            )),
-            None => {}
+        if let Some(f) = path_flag_finding(path, argv0, "A process was running from", &evidence) {
+            findings.push(f);
         }
     }
 
@@ -99,6 +81,7 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Severity;
 
     const SAMPLE: &str = "\
 USER             UID   PID  PPID  %CPU %MEM STARTED     TIME COMMAND

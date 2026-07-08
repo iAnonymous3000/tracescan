@@ -183,6 +183,14 @@ impl TarCollector {
         }
     }
 
+    /// True once the archive reached its end-of-archive marker (two zero
+    /// blocks). A stream that stops mid-entry or without the marker may have
+    /// been truncated in transit, and a scan of it must not be presented as
+    /// complete - files after the cut-off were never seen.
+    pub fn terminated_cleanly(&self) -> bool {
+        matches!(self.state, State::Done)
+    }
+
     fn process(&mut self) {
         let mut cur = 0usize;
         loop {
