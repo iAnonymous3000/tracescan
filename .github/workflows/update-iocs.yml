@@ -1,0 +1,52 @@
+name: Update IOC snapshots
+
+# Keeps the bundled STIX2 snapshots (the offline floor) close to upstream.
+# Opens a PR rather than pushing: indicator changes deserve human review
+# before they ship, and the PR diff is the review surface.
+#
+# Requires the repo setting "Allow GitHub Actions to create and approve
+# pull requests" (Settings -> Actions -> General) to be enabled.
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest published indicator sets
+        run: |
+          set -euo pipefail
+          changed=0
+          for row in $(jq -r '.sets[] | @base64' web/iocs/manifest.json); do
+            url=$(echo "$row" | base64 -d | jq -r .url)
+            file=$(echo "$row" | base64 -d | jq -r .file)
+            curl -fsSL --max-time 60 "$url" -o /tmp/new.stix2
+            jq empty /tmp/new.stix2  # refuse to snapshot a non-JSON error page
+            if ! cmp -s /tmp/new.stix2 "web/$file"; then
+              cp /tmp/new.stix2 "web/$file"
+              changed=1
+            fi
+          done
+          if [ "$changed" = 1 ]; then
+            jq --arg d "$(date -u +%F)" '.bundled_date = $d' web/iocs/manifest.json > /tmp/manifest.json
+            mv /tmp/manifest.json web/iocs/manifest.json
+          fi
+
+      - name: Open a PR if snapshots changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/update-ioc-snapshots
+          title: Update bundled IOC snapshots
+          commit-message: Update bundled IOC snapshots from upstream
+          body: >
+            Automated refresh of the bundled STIX2 snapshots from
+            AmnestyTech/investigations. Review the indicator diff before
+            merging; merging redeploys the site with the new bundled floor.

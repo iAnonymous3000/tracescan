@@ -15,6 +15,18 @@ pub enum ArtifactKind {
     PsListing,
 }
 
+/// Matches "shutdown.log" and the rotated names iOS 26 introduced
+/// ("shutdown.0.log", "shutdown.1.log", ...). Verified against a real
+/// iOS 26.5.2 sysdiagnose, which carries only the rotated form.
+fn is_shutdown_log(base: &str) -> bool {
+    if base == "shutdown.log" {
+        return true;
+    }
+    base.strip_prefix("shutdown.")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|mid| !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn classify(path: &str) -> Option<ArtifactKind> {
     let p = path.trim_start_matches("./");
     let base = p.rsplit('/').next().unwrap_or(p);
@@ -23,7 +35,7 @@ pub fn classify(path: &str) -> Option<ArtifactKind> {
     if base.starts_with("._") {
         return None;
     }
-    if base == "shutdown.log" {
+    if is_shutdown_log(base) {
         return Some(ArtifactKind::ShutdownLog);
     }
     if p.contains("crashes_and_spins/") && base.ends_with(".ips") {
@@ -42,9 +54,34 @@ pub struct CollectedFile {
     pub truncated: bool,
 }
 
-/// Individual retained files are small (shutdown.log and .ips crash logs are
-/// kilobytes); the cap is a guardrail against a hostile archive.
-const FILE_CAP: usize = 32 * 1024 * 1024;
+/// Guardrails against a hostile archive. Real sysdiagnose artifacts are tiny
+/// (shutdown.log and .ips crash logs are kilobytes, a few hundred crash logs
+/// at most), so a scan that hits any of these caps is by definition not a
+/// normal sysdiagnose - the caps exist so a crafted archive cannot exhaust
+/// browser memory, and hitting one must surface as an incomplete scan.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// Per retained file.
+    pub file_cap: usize,
+    /// Across all retained files combined.
+    pub total_retain_cap: usize,
+    /// Number of files retained for analysis.
+    pub max_retained_files: usize,
+    /// Archive entries walked before parsing stops.
+    pub max_entries: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            file_cap: 32 * 1024 * 1024,
+            total_retain_cap: 192 * 1024 * 1024,
+            max_retained_files: 4096,
+            max_entries: 1_000_000,
+        }
+    }
+}
+
 const META_CAP: u64 = 1024 * 1024;
 
 enum State {
@@ -59,14 +96,12 @@ enum State {
     Meta {
         kind: MetaKind,
         buf: Vec<u8>,
-        cap: u64,
         real: u64,
         total: u64,
     },
     Done,
 }
 
-#[derive(PartialEq)]
 enum MetaKind {
     Pax,
     PaxGlobal,
@@ -77,8 +112,15 @@ pub struct TarCollector {
     pending: Vec<u8>,
     state: State,
     next_path: Option<String>,
+    limits: Limits,
+    retained_bytes: usize,
     pub files: Vec<CollectedFile>,
     pub entries: u64,
+    /// Artifact files the scanner wanted but dropped because a global cap
+    /// was already reached. Any nonzero value means the scan is incomplete.
+    pub dropped_artifacts: u64,
+    /// Parsing stopped early because the archive had too many entries.
+    pub entry_cap_hit: bool,
     zero_blocks: u8,
 }
 
@@ -126,13 +168,17 @@ fn pax_path(data: &[u8]) -> Option<String> {
 }
 
 impl TarCollector {
-    pub fn new() -> Self {
+    pub fn with_limits(limits: Limits) -> Self {
         TarCollector {
             pending: Vec::new(),
             state: State::Header,
             next_path: None,
+            limits,
+            retained_bytes: 0,
             files: Vec::new(),
             entries: 0,
+            dropped_artifacts: 0,
+            entry_cap_hit: false,
             zero_blocks: 0,
         }
     }
@@ -175,13 +221,33 @@ impl TarCollector {
                         None if prefix.is_empty() => name,
                         None => format!("{}/{}", prefix, name),
                     };
-                    let total = size.div_ceil(512) * 512;
+                    // Saturate: a base-256 size field can encode u64::MAX,
+                    // where rounding up to the 512 boundary would overflow
+                    // (panic in debug, silent wrap to 0 and a misparse
+                    // cascade in release). Saturating instead makes the
+                    // bogus entry swallow the rest of the stream, which is
+                    // the safe outcome for garbage input.
+                    let total = size.div_ceil(512).saturating_mul(512);
                     cur += 512;
 
                     match typeflag {
                         b'0' | 0 | b'7' => {
                             self.entries += 1;
-                            let keep = classify(&path).map(|k| (path, k));
+                            if self.entries > self.limits.max_entries {
+                                self.entry_cap_hit = true;
+                                self.state = State::Done;
+                                continue;
+                            }
+                            let at_cap = self.files.len() >= self.limits.max_retained_files
+                                || self.retained_bytes >= self.limits.total_retain_cap;
+                            let keep = match classify(&path) {
+                                Some(_) if at_cap => {
+                                    self.dropped_artifacts += 1;
+                                    None
+                                }
+                                Some(k) => Some((path, k)),
+                                None => None,
+                            };
                             if total == 0 {
                                 if let Some((p, k)) = keep {
                                     self.files.push(CollectedFile {
@@ -211,7 +277,6 @@ impl TarCollector {
                                 self.state = State::Meta {
                                     kind,
                                     buf: Vec::new(),
-                                    cap: META_CAP,
                                     real: size,
                                     total,
                                 };
@@ -242,9 +307,14 @@ impl TarCollector {
                     let n = avail.min(total);
                     let r = n.min(real);
                     if keep.is_some() && r > 0 {
-                        let room = FILE_CAP.saturating_sub(buf.len());
+                        let room = self.limits.file_cap.saturating_sub(buf.len()).min(
+                            self.limits
+                                .total_retain_cap
+                                .saturating_sub(self.retained_bytes),
+                        );
                         let take = (r as usize).min(room);
                         buf.extend_from_slice(&self.pending[cur..cur + take]);
+                        self.retained_bytes += take;
                         if take < r as usize {
                             truncated = true;
                         }
@@ -276,7 +346,6 @@ impl TarCollector {
                 State::Meta {
                     kind,
                     mut buf,
-                    cap,
                     mut real,
                     mut total,
                 } => {
@@ -284,7 +353,7 @@ impl TarCollector {
                     let n = avail.min(total);
                     let r = n.min(real);
                     if r > 0 {
-                        let room = (cap as usize).saturating_sub(buf.len());
+                        let room = (META_CAP as usize).saturating_sub(buf.len());
                         let take = (r as usize).min(room);
                         buf.extend_from_slice(&self.pending[cur..cur + take]);
                     }
@@ -311,7 +380,6 @@ impl TarCollector {
                     self.state = State::Meta {
                         kind,
                         buf,
-                        cap,
                         real,
                         total,
                     };
@@ -418,7 +486,7 @@ mod tests {
         let archive = test_util::finish(archive);
 
         // Feed in awkward 7-byte chunks to stress the state machine.
-        let mut col = TarCollector::new();
+        let mut col = TarCollector::with_limits(Limits::default());
         for chunk in archive.chunks(7) {
             col.write_all(chunk).unwrap();
         }
@@ -442,11 +510,77 @@ mod tests {
     }
 
     #[test]
+    fn retained_file_count_cap_drops_extra_artifacts() {
+        let mut archive = Vec::new();
+        for i in 0..3 {
+            archive.extend_from_slice(&test_util::entry(
+                &format!("root/crashes_and_spins/proc{i}-2026.ips"),
+                b"{}\n{}",
+            ));
+        }
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            max_retained_files: 2,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.files.len(), 2);
+        assert_eq!(col.dropped_artifacts, 1);
+    }
+
+    #[test]
+    fn total_retain_cap_truncates_and_then_drops() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", &[b'a'; 40]));
+        archive.extend_from_slice(&test_util::entry("root/ps_thread.txt", &[b'b'; 40]));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            total_retain_cap: 10,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.files.len(), 1);
+        assert_eq!(col.files[0].data.len(), 10);
+        assert!(col.files[0].truncated);
+        assert_eq!(col.dropped_artifacts, 1);
+    }
+
+    #[test]
+    fn entry_cap_stops_parsing() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&test_util::entry("root/a.txt", b"x"));
+        archive.extend_from_slice(&test_util::entry("root/b.txt", b"x"));
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"would match"));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            max_entries: 2,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert!(col.entry_cap_hit);
+        assert!(
+            col.files.is_empty(),
+            "nothing after the cap may be retained"
+        );
+    }
+
+    #[test]
     fn classify_paths() {
         assert_eq!(
             classify("root/system_logs.logarchive/Extra/shutdown.log"),
             Some(ArtifactKind::ShutdownLog)
         );
+        // iOS 26 rotated form, and names that must not match it
+        assert_eq!(
+            classify("root/system_logs.logarchive/Extra/shutdown.0.log"),
+            Some(ArtifactKind::ShutdownLog)
+        );
+        assert_eq!(
+            classify("root/system_logs.logarchive/Extra/shutdown.12.log"),
+            Some(ArtifactKind::ShutdownLog)
+        );
+        assert_eq!(classify("root/Extra/shutdown.old.log"), None);
+        assert_eq!(classify("root/Extra/preshutdown.log"), None);
         assert_eq!(
             classify("./root/crashes_and_spins/Panics/panic-full.ips"),
             Some(ArtifactKind::CrashLog)

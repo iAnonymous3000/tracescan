@@ -1,0 +1,5 @@
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://raw.githubusercontent.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Cross-Origin-Opener-Policy: same-origin
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

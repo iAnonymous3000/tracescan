@@ -21,21 +21,24 @@ make_tree() { # $1 = tmpdir root, $2 = infected|clean
   local root="$1/sysdiagnose_2026.07.07_19-00-00+0000_iPhone-OS_iPhone_23A341"
   mkdir -p "$root/crashes_and_spins" "$root/system_logs.logarchive/Extra"
 
-  # --- shutdown.log: several reboot blocks; delays reset each reboot ---
+  # --- shutdown.0.log: iOS 26 format (rotated filename; "After Xs, these
+  #     clients are still here:" headers; tab-indented client lines whose
+  #     paths carry a trailing binary-UUID component). Several reboot
+  #     blocks; delays reset each reboot. ---
   {
     for i in 1 2 3; do
-      echo "%%%%% Entering phase: Waiting for apps to exit"
-      echo ""
-      echo "After 0.1s, remaining client pid: 155 (/usr/libexec/nfcd)"
-      echo "After 0.2s, remaining client pid: 155 (/usr/libexec/nfcd)"
+      echo "After 1.26s, these clients are still here:"
+      printf '\t\tremaining client pid: 155 (/usr/libexec/nfcd/EBFB3E7F-4CA4-3656-8E9C-8CCF5995C34A)\n'
       if [ "$2" = infected ] && [ "$i" -ge 2 ]; then
-        echo "After 0.3s, remaining client pid: 2143 ($STAGING/$IOC_PROC)"
-        echo "After 0.4s, remaining client pid: 2143 ($STAGING/$IOC_PROC)"
+        printf '\t\tremaining client pid: 2143 (%s/%s/AAAA1111-B896-3E7F-A6CC-577F0A547BB1)\n' "$STAGING" "$IOC_PROC"
       fi
-      echo "SIGTERM: [0x100304080] Sent SIGTERM to remaining client pid: 155 (/usr/libexec/nfcd)"
-      echo ""
+      echo "After 1.77s, these clients are still here:"
+      printf '\t\tremaining client pid: 155 (/usr/libexec/nfcd/EBFB3E7F-4CA4-3656-8E9C-8CCF5995C34A)\n'
+      if [ "$2" = infected ] && [ "$i" -ge 2 ]; then
+        printf '\t\tremaining client pid: 2143 (%s/%s/AAAA1111-B896-3E7F-A6CC-577F0A547BB1)\n' "$STAGING" "$IOC_PROC"
+      fi
     done
-  } > "$root/system_logs.logarchive/Extra/shutdown.log"
+  } > "$root/system_logs.logarchive/Extra/shutdown.0.log"
 
   # --- ps.txt: fixed-width columns; COMMAND offset must match the header ---
   local fmt='%-16s %3s %5s %5s %4s %4s %-8s %8s %s\n'
@@ -61,15 +64,21 @@ EOF
 EOF
   fi
 
-  # decoys the scanner must ignore
-  head -c 4096 /dev/urandom > "$root/ignored_blob.bin"
+  # decoys the scanner must ignore (deterministic bytes: the fixtures are
+  # tracked in git, so a rebuild must reproduce them byte-for-byte)
+  python3 -c "import sys; sys.stdout.buffer.write(bytes(range(256)) * 16)" > "$root/ignored_blob.bin"
   echo "sysdiagnose metadata" > "$root/sysdiagnose.log"
 }
 
 for kind in clean infected; do
   tmp=$(mktemp -d)
   make_tree "$tmp" "$kind"
-  tar -czf "$OUT/sysdiagnose_demo_$kind.tar.gz" -C "$tmp" .
+  # Deterministic archive: fixed mtimes, sorted entry order, no owner
+  # metadata, and gzip without its timestamp header.
+  find "$tmp" -exec touch -t 202607071900 {} +
+  (cd "$tmp" && find . -mindepth 1 -print | LC_ALL=C sort \
+    | tar -cn --uid 0 --gid 0 -T - -f - | gzip -n) \
+    > "$OUT/sysdiagnose_demo_$kind.tar.gz"
   rm -rf "$tmp"
 done
 

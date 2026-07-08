@@ -3,7 +3,7 @@
 
 use crate::ioc::{IocDb, SetStats};
 use crate::report::*;
-use crate::tar_stream::{ArtifactKind, TarCollector};
+use crate::tar_stream::{ArtifactKind, Limits, TarCollector};
 use crate::{crash_log, ps, shutdown_log};
 use flate2::write::GzDecoder;
 use std::io::Write;
@@ -13,10 +13,29 @@ enum Sink {
     Plain(TarCollector),
 }
 
+fn write_sink(sink: &mut Sink, data: &[u8]) -> Result<(), String> {
+    match sink {
+        Sink::Gz(g) => g.write_all(data).map_err(|e| {
+            format!("decompression failed - is this a .tar.gz sysdiagnose archive? ({e})")
+        }),
+        Sink::Plain(c) => c.write_all(data).map_err(|e| e.to_string()),
+    }
+}
+
 pub struct Engine {
     db: IocDb,
     sink: Option<Sink>,
+    /// Bytes held back until enough have arrived to sniff the gzip magic;
+    /// a stream may legally deliver its first chunk as a single byte.
+    prelude: Vec<u8>,
+    limits: Limits,
     bytes_in: u64,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Engine::new()
+    }
 }
 
 impl Engine {
@@ -24,6 +43,8 @@ impl Engine {
         Engine {
             db: IocDb::new(),
             sink: None,
+            prelude: Vec::new(),
+            limits: Limits::default(),
             bytes_in: 0,
         }
     }
@@ -38,24 +59,31 @@ impl Engine {
         }
         self.bytes_in += chunk.len() as u64;
         if self.sink.is_none() {
-            let collector = TarCollector::new();
-            let is_gz = chunk.len() >= 2 && chunk[0] == 0x1f && chunk[1] == 0x8b;
-            self.sink = Some(if is_gz {
+            self.prelude.extend_from_slice(chunk);
+            if self.prelude.len() < 2 {
+                return Ok(());
+            }
+            let collector = TarCollector::with_limits(self.limits);
+            let is_gz = self.prelude[0] == 0x1f && self.prelude[1] == 0x8b;
+            let mut sink = if is_gz {
                 Sink::Gz(GzDecoder::new(collector))
             } else {
                 Sink::Plain(collector)
-            });
+            };
+            let buffered = std::mem::take(&mut self.prelude);
+            let res = write_sink(&mut sink, &buffered);
+            self.sink = Some(sink);
+            return res;
         }
-        match self.sink.as_mut().unwrap() {
-            Sink::Gz(g) => g.write_all(chunk).map_err(|e| {
-                format!("decompression failed - is this a .tar.gz sysdiagnose archive? ({e})")
-            }),
-            Sink::Plain(c) => c.write_all(chunk).map_err(|e| e.to_string()),
-        }
+        write_sink(self.sink.as_mut().unwrap(), chunk)
     }
 
     pub fn finish(mut self) -> Result<Report, String> {
         let collector = match self.sink.take() {
+            // A sub-2-byte input never got a sink; it cannot be an archive.
+            None if !self.prelude.is_empty() => {
+                return Err("file is too small to be an archive".into())
+            }
             None => return Err("no data received".into()),
             Some(Sink::Gz(g)) => g.finish().map_err(|e| {
                 format!("archive ended unexpectedly - the file may be incomplete ({e})")
@@ -120,6 +148,27 @@ impl Engine {
             });
         }
 
+        // Any safety limit hit means part of the archive went unanalyzed.
+        // A real sysdiagnose never comes close to these caps.
+        let mut scan_limits: Vec<String> = Vec::new();
+        if collector.entry_cap_hit {
+            scan_limits.push(
+                "The archive contained more files than this scanner will walk; scanning stopped early and later files were not examined.".into(),
+            );
+        }
+        let truncated_count = collector.files.iter().filter(|f| f.truncated).count();
+        if truncated_count > 0 {
+            scan_limits.push(format!(
+                "{truncated_count} artifact file(s) exceeded size limits and only their beginning was analyzed."
+            ));
+        }
+        if collector.dropped_artifacts > 0 {
+            scan_limits.push(format!(
+                "{} artifact file(s) were skipped entirely after the scan reached its memory safety limit.",
+                collector.dropped_artifacts
+            ));
+        }
+
         Ok(Report {
             tool: ToolInfo {
                 name: "Trace",
@@ -137,9 +186,10 @@ impl Engine {
                 total_indicators: self.db.total(),
                 applicable_indicators: self.db.applicable_total(),
             },
+            scan_limits,
             coverage: Coverage {
                 examined: vec![
-                    "shutdown.log - processes that delayed device shutdown, across reboots",
+                    "shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots",
                     "Crash logs (crashes_and_spins/*.ips) - crashing process names and paths",
                     "Process listings (ps.txt, ps_thread.txt) - processes running at capture time",
                 ],
@@ -150,7 +200,7 @@ impl Engine {
                     "Per-process network usage (DataUsage) - device backups only",
                     "Installed apps and configuration profiles - device backups only",
                 ],
-                note: "Domain, URL and email indicators in the loaded sets cannot be checked against sysdiagnose artifacts. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
+                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
             },
         })
     }
@@ -224,6 +274,50 @@ mod tests {
         // applicable-indicator accounting excludes the domain
         assert_eq!(report.stats.total_indicators, 2);
         assert_eq!(report.stats.applicable_indicators, 1);
+    }
+
+    #[test]
+    fn gzip_detected_even_when_streamed_byte_by_byte() {
+        let gz = gzip(&build_archive(true));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        for byte in &gz {
+            engine.push(std::slice::from_ref(byte)).unwrap();
+        }
+        let report = engine.finish().unwrap();
+        assert_eq!(report.stats.artifacts_found, 3);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Match));
+    }
+
+    #[test]
+    fn single_byte_input_errors_cleanly() {
+        let mut engine = Engine::new();
+        engine.push(&[0x1f]).unwrap();
+        assert!(engine.finish().is_err());
+    }
+
+    #[test]
+    fn hitting_limits_marks_scan_incomplete() {
+        let mut a = Vec::new();
+        for i in 0..3 {
+            a.extend_from_slice(&test_util::entry(
+                &format!("sysdiagnose_t/crashes_and_spins/p{i}-2026.ips"),
+                b"{}\n{}",
+            ));
+        }
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.limits = crate::tar_stream::Limits {
+            max_retained_files: 1,
+            ..Default::default()
+        };
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert!(!report.scan_limits.is_empty());
+        assert!(report.scan_limits[0].contains("skipped"));
     }
 
     #[test]

@@ -3,15 +3,16 @@
 //! are checked against indicators; historically, crashes of implant processes
 //! (and of media/message daemons they exploit) have been detection signals.
 
-use crate::ioc::{basename, IocDb};
+use crate::heuristics::{path_flag, PathFlag};
+use crate::ioc::{basename, IocDb, IocKind};
 use crate::report::{ArtifactSummary, DeviceInfo, Finding, Severity};
 use regex_lite::Regex;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
-fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|k| v.get(k).and_then(|x| x.as_str()))
+fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
 }
 
 fn panic_pid_re() -> &'static Regex {
@@ -46,26 +47,29 @@ pub fn analyze(
                 proc_name.get_or_insert_with(|| n.to_string());
             }
         }
-        bug_type = str_field(h, &["bug_type"]).map(String::from);
-        timestamp = str_field(h, &["timestamp"]).map(String::from);
-        os_version = str_field(h, &["os_version"]).map(String::from);
+        bug_type = str_field(h, "bug_type").map(String::from);
+        timestamp = str_field(h, "timestamp").map(String::from);
+        os_version = str_field(h, "os_version").map(String::from);
     }
     if let Some(b) = &body {
-        if let Some(n) = str_field(b, &["procName", "process_name", "processName"]) {
+        if let Some(n) = str_field(b, "procName") {
             candidates.insert(n.to_string());
             proc_name.get_or_insert_with(|| n.to_string());
         }
-        if let Some(p) = str_field(b, &["procPath", "process_path", "procesPath"]) {
+        if let Some(p) = str_field(b, "procPath") {
+            // The full path must be a candidate too: file:path indicators
+            // (e.g. '/private/var/tmp/UserEventAgent') only match on it.
+            candidates.insert(p.to_string());
             candidates.insert(basename(p).to_string());
             proc_path = Some(p.to_string());
         }
-        if let Some(pp) = str_field(b, &["parentProc", "parent_process"]) {
+        if let Some(pp) = str_field(b, "parentProc") {
             candidates.insert(pp.to_string());
         }
         if os_version.is_none() {
             if let Some(ov) = b.get("osVersion") {
-                let train = str_field(ov, &["train"]).unwrap_or("");
-                let build = str_field(ov, &["build"]).unwrap_or("");
+                let train = str_field(ov, "train").unwrap_or("");
+                let build = str_field(ov, "build").unwrap_or("");
                 if !train.is_empty() {
                     os_version = Some(format!("{train} ({build})"));
                 }
@@ -79,7 +83,7 @@ pub fn analyze(
     // ever compared by exact equality against the indicator set, so noisy
     // extraction cannot create false positives.
     let mut panic_staging = false;
-    if let Some(ps) = body.as_ref().and_then(|b| str_field(b, &["panicString"])) {
+    if let Some(ps) = body.as_ref().and_then(|b| str_field(b, "panicString")) {
         if ps.contains("/com.apple.xpc.roleaccountd.staging/") {
             panic_staging = true;
         }
@@ -117,11 +121,17 @@ pub fn analyze(
             if !seen.insert(format!("{}|{}", ind.set, ind.value)) {
                 continue;
             }
+            // Name indicators read best as a bare process name; a file:path
+            // indicator only makes sense shown as the full path it matched.
+            let shown = match ind.kind {
+                IocKind::FilePath => cand.as_str(),
+                _ => basename(cand),
+            };
             findings.push(Finding::ioc_match(
                 path,
                 format!(
                     "Crash log involves process \u{2018}{}\u{2019} - matches a published {} indicator",
-                    cand, ind.campaign
+                    shown, ind.campaign
                 ),
                 evidence_base.clone(),
                 ind,
@@ -129,11 +139,9 @@ pub fn analyze(
         }
     }
 
-    let staging_in_proc_path = proc_path
-        .as_deref()
-        .is_some_and(|pp| pp.contains("/com.apple.xpc.roleaccountd.staging/"));
-    if staging_in_proc_path || panic_staging {
-        let where_seen = if staging_in_proc_path {
+    let proc_path_flag = proc_path.as_deref().and_then(path_flag);
+    if proc_path_flag == Some(PathFlag::Staging) || panic_staging {
+        let where_seen = if proc_path_flag == Some(PathFlag::Staging) {
             proc_path.clone().unwrap_or_default()
         } else {
             "the kernel panic report".to_string()
@@ -144,6 +152,18 @@ pub fn analyze(
             format!(
                 "Crash log references {} - the roleaccountd.staging directory is strongly associated with Pegasus infections in published research",
                 where_seen
+            ),
+            evidence_base.clone(),
+        ));
+    } else if proc_path_flag == Some(PathFlag::UnusualLocation) {
+        // Same yardstick as the ps and shutdown.log surfaces: a crash of a
+        // binary running from a writable system location is worth a note.
+        findings.push(Finding::heuristic(
+            Severity::Note,
+            path,
+            format!(
+                "The crashing process ran from an unusual location ({}) - often benign, but worth review alongside other findings",
+                proc_path.as_deref().unwrap_or_default()
             ),
             evidence_base.clone(),
         ));
@@ -242,6 +262,52 @@ mod tests {
             1,
             "staging path inside panicString should raise the heuristic"
         );
+    }
+
+    #[test]
+    fn file_path_indicator_matches_full_proc_path() {
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[file:path='/private/var/db/com.apple.xpc.roleaccountd.staging/bh']"}]}"#,
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        analyze(
+            "root/crashes_and_spins/bh-2026-07-01-120311.ips",
+            SAMPLE,
+            &db,
+            &mut findings,
+        );
+        let matches: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Match)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "file:path indicator must match the crash log's full procPath"
+        );
+        assert_eq!(matches[0].indicator.as_ref().unwrap().kind, "file_path");
+        assert!(matches[0]
+            .summary
+            .contains("/com.apple.xpc.roleaccountd.staging/bh"));
+    }
+
+    #[test]
+    fn crash_from_unusual_location_yields_note() {
+        let sample = r#"{"app_name":"agent","name":"agent","bug_type":"309"}
+{"procName":"agent","procPath":"/private/var/tmp/agent","parentProc":"launchd"}"#;
+        let mut findings = Vec::new();
+        analyze(
+            "root/crashes_and_spins/agent-2026.ips",
+            sample,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Note);
+        assert!(findings[0].summary.contains("/private/var/tmp/agent"));
     }
 
     #[test]

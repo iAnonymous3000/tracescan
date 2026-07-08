@@ -3,6 +3,7 @@
 //! COMMAND column is located by its header offset so commands containing
 //! spaces survive, since column counts vary across iOS versions.
 
+use crate::heuristics::{path_flag, PathFlag};
 use crate::ioc::{basename, IocDb};
 use crate::report::{ArtifactSummary, Finding, Severity};
 use serde_json::json;
@@ -47,20 +48,30 @@ pub fn analyze(
             .unwrap_or("?");
         let evidence = json!({"pid": pid, "command": cmd});
 
-        for ind in db.match_process(argv0) {
-            findings.push(Finding::ioc_match(
-                path,
-                format!(
-                    "Running process \u{2018}{}\u{2019} matches a published {} indicator",
-                    basename(argv0),
-                    ind.campaign
-                ),
-                evidence.clone(),
-                ind,
-            ));
+        // argv0 cannot be told apart from a binary path containing spaces
+        // ("/…/My App.app/My App --flag"), so the full command is offered as
+        // a second candidate. Matching is exact, so a command with real
+        // arguments can never accidentally hit an indicator this way.
+        let mut candidates = vec![argv0];
+        if cmd != argv0 {
+            candidates.push(cmd);
         }
-        if argv0.contains("/com.apple.xpc.roleaccountd.staging/") {
-            findings.push(Finding::heuristic(
+        for cand in candidates {
+            for ind in db.match_process(cand) {
+                findings.push(Finding::ioc_match(
+                    path,
+                    format!(
+                        "Running process \u{2018}{}\u{2019} matches a published {} indicator",
+                        basename(cand),
+                        ind.campaign
+                    ),
+                    evidence.clone(),
+                    ind,
+                ));
+            }
+        }
+        match path_flag(argv0) {
+            Some(PathFlag::Staging) => findings.push(Finding::heuristic(
                 Severity::Suspicious,
                 path,
                 format!(
@@ -68,12 +79,8 @@ pub fn analyze(
                     argv0
                 ),
                 evidence.clone(),
-            ));
-        } else if argv0.starts_with("/private/var/db/")
-            || argv0.starts_with("/private/var/tmp/")
-            || argv0.starts_with("/private/var/root/")
-        {
-            findings.push(Finding::heuristic(
+            )),
+            Some(PathFlag::UnusualLocation) => findings.push(Finding::heuristic(
                 Severity::Note,
                 path,
                 format!(
@@ -81,7 +88,8 @@ pub fn analyze(
                     argv0
                 ),
                 evidence.clone(),
-            ));
+            )),
+            None => {}
         }
     }
 
@@ -134,7 +142,44 @@ root               0  2143     1   0.0  0.2 Tue07PM  0:00.11 /private/var/db/com
         )
         .unwrap();
         analyze("root/ps.txt", SAMPLE, &db, &mut findings);
-        // matches basename of argv0, not the trailing "--launchedByApp"
-        assert_eq!(findings.len(), 2); // ioc match + staging heuristic note? no: staging is Suspicious, bh not in db here
+        // exactly one IOC match: the basename of argv0, with the trailing
+        // "--launchedByApp" argument not treated as part of the name (the
+        // staging line in SAMPLE also raises its heuristic, which is not
+        // under test here and is filtered out by severity)
+        let matches: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Match)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].indicator.as_ref().unwrap().value, "music");
+        assert_eq!(
+            matches[0].evidence["command"],
+            "/Applications/Music.app/Music --launchedByApp"
+        );
+    }
+
+    #[test]
+    fn binary_path_containing_spaces_matches_via_full_command() {
+        // argv0 splitting truncates "/…/My App.app/My App" at the first
+        // space; the full command must still be offered as a candidate so a
+        // file:path indicator with spaces can hit.
+        const SPACED: &str = "\
+USER             UID   PID  PPID  %CPU %MEM STARTED     TIME COMMAND
+mobile           501   777     1   0.0  0.3 Tue07PM  0:00.55 /private/var/app/My App.app/My App
+";
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/app/My App.app/My App']"}]}"#,
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        analyze("root/ps.txt", SPACED, &db, &mut findings);
+        let matches: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Match)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].indicator.as_ref().unwrap().kind, "file_path");
     }
 }

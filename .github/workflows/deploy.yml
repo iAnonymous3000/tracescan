@@ -1,7 +1,13 @@
 name: Deploy
 
+# Publishing is gated on the full CI gate (fmt, clippy, tests, audit,
+# browser E2E): this workflow only runs after a CI run on main concludes,
+# and the job condition requires that run to have succeeded. The manual
+# dispatch escape hatch still exists for redeploys of a known-good main.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -16,12 +22,17 @@ concurrency:
 
 jobs:
   build-and-deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Deploy exactly the commit CI validated, not whatever main
+          # points at by the time this workflow runs.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install Rust
         run: |
@@ -38,7 +49,10 @@ jobs:
         run: rm -f web/pkg/.gitignore web/pkg/package.json
 
       - name: Version the service worker cache per deploy
-        run: sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${GITHUB_SHA:0:8}'/" web/sw.js && grep "const CACHE" web/sw.js
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${SHA:0:8}'/" web/sw.js
+          grep "const CACHE" web/sw.js
 
       - uses: actions/configure-pages@v5
 

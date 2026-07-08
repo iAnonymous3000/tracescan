@@ -147,5 +147,10 @@ pub struct Report {
     pub missing_artifacts: Vec<MissingArtifact>,
     pub findings: Vec<Finding>,
     pub stats: ScanStats,
+    /// Non-empty when the scan hit a safety limit (oversized or too many
+    /// files, too many archive entries) and therefore did not analyze
+    /// everything. Consumers must not present such a scan as a clean result;
+    /// the UI renders it as inconclusive.
+    pub scan_limits: Vec<String>,
     pub coverage: Coverage,
 }

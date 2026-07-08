@@ -145,6 +145,8 @@ main { padding: 28px 0 8px; }
 .verdict.suspicious { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
 .verdict.clear { background: var(--clear-bg); color: var(--clear-ink); border-color: var(--clear-line); }
 .verdict.invalid { background: var(--note-bg); color: var(--note-ink); border-color: var(--note-line); }
+.verdict.inconclusive { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
+.verdict.inconclusive ul { margin: 6px 0; padding-left: 20px; }
 
 .help-block { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px 18px; margin: 0 0 22px; }
 .help-block h3 { margin: 0 0 8px; font-size: 1.02rem; }
@@ -157,7 +159,10 @@ main { padding: 28px 0 8px; }
 .sev.match { background: var(--match-bg); color: var(--match-ink); border-color: var(--match-line); }
 .sev.suspicious { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
 .sev.note { background: var(--note-bg); color: var(--note-ink); border-color: var(--note-line); }
-.finding .summary { margin: 6px 0; }
+/* Summaries and verdicts quote long unbroken paths; without a break
+   opportunity they widen the page on narrow screens. */
+.finding .summary { margin: 6px 0; overflow-wrap: anywhere; }
+.verdict p, .verdict li { overflow-wrap: anywhere; }
 .finding .artifact { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
 .finding details { margin-top: 8px; }
 .finding summary { cursor: pointer; font-size: 0.88rem; color: var(--muted); }

@@ -1,6 +1,6 @@
 [package]
 name = "trace-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
 license = "MIT"
@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 regex-lite = "0.1"
+
+[dev-dependencies]
+proptest = "1"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false

@@ -4,13 +4,18 @@
 //! streamed in chunks and never leaves the machine; only STIX2 indicator
 //! bundles are (optionally) fetched from public sources by the JS host.
 
+// The engine and its result types are public so native tooling (the
+// examples/scan.rs harness, property tests, future fuzz targets) can drive
+// the exact pipeline the WASM Scanner wraps. The parsers stay private.
+pub mod engine;
+pub mod ioc;
+pub mod report;
+pub mod tar_stream;
+
 mod crash_log;
-mod engine;
-mod ioc;
+mod heuristics;
 mod ps;
-mod report;
 mod shutdown_log;
-mod tar_stream;
 
 use wasm_bindgen::prelude::*;
 

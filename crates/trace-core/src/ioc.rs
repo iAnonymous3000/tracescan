@@ -138,6 +138,15 @@ impl IocDb {
             let Some(pattern) = obj.get("pattern").and_then(|p| p.as_str()) else {
                 continue;
             };
+            // A pattern joining clauses with AND (or sequencing them with
+            // FOLLOWEDBY) only matches when every clause holds. Extracting a
+            // single clause from one would let a partial condition claim a
+            // full indicator match, so such patterns are skipped rather than
+            // half-checked. The bundled Amnesty sets contain none; OR-joined
+            // clauses are safe to split and are handled below.
+            if pattern.contains(" AND ") || pattern.contains("FOLLOWEDBY") {
+                continue;
+            }
             for cap in clause_re().captures_iter(pattern) {
                 let kind = kind_of(&cap[1], &cap[2]);
                 let value = cap[3].trim().to_lowercase();
@@ -227,6 +236,25 @@ mod tests {
         assert_eq!(stats.by_kind["domain"], 1);
         assert_eq!(stats.by_kind["file_hash"], 1);
         assert_eq!(stats.applicable, 3); // 2 process names + 1 file name
+    }
+
+    #[test]
+    fn and_joined_patterns_are_skipped_not_half_checked() {
+        let mut db = IocDb::new();
+        let stats = db
+            .load_stix(
+                "t",
+                r#"{"objects":[
+                    {"type":"indicator","pattern":"[process:name='safe' AND file:hashes.'SHA-256'='abc']"},
+                    {"type":"indicator","pattern":"[process:name='alone']"}
+                ]}"#,
+            )
+            .unwrap();
+        assert_eq!(stats.stix_indicators, 2);
+        assert_eq!(stats.extracted, 1, "only the single-clause pattern counts");
+        // matching one clause of an AND must never claim the full indicator
+        assert!(db.match_process("safe").is_empty());
+        assert_eq!(db.match_process("alone").len(), 1);
     }
 
     #[test]

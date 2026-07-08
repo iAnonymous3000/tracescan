@@ -31,3 +31,48 @@ jobs:
 
       - name: Build WASM module
         run: wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl -sSf https://drager.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Build WASM module
+        run: wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install E2E dependencies
+        run: npm ci
+        working-directory: e2e
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - name: Run browser E2E tests
+        run: npx playwright test
+        working-directory: e2e

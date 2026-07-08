@@ -1,0 +1,11 @@
+{
+  "name": "trace-e2e",
+  "private": true,
+  "description": "Browser end-to-end tests for Trace. Requires web/pkg to be built first (./build.sh).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.0"
+  }
+}
