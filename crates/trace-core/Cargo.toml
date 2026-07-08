@@ -1,6 +1,6 @@
 [package]
 name = "trace-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
 license = "MIT"
@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 regex-lite = "0.1"
+# Mandiant's unified-log parser; compiles to wasm32 unmodified. Used at
+# catalog level only (process inventory) - no message rendering, no dsc.
+macos-unifiedlogs = "0.6"
 
 [dev-dependencies]
 proptest = "1"

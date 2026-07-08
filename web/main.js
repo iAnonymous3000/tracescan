@@ -309,7 +309,7 @@ function verdictHtml(report) {
   }
   const missing = report.missing_artifacts || [];
   const coverageNote = missing.length
-    ? `<p><strong>Coverage note:</strong> ${missing.length} of the 3 artifact types this tool reads ${missing.length > 1 ? 'were' : 'was'} not present in this archive (${missing.map((m) => esc(m.kind.replace(/_/g, ' '))).join(', ')}), so ${missing.length > 1 ? 'those surfaces' : 'that surface'} could not be checked. Details are in the table below.</p>`
+    ? `<p><strong>Coverage note:</strong> ${missing.length} of the 4 artifact types this tool reads ${missing.length > 1 ? 'were' : 'was'} not present in this archive (${missing.map((m) => esc(m.kind.replace(/_/g, ' '))).join(', ')}), so ${missing.length > 1 ? 'those surfaces' : 'that surface'} could not be checked. Details are in the table below.</p>`
     : '';
   return `<div class="verdict clear">
     <h2>No known spyware traces found</h2>

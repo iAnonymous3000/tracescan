@@ -10,6 +10,7 @@ always means an automated test that runs in CI.
 | Surface | Evidence |
 |---|---|
 | Archive streaming (gzip/tar, PAX, GNU long names, caps) | Property tests over arbitrary bytes and chunkings; unit tests for PAX paths, caps, truncation, end-of-archive handling; a real iOS 26.5.2 sysdiagnose parsed end to end |
+| Unified logs (tracev3 catalog inventory) | Validated against a real iOS 26.5.2 capture: 64 tracev3 files (2,656 catalogs) and 689 uuidtext files parsed with zero failures; 617 of 617 processes resolved to binary paths; zero false positives from indicators or path heuristics across the full log window. Format parsing is delegated to Mandiant's upstream-tested `macos-unifiedlogs`. Repeatable locally: `TRACE_REAL_SYSDIAGNOSE=… cargo test --release --test real_capture -- --ignored` |
 | shutdown.log format handling | Both real-world formats verified against a real iOS 26.5.2 capture (rotated `shutdown.N.log`, header plus indented clients, trailing binary-UUID path component) and the classic one-line format from published research |
 | Pegasus shutdown.log technique | Pattern published by Kaspersky (iShutdown, Jan 2024): processes running from `/private/var/db/com.apple.xpc.roleaccountd.staging/`. Unit tests and the demo fixture seed a real published Pegasus process-name indicator through this path |
 | Crash log and ps.txt parsing | Unit tests over real-format samples, including kernel panics (`panicString`), hyphenated process names, and commands containing spaces |

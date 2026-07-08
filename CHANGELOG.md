@@ -4,6 +4,24 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.5.0 - 2026-07-08
+
+- **Unified log analysis** - the fourth detection surface, and the largest:
+  every process that wrote a log entry during the archive window (typically
+  days of device history) is inventoried and checked against the process and
+  path indicators plus the location heuristics. Implementation is
+  catalog-level via Mandiant's `macos-unifiedlogs` (compiled to WASM):
+  tracev3 and uuidtext files are reduced to process facts as they stream by
+  and dropped, so the 155 MB dsc string cache is never loaded and peak
+  memory stays at one file. Log message contents are never rendered.
+- Validated against a real iOS 26.5.2 capture: 64 tracev3 files, 2,656
+  catalogs, 689 uuidtext files, zero parse failures, 617/617 processes
+  resolved to paths, zero false positives (see VALIDATION.md; repeatable via
+  the env-gated `real_capture` integration test).
+- A sysdiagnose without unified log data reports the surface as missing,
+  and unified files cut short by the size cap surface in scan limits.
+- WASM module grows ~165 KB for the parser.
+
 ## v0.4.0 - 2026-07-08
 
 - Indicator coverage: eight iOS-relevant campaigns bundled (was three).

@@ -79,7 +79,7 @@ impl Engine {
     }
 
     pub fn finish(mut self) -> Result<Report, String> {
-        let collector = match self.sink.take() {
+        let mut collector = match self.sink.take() {
             // A sub-2-byte input never got a sink; it cannot be an archive.
             None if !self.prelude.is_empty() => {
                 return Err("file is too small to be an archive".into())
@@ -124,6 +124,15 @@ impl Engine {
             }
         }
 
+        // Unified logs were consumed during streaming; reduce them to
+        // findings and a summary now that the whole archive has been seen.
+        let unified = std::mem::take(&mut collector.unified);
+        let unified_truncated = unified.truncated_files;
+        let unified_seen = unified.saw_content();
+        if let Some(summary) = unified.finalize(&self.db, &mut findings) {
+            artifacts.push(summary);
+        }
+
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
         let found: std::collections::HashSet<ArtifactKind> =
@@ -132,7 +141,7 @@ impl Engine {
         if !found.contains(&ArtifactKind::ShutdownLog) {
             missing_artifacts.push(MissingArtifact {
                 kind: "shutdown_log".into(),
-                note: "No shutdown.log was found in this archive. It normally exists once the device has been restarted at least once; without it, one of the three detection surfaces is unavailable for this scan.".into(),
+                note: "No shutdown.log was found in this archive. It normally exists once the device has been restarted at least once; without it, one of the four detection surfaces is unavailable for this scan.".into(),
             });
         }
         if !found.contains(&ArtifactKind::CrashLog) {
@@ -145,6 +154,12 @@ impl Engine {
             missing_artifacts.push(MissingArtifact {
                 kind: "ps_listing".into(),
                 note: "No process listing (ps.txt) was found in this archive, so running processes could not be checked.".into(),
+            });
+        }
+        if !unified_seen {
+            missing_artifacts.push(MissingArtifact {
+                kind: "unified_log".into(),
+                note: "No unified log data (system_logs.logarchive tracev3 files) was found in this archive, so the process history across the log window could not be checked.".into(),
             });
         }
 
@@ -166,6 +181,11 @@ impl Engine {
             scan_limits.push(format!(
                 "{} artifact file(s) were skipped entirely after the scan reached its memory safety limit.",
                 collector.dropped_artifacts
+            ));
+        }
+        if unified_truncated > 0 {
+            scan_limits.push(format!(
+                "{unified_truncated} unified log file(s) exceeded size limits and were skipped; the process history is incomplete."
             ));
         }
         // A raw tar that stops before its end-of-archive marker may have been
@@ -204,9 +224,10 @@ impl Engine {
                     "shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots",
                     "Crash logs (crashes_and_spins/*.ips) - crashing process names and paths",
                     "Process listings (ps.txt, ps_thread.txt) - processes running at capture time",
+                    "Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)",
                 ],
                 not_examined: vec![
-                    "Unified system logs (system_logs.logarchive) - the richest sysdiagnose artifact; planned for a future version",
+                    "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
                     "SMS/iMessage link payloads - device backups only",
                     "Per-process network usage (DataUsage) - device backups only",
@@ -360,7 +381,7 @@ mod tests {
             .iter()
             .map(|m| m.kind.as_str())
             .collect();
-        assert_eq!(missing, vec!["shutdown_log", "crash_log"]);
+        assert_eq!(missing, vec!["shutdown_log", "crash_log", "unified_log"]);
     }
 
     #[test]

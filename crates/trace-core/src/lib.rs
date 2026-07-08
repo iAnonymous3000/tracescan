@@ -16,6 +16,7 @@ mod crash_log;
 mod heuristics;
 mod ps;
 mod shutdown_log;
+mod unified_log;
 
 use wasm_bindgen::prelude::*;
 

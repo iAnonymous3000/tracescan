@@ -47,6 +47,42 @@ pub fn classify(path: &str) -> Option<ArtifactKind> {
     None
 }
 
+/// Unified-log files are consumed as they stream by rather than retained:
+/// a real logarchive carries hundreds of megabytes of tracev3 and uuidtext,
+/// far past the retention budget, but each file can be reduced to a few
+/// process facts and dropped (see `unified_log`).
+enum ConsumeKind {
+    Tracev3,
+    /// Payload is the 32-hex binary UUID encoded by the file's location
+    /// (`XX/` directory plus 30-char filename).
+    UuidText(String),
+}
+
+fn is_upper_hex(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+}
+
+fn classify_consume(path: &str) -> Option<ConsumeKind> {
+    let p = path.trim_start_matches("./");
+    let rest = &p[p.find("system_logs.logarchive/")? + "system_logs.logarchive/".len()..];
+    let base = rest.rsplit('/').next().unwrap_or(rest);
+    if base.starts_with("._") {
+        return None;
+    }
+    if base.ends_with(".tracev3") {
+        return Some(ConsumeKind::Tracev3);
+    }
+    let mut comps = rest.split('/');
+    if let (Some(dir), Some(name), None) = (comps.next(), comps.next(), comps.next()) {
+        if dir.len() == 2 && name.len() == 30 && is_upper_hex(dir) && is_upper_hex(name) {
+            return Some(ConsumeKind::UuidText(format!("{dir}{name}")));
+        }
+    }
+    None
+}
+
 pub struct CollectedFile {
     pub path: String,
     pub kind: ArtifactKind,
@@ -84,10 +120,16 @@ impl Default for Limits {
 
 const META_CAP: u64 = 1024 * 1024;
 
+enum Keep {
+    No,
+    Retain(String, ArtifactKind),
+    Consume(String, ConsumeKind),
+}
+
 enum State {
     Header,
     Data {
-        keep: Option<(String, ArtifactKind)>,
+        keep: Keep,
         buf: Vec<u8>,
         real: u64,
         total: u64,
@@ -115,6 +157,9 @@ pub struct TarCollector {
     limits: Limits,
     retained_bytes: usize,
     pub files: Vec<CollectedFile>,
+    /// Streaming consumer for unified-log files (never retained; each file
+    /// is reduced to process facts on completion and dropped).
+    pub(crate) unified: crate::unified_log::Aggregator,
     pub entries: u64,
     /// Artifact files the scanner wanted but dropped because a global cap
     /// was already reached. Any nonzero value means the scan is incomplete.
@@ -176,6 +221,7 @@ impl TarCollector {
             limits,
             retained_bytes: 0,
             files: Vec::new(),
+            unified: Default::default(),
             entries: 0,
             dropped_artifacts: 0,
             entry_cap_hit: false,
@@ -251,13 +297,19 @@ impl TarCollector {
                             let keep = match classify(&path) {
                                 Some(_) if at_cap => {
                                     self.dropped_artifacts += 1;
-                                    None
+                                    Keep::No
                                 }
-                                Some(k) => Some((path, k)),
-                                None => None,
+                                Some(k) => Keep::Retain(path, k),
+                                // Consumables are transient (bounded by
+                                // file_cap, one at a time), so the retention
+                                // caps do not apply to them.
+                                None => match classify_consume(&path) {
+                                    Some(k) => Keep::Consume(path, k),
+                                    None => Keep::No,
+                                },
                             };
                             if total == 0 {
-                                if let Some((p, k)) = keep {
+                                if let Keep::Retain(p, k) = keep {
                                     self.files.push(CollectedFile {
                                         path: p,
                                         kind: k,
@@ -294,7 +346,7 @@ impl TarCollector {
                             // Directories, links, and unknown types: skip payload.
                             if total > 0 {
                                 self.state = State::Data {
-                                    keep: None,
+                                    keep: Keep::No,
                                     buf: Vec::new(),
                                     real: 0,
                                     total,
@@ -314,16 +366,25 @@ impl TarCollector {
                     let avail = (self.pending.len() - cur) as u64;
                     let n = avail.min(total);
                     let r = n.min(real);
-                    if keep.is_some() && r > 0 {
-                        let room = self.limits.file_cap.saturating_sub(buf.len()).min(
-                            self.limits
-                                .total_retain_cap
-                                .saturating_sub(self.retained_bytes),
-                        );
+                    if r > 0 {
+                        // Retained files count against the global retention
+                        // budget; consumables only against the per-file cap,
+                        // since at most one is buffered and then dropped.
+                        let room = match &keep {
+                            Keep::Retain(..) => self.limits.file_cap.saturating_sub(buf.len()).min(
+                                self.limits
+                                    .total_retain_cap
+                                    .saturating_sub(self.retained_bytes),
+                            ),
+                            Keep::Consume(..) => self.limits.file_cap.saturating_sub(buf.len()),
+                            Keep::No => 0,
+                        };
                         let take = (r as usize).min(room);
                         buf.extend_from_slice(&self.pending[cur..cur + take]);
-                        self.retained_bytes += take;
-                        if take < r as usize {
+                        if matches!(keep, Keep::Retain(..)) {
+                            self.retained_bytes += take;
+                        }
+                        if !matches!(keep, Keep::No) && take < r as usize {
                             truncated = true;
                         }
                     }
@@ -331,13 +392,26 @@ impl TarCollector {
                     real -= r;
                     total -= n;
                     if total == 0 {
-                        if let Some((p, k)) = keep {
-                            self.files.push(CollectedFile {
+                        match keep {
+                            Keep::Retain(p, k) => self.files.push(CollectedFile {
                                 path: p,
                                 kind: k,
                                 data: buf,
                                 truncated,
-                            });
+                            }),
+                            // A partially buffered unified-log file would
+                            // parse to an under-count, not an error; skip
+                            // it and let the engine surface the gap.
+                            Keep::Consume(_, _) if truncated => {
+                                self.unified.truncated_files += 1;
+                            }
+                            Keep::Consume(p, kind) => match kind {
+                                ConsumeKind::Tracev3 => self.unified.consume_tracev3(&p, &buf),
+                                ConsumeKind::UuidText(uuid) => {
+                                    self.unified.consume_uuidtext(uuid, &buf)
+                                }
+                            },
+                            Keep::No => {}
                         }
                         self.state = State::Header;
                         continue;
@@ -570,6 +644,50 @@ mod tests {
             col.files.is_empty(),
             "nothing after the cap may be retained"
         );
+    }
+
+    #[test]
+    fn classify_consume_patterns() {
+        let lp = "root/system_logs.logarchive";
+        assert!(matches!(
+            classify_consume(&format!("{lp}/Persist/0000000000000001.tracev3")),
+            Some(ConsumeKind::Tracev3)
+        ));
+        assert!(matches!(
+            classify_consume(&format!("{lp}/Special/0000000000000002.tracev3")),
+            Some(ConsumeKind::Tracev3)
+        ));
+        match classify_consume(&format!("{lp}/AB/CDEF01234567890123456789012345")) {
+            Some(ConsumeKind::UuidText(u)) => {
+                assert_eq!(u, "ABCDEF01234567890123456789012345")
+            }
+            _ => panic!("uuidtext layout must classify"),
+        }
+        // dsc must never be consumed (155 MB shared string cache)
+        assert!(classify_consume(&format!("{lp}/dsc/CDEF01234567890123456789012345")).is_none());
+        // lowercase hex is not the uuidtext layout
+        assert!(classify_consume(&format!("{lp}/ab/cdef01234567890123456789012345")).is_none());
+        // tracev3 outside a logarchive is not ours
+        assert!(classify_consume("root/other/x.tracev3").is_none());
+        // AppleDouble companions are ignored here too
+        assert!(classify_consume(&format!("{lp}/Persist/._0000000000000001.tracev3")).is_none());
+    }
+
+    #[test]
+    fn consumed_files_are_not_retained() {
+        let lp = "root/system_logs.logarchive";
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&test_util::entry(
+            &format!("{lp}/Persist/0000000000000001.tracev3"),
+            &[0xAB; 700], // garbage: parse failure, but must be consumed
+        ));
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.files.len(), 1, "only ps.txt is retained");
+        assert_eq!(col.unified.tracev3_files, 1);
+        assert_eq!(col.unified.tracev3_failures, 1);
     }
 
     #[test]

@@ -14,13 +14,14 @@ Trace makes credible spyware forensics accessible to people who have never opene
 2. AirDrop the `sysdiagnose_….tar.gz` file to a computer.
 3. Drag it into the Trace page. Analysis takes well under two minutes.
 
-The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory (hard-capped, so a crafted archive cannot exhaust it), and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. Three artifact types are analyzed:
+The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory (hard-capped, so a crafted archive cannot exhaust it), and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. Four artifact types are analyzed:
 
 | Artifact | Signal |
 |---|---|
 | `system_logs.logarchive/Extra/shutdown.log` (rotated `shutdown.0.log` on iOS 26) | Processes that delayed shutdown, per reboot - the [iShutdown](https://github.com/KasperskyLab/iShutdown) technique; Pegasus artifacts run from `roleaccountd.staging` |
 | `crashes_and_spins/*.ips` | Crashing process names/paths vs. process indicators |
 | `ps.txt`, `ps_thread.txt` | Processes running at capture time vs. process indicators |
+| `system_logs.logarchive` tracev3 + uuidtext | Every process that wrote a unified-log entry during the archive window (typically days of history), via [Mandiant's parser](https://github.com/mandiant/macos-UnifiedLogs) at catalog level - process inventory only, log messages are never rendered, and each file is reduced and dropped so memory stays flat |
 
 Both shutdown.log generations are handled and were verified against a real iOS 26.5.2 capture: the classic one-line format, and the iOS 26 format with rotated filenames, indented client lines, and a trailing binary-UUID path component (stripped before matching, or no name indicator could ever hit).
 
@@ -68,7 +69,7 @@ Cloudflare enforces `web/_headers` automatically, so the CSP, COOP, and nosniff 
 
 ## Scope (v1)
 
-Deliberate non-goals: real-time monitoring, removal claims, Android, backup parsing. Planned next: unified log (`tracev3`) parsing via Mandiant's `macos-unifiedlogs` Rust crate - the richest artifact in a sysdiagnose, already in the right language for this stack.
+Deliberate non-goals: real-time monitoring, removal claims, Android, backup parsing. Unified-log analysis is catalog-level by design (process inventory, no message rendering): message-content indicators are domains and URLs, which belong to the backup-artifact scope. See [docs/design-unified-logs.md](docs/design-unified-logs.md) for that trade-off.
 
 ## Acknowledgements
 
