@@ -27,10 +27,29 @@ always means an automated test that runs in CI.
   seeded with a real published indicator. If you are a researcher holding
   real infected artifacts and can share them (even hashed or redacted),
   please open contact via SECURITY.md.
-- **No differential run against MVT on the same capture.** Planned: run
-  Trace and MVT over the same real sysdiagnose and compare findings. Needs a
-  real capture, which is personal data and therefore not committed to this
-  repository.
+
+## Differential comparison against MVT (2026-07-08)
+
+Trace v0.5.0 and MVT 2026.5.12 were run over the same real iOS 26.5.2
+capture. MVT cannot ingest a sysdiagnose archive (its filesystem modules
+target full filesystem dumps), so its `ShutdownLog` parser was driven
+directly against the capture's `shutdown.0.log` - the one artifact class
+both tools read:
+
+| Metric | Trace | MVT | Agreement |
+|---|---|---|---|
+| Client records parsed | 2,279 | 2,279 | exact |
+| Unique clients (UUID-stripped) | 72 | 72 | path sets byte-identical |
+| Shutdown events | 50 reboot blocks | 50 SIGTERM markers | consistent |
+| Indicator alerts | 0 (2,887 indicators) | 0 (11,254 indicators, full MVT collection) | agree |
+
+Two MVT-side gaps surfaced during the comparison, both relevant to iOS 26
+captures: its module globs only `private/var/db/diagnostics/shutdown.log`
+(the rotated `shutdown.0.log` name would not be found even in a filesystem
+dump), and it does not strip the iOS 26 trailing binary-UUID path component
+(its per-component process matching compensates for process-name
+indicators, but `file:path` indicators would not match). Both are worth
+reporting upstream.
 
 A "validated against published patterns" tool can still miss what was never
 published. That limit is inherent to public threat intelligence and is
