@@ -74,10 +74,14 @@ for kind in clean infected; do
   tmp=$(mktemp -d)
   make_tree "$tmp" "$kind"
   # Deterministic archive: fixed mtimes, sorted entry order, no owner
-  # metadata, and gzip without its timestamp header.
+  # metadata, and gzip without its timestamp header. Extended attributes,
+  # ACLs and file flags are stripped too: macOS stamps new files with a
+  # com.apple.provenance xattr whose value varies per creating process,
+  # which silently broke byte-for-byte reproducibility.
   find "$tmp" -exec touch -t 202607071900 {} +
   (cd "$tmp" && find . -mindepth 1 -print | LC_ALL=C sort \
-    | tar -cn --uid 0 --gid 0 -T - -f - | gzip -n) \
+    | COPYFILE_DISABLE=1 tar -cn --no-xattrs --no-acls --no-fflags \
+        --uid 0 --gid 0 -T - -f - | gzip -n) \
     > "$OUT/sysdiagnose_demo_$kind.tar.gz"
   rm -rf "$tmp"
 done

@@ -4,7 +4,7 @@
 
 **Check an iPhone sysdiagnose for traces of known mercenary spyware - entirely in your browser.**
 
-**Live: https://ianonymous3000.github.io/tracescan/**
+**Live: https://tracescan.pages.dev/**
 
 Trace makes credible spyware forensics accessible to people who have never opened a terminal, without asking them to trust anyone with their data. Parsing and indicator matching run as a Rust/WebAssembly module inside the browser tab. **There is no upload endpoint - the privacy claim is architectural, not a policy promise**, and you can verify it yourself: load the page, turn on Airplane Mode, and scan.
 
@@ -55,9 +55,9 @@ Layout:
 - `e2e/` - Playwright browser tests: demo scans, verdict rendering, report export, scan-limit handling, and offline operation.
 - `fixtures/make_fixtures.sh` - synthetic demo archive generator.
 
-CI runs fmt, clippy, tests, `cargo audit`, and the browser E2E suite; deploys only run after a CI run on `main` succeeds, pinned to the commit CI validated. A weekly workflow PRs upstream indicator changes into the bundled snapshots (requires the "Allow GitHub Actions to create and approve pull requests" repo setting).
+CI runs fmt, clippy, tests, `cargo audit`, and the browser E2E suite on every push and PR. A weekly workflow PRs upstream indicator changes into the bundled snapshots (requires the "Allow GitHub Actions to create and approve pull requests" repo setting).
 
-Deployment notes: serve `web/` from any static host. `web/_headers` carries the real security headers (CSP, COOP, nosniff) in the format Netlify and Cloudflare Pages honor automatically; on other hosts, send those same headers yourself. **GitHub Pages cannot send custom headers**, so on the current Pages deployment the `<meta>` CSP in `index.html` is the only enforced policy (COOP and `frame-ancestors` cannot be expressed in a meta tag) - a hardened production deployment should live on a host that sends real headers. Bump `CACHE` in `sw.js` on each release (the deploy workflow also stamps it per commit).
+Deployment notes: production is **Cloudflare Pages** (`tracescan.pages.dev`), built by its git integration on every push to `main` (build command installs Rust and wasm-pack, builds the WASM module, and stamps the service-worker cache name with the commit SHA; output directory `web/`). Cloudflare enforces `web/_headers` automatically, so the CSP, COOP, and nosniff headers are real there; the `<meta>` CSP in `index.html` remains as defense in depth for any host that cannot send headers. Note that Cloudflare builds track `main` directly rather than waiting for CI, so don't push to `main` with CI red. The old GitHub Pages URL now serves only a redirect plus a service-worker kill switch (`redirect/`, published by `.github/workflows/deploy.yml`); leave it in place indefinitely so returning visitors with the old origin cached get moved over.
 
 ## Scope (v1)
 
