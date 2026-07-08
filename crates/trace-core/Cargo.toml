@@ -1,0 +1,21 @@
+[package]
+name = "trace-core"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
+license = "MIT"
+repository = "https://github.com/iAnonymous3000/tracescan"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+regex-lite = "0.1"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

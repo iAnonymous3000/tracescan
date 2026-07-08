@@ -1,0 +1,27 @@
+{
+  "bundled_date": "2026-07-07",
+  "comment": "Bundled snapshots are the offline floor; the app opportunistically fetches the same URLs live at load time. Android-only sets from the same repo (2023-03-29_android_campaign, 2024-12-16_serbia_novispy) are excluded by scope.",
+  "sets": [
+    {
+      "name": "pegasus",
+      "campaign_hint": "Pegasus (NSO Group)",
+      "file": "iocs/pegasus.stix2",
+      "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2021-07-18_nso/pegasus.stix2",
+      "source": "Amnesty International Security Lab"
+    },
+    {
+      "name": "cytrox",
+      "campaign_hint": "Predator (Cytrox/Intellexa)",
+      "file": "iocs/cytrox.stix2",
+      "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2021-12-16_cytrox/cytrox.stix2",
+      "source": "Amnesty International Security Lab"
+    },
+    {
+      "name": "wintego_helios",
+      "campaign_hint": "Wintego Helios",
+      "file": "iocs/wintego_helios.stix2",
+      "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2024-05-02_wintego_helios/wintego_helios.stix2",
+      "source": "Amnesty International Security Lab"
+    }
+  ]
+}

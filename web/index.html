@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://raw.githubusercontent.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Trace - check an iPhone sysdiagnose for spyware traces</title>
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap">
+    <h1 class="wordmark">Trace</h1>
+    <p class="tagline">Check an iPhone diagnostic file for traces of known mercenary spyware - Pegasus, Predator, and others. Free, open, and nothing you scan ever leaves your computer.</p>
+  </div>
+</header>
+
+<div class="privacy-strip" id="privacy-strip">
+  <div class="wrap">
+    <span class="dot" id="offline-dot" aria-hidden="true"></span>
+    <span id="privacy-text">Analysis runs entirely in this browser tab. There is no upload - no server ever sees your file.</span>
+    <button class="linklike" id="prove-it">How can I verify that?</button>
+  </div>
+</div>
+
+<dialog id="prove-dialog">
+  <h2>Verify it yourself - no trust required</h2>
+  <ol>
+    <li>Load this page.</li>
+    <li>Turn on <strong>Airplane Mode</strong> (or unplug your network).</li>
+    <li>Run your scan. Everything still works, because the analysis is a WebAssembly program running inside this tab.</li>
+  </ol>
+  <p>You can also open your browser's developer tools on the Network panel during a scan: the only requests this page ever makes are downloads of public indicator lists - your file is never in any request. The page's security policy (CSP) forbids connections to anywhere else.</p>
+  <form method="dialog"><button class="btn">Close</button></form>
+</dialog>
+
+<main class="wrap">
+  <section id="landing">
+    <div id="dropzone" tabindex="0" role="button" aria-label="Choose or drop a sysdiagnose archive to scan">
+      <div class="dz-inner">
+        <div class="dz-icon" aria-hidden="true">⇣</div>
+        <p class="dz-title">Drop your sysdiagnose file here</p>
+        <p class="dz-sub">a file named like <code>sysdiagnose_2026.07.07_…​.tar.gz</code></p>
+        <label class="btn" for="file-input">Choose file</label>
+        <input type="file" id="file-input" accept=".gz,.tgz,.tar,application/gzip">
+      </div>
+    </div>
+    <p class="demo-row">No file yet? See what results look like:
+      <button class="linklike" id="demo-clean">example with no findings</button> ·
+      <button class="linklike" id="demo-infected">example with an infection</button>
+    </p>
+
+    <details class="guide" id="capture-guide">
+      <summary>How to capture a sysdiagnose on your iPhone (no computer skills needed)</summary>
+      <ol>
+        <li><strong>Trigger it:</strong> press and hold <em>both volume buttons and the side button together</em> for about 1 to 1.5 seconds, then release. You'll feel a short vibration. (If the power-off slider appears, you held too long - cancel and try a shorter press.)</li>
+        <li><strong>Wait about 10 minutes.</strong> Your iPhone gathers diagnostics in the background; you can keep using it.</li>
+        <li><strong>Find the file:</strong> open <em>Settings → Privacy &amp; Security → Analytics &amp; Improvements → Analytics Data</em>. Scroll to the files starting with <code>sysdiagnose_</code> and tap the newest one.</li>
+        <li><strong>Send it to your computer:</strong> tap the share button and AirDrop it to your Mac, or save it to Files and transfer however you prefer.</li>
+        <li><strong>Drop it above.</strong> The capture takes ~10 minutes; the analysis usually takes well under two.</li>
+      </ol>
+    </details>
+
+    <section class="panel" id="ioc-panel" hidden>
+      <h2>Indicators loaded</h2>
+      <div id="ioc-list"></div>
+      <p class="fine" id="ioc-note"></p>
+    </section>
+  </section>
+
+  <section id="scanning" hidden>
+    <h2>Scanning…</h2>
+    <progress id="progress" max="100" value="0"></progress>
+    <p id="progress-text" class="fine"></p>
+    <p class="fine">Your file is being read locally, piece by piece. Nothing is uploaded.</p>
+  </section>
+
+  <section id="results" hidden></section>
+
+  <section id="about">
+    <h2>What Trace is - and is not</h2>
+    <p>Trace inspects three artifacts inside an iPhone sysdiagnose - the shutdown log, crash logs, and process listings - and compares them against public indicators of compromise published by <a href="https://securitylab.amnesty.org/" rel="noopener">Amnesty International's Security Lab</a>. These artifacts are where several known implants, including Pegasus, have left visible traces.</p>
+    <p><strong>A "no matches" result is not a clean bill of health.</strong> It means no <em>known</em> implant left <em>known</em> traces in the artifacts this tool reads. Spyware not yet publicly documented, or traces that live elsewhere (browsing history, message databases, network records), would not be found. If your risk is real - you are a journalist, activist, lawyer, or targeted person - treat this tool as a first look, not a verdict, and talk to the experts linked in every result.</p>
+    <p>Trace does not monitor in real time, cannot remove anything, and does not support Android yet. It inherits the time lag of public threat intelligence: commercial tools with private telemetry may know about newer indicators sooner. That is the honest trade for a tool you never have to trust with your data.</p>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener">open source</a> and runs entirely on your device. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener">AmnestyTech/investigations</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener">iShutdown</a> research.</p>
+    <p>If you believe you are in danger because of surveillance, contact <a href="https://www.accessnow.org/help/" rel="noopener">Access Now's Digital Security Helpline</a>.</p>
+  </div>
+</footer>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>
