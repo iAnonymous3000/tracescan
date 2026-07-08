@@ -14,5 +14,12 @@ module.exports = defineConfig({
     url: 'http://127.0.0.1:4173/',
     reuseExistingServer: !process.env.CI,
   },
-  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
+  // All three engines: Mac users overwhelmingly arrive in Safari, and the
+  // app leans on module workers, File.stream(), <dialog>, and a service
+  // worker - exactly the surfaces that diverge between engines.
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } },
+    { name: 'firefox', use: { browserName: 'firefox' } },
+    { name: 'webkit', use: { browserName: 'webkit' } },
+  ],
 });

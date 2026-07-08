@@ -1,5 +1,8 @@
 name: CI
 
+# Actions are pinned to commit SHAs (dependabot proposes bumps), the Rust
+# toolchain comes from rust-toolchain.toml, and wasm-pack is pinned by
+# version: no floating dependency can silently change what ships.
 on:
   push:
     branches: [main]
@@ -9,13 +12,10 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown
-          rustup component add rustfmt clippy
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Format check
         run: cargo fmt --all --check
@@ -27,7 +27,9 @@ jobs:
         run: cargo test
 
       - name: Install wasm-pack
-        run: curl -sSf https://drager.github.io/wasm-pack/installer/init.sh | sh
+        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
+        with:
+          tool: wasm-pack@0.14.0
 
       - name: Build WASM module
         run: wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
@@ -35,10 +37,12 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
+        with:
+          tool: cargo-audit
 
       - name: Audit dependencies
         run: cargo audit
@@ -46,20 +50,20 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Install wasm-pack
-        run: curl -sSf https://drager.github.io/wasm-pack/installer/init.sh | sh
+        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
+        with:
+          tool: wasm-pack@0.14.0
 
       - name: Build WASM module
         run: wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -69,8 +73,8 @@ jobs:
         run: npm ci
         working-directory: e2e
 
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium firefox webkit
         working-directory: e2e
 
       - name: Run browser E2E tests

@@ -71,7 +71,11 @@ function isStixBundle(text) {
 }
 
 async function loadIndicators() {
-  const manifest = await (await fetch('./iocs/manifest.json')).json();
+  // 'no-cache' forces revalidation: dev servers without Cache-Control
+  // otherwise leave heuristically cached stale copies in play. In
+  // production the service worker answers these before HTTP caching
+  // matters, so this only costs a conditional request on first load.
+  const manifest = await (await fetch('./iocs/manifest.json', { cache: 'no-cache' })).json();
   // Sets refresh in parallel: on a network that silently drops the requests,
   // sequential 6-second timeouts would stall the panel for their sum.
   state.stix = await Promise.all(manifest.sets.map(async (set) => {
@@ -94,7 +98,7 @@ async function loadIndicators() {
       }
     } catch { /* offline or blocked - bundled snapshot below */ }
     if (!text) {
-      text = await (await fetch(set.file)).text();
+      text = await (await fetch(set.file, { cache: 'no-cache' })).text();
     }
     const sha256 = await sha256hex(text);
     return { ...set, text, loaded_from, date, sha256, etag, last_modified };

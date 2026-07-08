@@ -1,0 +1,8 @@
+# Pins the exact compiler for every environment that builds Trace - CI,
+# the Cloudflare Pages build, and local checkouts - so the deployed WASM is
+# reproducible from a tagged commit and toolchain drift cannot break or
+# alter a release. Bump deliberately, in its own commit.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
