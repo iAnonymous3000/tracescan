@@ -51,7 +51,10 @@ pub fn analyze(
             entries += 1;
             let pid: u32 = c[1].parse().unwrap_or(0);
             let proc_path = c[2].trim().to_string();
-            client_pids.entry(proc_path.clone()).or_default().insert(pid);
+            client_pids
+                .entry(proc_path.clone())
+                .or_default()
+                .insert(pid);
             current.insert(proc_path);
         }
     }

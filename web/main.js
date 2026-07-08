@@ -90,13 +90,58 @@ function renderIocPanel() {
 
 /* ---------- scanning ---------- */
 
-async function handleFile(file) {
-  showSection('scanning');
-  const progress = $('#progress');
-  const ptext = $('#progress-text');
+let worker = null;
+
+function initWorker() {
+  try {
+    worker = new Worker('./worker.js', { type: 'module' });
+  } catch {
+    worker = null; // very old browser: fall back to inline scanning
+  }
+}
+
+function updateProgress(processed, total) {
+  $('#progress').value = total ? Math.round((processed / total) * 100) : 0;
+  $('#progress-text').textContent = `${fmtBytes(processed)} of ${fmtBytes(total)} read`;
+}
+
+function scanWithWorker(file) {
+  return new Promise((resolve, reject) => {
+    const w = worker;
+    const onMsg = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') {
+        updateProgress(m.processed, file.size);
+      } else if (m.type === 'report') {
+        cleanup();
+        resolve(m.report);
+      } else if (m.type === 'error') {
+        cleanup();
+        reject(new Error(m.message));
+      }
+    };
+    const onErr = () => {
+      cleanup();
+      worker = null; // future scans use the inline path
+      reject(new Error('The background scanner failed. Reload the page and try again.'));
+    };
+    const cleanup = () => {
+      w.removeEventListener('message', onMsg);
+      w.removeEventListener('error', onErr);
+    };
+    w.addEventListener('message', onMsg);
+    w.addEventListener('error', onErr);
+    w.postMessage({
+      type: 'scan',
+      file,
+      sets: state.stix.map((s) => ({ name: s.name, text: s.text })),
+    });
+  });
+}
+
+async function scanInline(file) {
   const scanner = state.scanner ?? newScanner();
   state.scanner = null;
-
   try {
     const reader = file.stream().getReader();
     let processed = 0;
@@ -106,13 +151,30 @@ async function handleFile(file) {
       if (done) break;
       scanner.push(value);
       processed += value.byteLength;
-      progress.value = file.size ? Math.round((processed / file.size) * 100) : 0;
-      ptext.textContent = `${fmtBytes(processed)} of ${fmtBytes(file.size)} read`;
+      updateProgress(processed, file.size);
       if (++n % 2 === 0) await new Promise((r) => setTimeout(r, 0));
     }
-    const report = JSON.parse(scanner.finish());
+    return JSON.parse(scanner.finish());
+  } finally {
+    try { state.scanner = newScanner(); } catch { /* keep last error visible */ }
+  }
+}
+
+async function handleFile(file) {
+  showSection('scanning');
+  updateProgress(0, file.size);
+  try {
+    let report;
+    if (worker) {
+      state.lastScanVia = 'worker';
+      report = await scanWithWorker(file);
+    } else {
+      state.lastScanVia = 'inline';
+      report = await scanInline(file);
+    }
     report.generated_at = new Date().toISOString();
     report.source_file = { name: file.name, size: file.size };
+    report.scanned_via = state.lastScanVia;
     report.indicator_provenance = state.stix.map((s) => ({
       name: s.name, campaign: s.stats.campaign, loaded_from: s.loaded_from, date: s.date, url: s.url,
     }));
@@ -120,8 +182,6 @@ async function handleFile(file) {
     renderReport(report);
   } catch (err) {
     renderError(err);
-  } finally {
-    try { state.scanner = newScanner(); } catch { /* keep last error visible */ }
   }
 }
 
@@ -142,8 +202,8 @@ const HELP_BLOCK = `
       <li><strong>Keep this sysdiagnose file</strong> somewhere safe, and export the report below.</li>
       <li><strong>Contact specialists</strong> (free, confidential):
         <ul>
-          <li><a href="https://www.accessnow.org/help/" rel="noopener">Access Now Digital Security Helpline</a> - 24/7, multiple languages</li>
-          <li><a href="https://securitylab.amnesty.org/get-help/" rel="noopener">Amnesty International Security Lab</a> - forensic support for civil society</li>
+          <li><a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now Digital Security Helpline</a> - 24/7, multiple languages</li>
+          <li><a href="https://securitylab.amnesty.org/get-help/" rel="noopener noreferrer">Amnesty International Security Lab</a> - forensic support for civil society</li>
         </ul>
       </li>
       <li>If you fear your device is being watched, consider making contact <strong>from a different device</strong>.</li>
@@ -177,7 +237,7 @@ function verdictHtml(report) {
   return `<div class="verdict clear">
     <h2>No known spyware traces found</h2>
     <p>None of the ${applicable} applicable public indicators appeared in the artifacts this tool reads${noteCount ? `, though ${noteCount} informational note${noteCount > 1 ? 's are' : ' is'} listed below` : ''}.</p>
-    <p><strong>This is not the same as "your phone is clean."</strong> It means: no publicly documented implant left its known traces in these artifacts. Spyware that is new, undocumented, or leaves traces elsewhere would not appear here. If you face real risk, treat this as one data point and consider expert help - <a href="https://www.accessnow.org/help/" rel="noopener">Access Now's helpline</a> is free.</p>
+    <p><strong>This is not the same as "your phone is clean."</strong> It means: no publicly documented implant left its known traces in these artifacts. Spyware that is new, undocumented, or leaves traces elsewhere would not appear here. If you face real risk, treat this as one data point and consider expert help - <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's helpline</a> is free.</p>
   </div>`;
 }
 
@@ -211,9 +271,16 @@ function artifactsHtml(report) {
         .filter(([, v]) => v !== null)
         .map(([k, v]) => `${k}: ${v}`).join(', '))}</td>
     </tr>`).join('');
+  const missingRows = (report.missing_artifacts || []).map((m) => `
+    <tr>
+      <td>${esc(m.kind)}</td>
+      <td class="path">–</td>
+      <td>not found</td>
+      <td>${esc(m.note)}</td>
+    </tr>`).join('');
   return `<div class="panel"><h2>What was examined (${report.artifacts.length} artifacts, ${report.stats.archive_entries} files in archive)</h2>
     <table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>`;
+    <tbody>${rows}${missingRows}</tbody></table></div>`;
 }
 
 function coverageHtml(report) {
@@ -233,7 +300,7 @@ function provenanceHtml(report) {
     <div class="ioc-row">
       <span><span class="campaign">${esc(p.campaign)}</span>
         <span class="badge ${esc(p.loaded_from)}">${p.loaded_from === 'live' ? 'live · ' : 'snapshot · '}${esc(p.date)}</span></span>
-      <span class="meta"><a href="${esc(p.url)}" rel="noopener">source</a></span>
+      <span class="meta"><a href="${esc(p.url)}" rel="noopener noreferrer">source</a></span>
     </div>`).join('');
   return `<div class="panel"><h2>Indicators used</h2>${rows}
     <p class="fine">Public indicators inherit a time lag: new campaigns appear here only after researchers publish them. A scan can only be as current as the open ecosystem.</p></div>`;
@@ -258,6 +325,8 @@ function renderReport(report) {
   $('#export-btn').addEventListener('click', exportReport);
   $('#rescan-btn').addEventListener('click', () => showSection('landing'));
   showSection('results');
+  // Move focus to the verdict so screen readers announce the outcome.
+  $('#results').focus();
 }
 
 function renderError(err) {
@@ -331,6 +400,7 @@ function wireUi() {
 
 async function boot() {
   wireUi();
+  initWorker();
   await init();
   await loadIndicators();
   state.scanner = newScanner();
@@ -344,6 +414,7 @@ async function boot() {
 window.__trace = {
   handleFile,
   get lastReport() { return state.lastReport; },
+  get lastScanVia() { return state.lastScanVia; },
   get ready() { return state.scanner !== null; },
 };
 

@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://raw.githubusercontent.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="description" content="Check an iPhone sysdiagnose for traces of Pegasus, Predator, and other mercenary spyware. Runs entirely in your browser; your file never leaves your device.">
+<meta property="og:title" content="Trace: check an iPhone for spyware traces">
+<meta property="og:description" content="Scan an iPhone sysdiagnose for traces of known mercenary spyware. Free, open source, and nothing you scan ever leaves your computer.">
+<meta property="og:url" content="https://ianonymous3000.github.io/tracescan/">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14171a" media="(prefers-color-scheme: dark)">
 <title>Trace - check an iPhone sysdiagnose for spyware traces</title>
 <link rel="stylesheet" href="./style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
@@ -72,15 +80,15 @@
   <section id="scanning" hidden>
     <h2>Scanning…</h2>
     <progress id="progress" max="100" value="0"></progress>
-    <p id="progress-text" class="fine"></p>
+    <p id="progress-text" class="fine" role="status"></p>
     <p class="fine">Your file is being read locally, piece by piece. Nothing is uploaded.</p>
   </section>
 
-  <section id="results" hidden></section>
+  <section id="results" tabindex="-1" hidden></section>
 
   <section id="about">
     <h2>What Trace is - and is not</h2>
-    <p>Trace inspects three artifacts inside an iPhone sysdiagnose - the shutdown log, crash logs, and process listings - and compares them against public indicators of compromise published by <a href="https://securitylab.amnesty.org/" rel="noopener">Amnesty International's Security Lab</a>. These artifacts are where several known implants, including Pegasus, have left visible traces.</p>
+    <p>Trace inspects three artifacts inside an iPhone sysdiagnose - the shutdown log, crash logs, and process listings - and compares them against public indicators of compromise published by <a href="https://securitylab.amnesty.org/" rel="noopener noreferrer">Amnesty International's Security Lab</a>. These artifacts are where several known implants, including Pegasus, have left visible traces.</p>
     <p><strong>A "no matches" result is not a clean bill of health.</strong> It means no <em>known</em> implant left <em>known</em> traces in the artifacts this tool reads. Spyware not yet publicly documented, or traces that live elsewhere (browsing history, message databases, network records), would not be found. If your risk is real - you are a journalist, activist, lawyer, or targeted person - treat this tool as a first look, not a verdict, and talk to the experts linked in every result.</p>
     <p>Trace does not monitor in real time, cannot remove anything, and does not support Android yet. It inherits the time lag of public threat intelligence: commercial tools with private telemetry may know about newer indicators sooner. That is the honest trade for a tool you never have to trust with your data.</p>
   </section>
@@ -88,8 +96,8 @@
 
 <footer class="site-footer">
   <div class="wrap">
-    <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener">open source</a> and runs entirely on your device. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener">AmnestyTech/investigations</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener">iShutdown</a> research.</p>
-    <p>If you believe you are in danger because of surveillance, contact <a href="https://www.accessnow.org/help/" rel="noopener">Access Now's Digital Security Helpline</a>.</p>
+    <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener noreferrer">open source</a> and runs entirely on your device. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener noreferrer">AmnestyTech/investigations</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener noreferrer">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener noreferrer">iShutdown</a> research.</p>
+    <p>If you believe you are in danger because of surveillance, contact <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's Digital Security Helpline</a>.</p>
   </div>
 </footer>
 

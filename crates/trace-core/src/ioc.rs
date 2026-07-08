@@ -236,7 +236,8 @@ mod tests {
         assert_eq!(db.match_process("BH").len(), 1);
         assert_eq!(db.match_process("/usr/sbin/bh").len(), 1);
         assert_eq!(
-            db.match_process("/private/var/db/com.apple.xpc.roleaccountd.staging/msgacntd").len(),
+            db.match_process("/private/var/db/com.apple.xpc.roleaccountd.staging/msgacntd")
+                .len(),
             1
         );
         // no substring matching: "bh2" must not hit "bh"

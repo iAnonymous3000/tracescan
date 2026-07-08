@@ -37,6 +37,9 @@ jobs:
       - name: Drop build metadata from the site artifact
         run: rm -f web/pkg/.gitignore web/pkg/package.json
 
+      - name: Version the service worker cache per deploy
+        run: sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${GITHUB_SHA:0:8}'/" web/sw.js && grep "const CACHE" web/sw.js
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3

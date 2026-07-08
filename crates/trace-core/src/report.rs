@@ -121,6 +121,15 @@ pub struct ScanStats {
     pub applicable_indicators: usize,
 }
 
+/// An artifact kind the scanner knows how to read but did not find in the
+/// archive. Surfacing these is part of honest results: a verdict computed
+/// from two of three detection surfaces must say so.
+#[derive(Serialize)]
+pub struct MissingArtifact {
+    pub kind: String,
+    pub note: String,
+}
+
 #[derive(Serialize)]
 pub struct Coverage {
     pub examined: Vec<&'static str>,
@@ -135,6 +144,7 @@ pub struct Report {
     pub device: Option<DeviceInfo>,
     pub indicator_sets: Vec<crate::ioc::SetStats>,
     pub artifacts: Vec<ArtifactSummary>,
+    pub missing_artifacts: Vec<MissingArtifact>,
     pub findings: Vec<Finding>,
     pub stats: ScanStats,
     pub coverage: Coverage,

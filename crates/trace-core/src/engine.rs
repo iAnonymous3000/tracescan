@@ -47,9 +47,9 @@ impl Engine {
             });
         }
         match self.sink.as_mut().unwrap() {
-            Sink::Gz(g) => g
-                .write_all(chunk)
-                .map_err(|e| format!("decompression failed - is this a .tar.gz sysdiagnose archive? ({e})")),
+            Sink::Gz(g) => g.write_all(chunk).map_err(|e| {
+                format!("decompression failed - is this a .tar.gz sysdiagnose archive? ({e})")
+            }),
             Sink::Plain(c) => c.write_all(chunk).map_err(|e| e.to_string()),
         }
     }
@@ -71,7 +71,12 @@ impl Engine {
             let text = String::from_utf8_lossy(&f.data);
             match f.kind {
                 ArtifactKind::ShutdownLog => {
-                    artifacts.push(shutdown_log::analyze(&f.path, &text, &self.db, &mut findings));
+                    artifacts.push(shutdown_log::analyze(
+                        &f.path,
+                        &text,
+                        &self.db,
+                        &mut findings,
+                    ));
                 }
                 ArtifactKind::CrashLog => {
                     let (a, d) = crash_log::analyze(&f.path, &text, &self.db, &mut findings);
@@ -93,6 +98,28 @@ impl Engine {
 
         findings.sort_by(|a, b| b.severity.cmp(&a.severity));
 
+        let found: std::collections::HashSet<ArtifactKind> =
+            collector.files.iter().map(|f| f.kind).collect();
+        let mut missing_artifacts = Vec::new();
+        if !found.contains(&ArtifactKind::ShutdownLog) {
+            missing_artifacts.push(MissingArtifact {
+                kind: "shutdown_log".into(),
+                note: "No shutdown.log was found in this archive. It normally exists once the device has been restarted at least once; without it, one of the three detection surfaces is unavailable for this scan.".into(),
+            });
+        }
+        if !found.contains(&ArtifactKind::CrashLog) {
+            missing_artifacts.push(MissingArtifact {
+                kind: "crash_log".into(),
+                note: "No crash logs were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into(),
+            });
+        }
+        if !found.contains(&ArtifactKind::PsListing) {
+            missing_artifacts.push(MissingArtifact {
+                kind: "ps_listing".into(),
+                note: "No process listing (ps.txt) was found in this archive, so running processes could not be checked.".into(),
+            });
+        }
+
         Ok(Report {
             tool: ToolInfo {
                 name: "Trace",
@@ -101,6 +128,7 @@ impl Engine {
             device,
             indicator_sets: self.db.sets.clone(),
             artifacts,
+            missing_artifacts,
             findings,
             stats: ScanStats {
                 bytes_read: self.bytes_in,
@@ -181,7 +209,10 @@ mod tests {
         }
         let report = engine.finish().unwrap();
         assert_eq!(report.stats.artifacts_found, 3);
-        assert_eq!(report.device.unwrap().os_version, "iPhone OS 17.2.1 (21C66)");
+        assert_eq!(
+            report.device.unwrap().os_version,
+            "iPhone OS 17.2.1 (21C66)"
+        );
         let match_count = report
             .findings
             .iter()
@@ -204,6 +235,26 @@ mod tests {
         let report = engine.finish().unwrap();
         assert_eq!(report.stats.artifacts_found, 3);
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn missing_artifacts_are_reported() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER   PID COMMAND\nroot     1 /sbin/launchd\n",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.stats.artifacts_found, 1);
+        let missing: Vec<&str> = report
+            .missing_artifacts
+            .iter()
+            .map(|m| m.kind.as_str())
+            .collect();
+        assert_eq!(missing, vec!["shutdown_log", "crash_log"]);
     }
 
     #[test]

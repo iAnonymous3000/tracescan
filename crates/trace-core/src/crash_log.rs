@@ -5,11 +5,18 @@
 
 use crate::ioc::{basename, IocDb};
 use crate::report::{ArtifactSummary, DeviceInfo, Finding, Severity};
+use regex_lite::Regex;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| v.get(k).and_then(|x| x.as_str()))
+}
+
+fn panic_pid_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"pid (\d+)[:\s]+\(?([A-Za-z0-9_.-]+)\)?").unwrap())
 }
 
 pub fn analyze(
@@ -66,6 +73,21 @@ pub fn analyze(
         }
     }
 
+    // Kernel panics (bug_type 210) carry their signal inside panicString
+    // rather than procName. Process names in it look like "pid 282: bh" or
+    // "pid 282 (bh)"; extract them as match candidates. Candidates are only
+    // ever compared by exact equality against the indicator set, so noisy
+    // extraction cannot create false positives.
+    let mut panic_staging = false;
+    if let Some(ps) = body.as_ref().and_then(|b| str_field(b, &["panicString"])) {
+        if ps.contains("/com.apple.xpc.roleaccountd.staging/") {
+            panic_staging = true;
+        }
+        for cap in panic_pid_re().captures_iter(ps) {
+            candidates.insert(cap[2].to_string());
+        }
+    }
+
     // The filename itself encodes the crashing process ("bh-2026-07-01-….ips"),
     // which survives even when the JSON fails to parse.
     let fname = basename(path);
@@ -107,18 +129,24 @@ pub fn analyze(
         }
     }
 
-    if let Some(pp) = &proc_path {
-        if pp.contains("/com.apple.xpc.roleaccountd.staging/") {
-            findings.push(Finding::heuristic(
-                Severity::Suspicious,
-                path,
-                format!(
-                    "Crashing process ran from {} - this staging directory is strongly associated with Pegasus infections in published research",
-                    pp
-                ),
-                evidence_base.clone(),
-            ));
-        }
+    let staging_in_proc_path = proc_path
+        .as_deref()
+        .is_some_and(|pp| pp.contains("/com.apple.xpc.roleaccountd.staging/"));
+    if staging_in_proc_path || panic_staging {
+        let where_seen = if staging_in_proc_path {
+            proc_path.clone().unwrap_or_default()
+        } else {
+            "the kernel panic report".to_string()
+        };
+        findings.push(Finding::heuristic(
+            Severity::Suspicious,
+            path,
+            format!(
+                "Crash log references {} - the roleaccountd.staging directory is strongly associated with Pegasus infections in published research",
+                where_seen
+            ),
+            evidence_base.clone(),
+        ));
     }
 
     let device = os_version.as_ref().map(|ov| DeviceInfo {
@@ -172,7 +200,10 @@ mod tests {
         assert_eq!(device.unwrap().os_version, "iPhone OS 17.2.1 (21C66)");
         // one deduped IOC match plus the staging-directory heuristic
         assert_eq!(
-            findings.iter().filter(|f| f.severity == Severity::Match).count(),
+            findings
+                .iter()
+                .filter(|f| f.severity == Severity::Match)
+                .count(),
             1
         );
         assert_eq!(
@@ -181,6 +212,35 @@ mod tests {
                 .filter(|f| f.severity == Severity::Suspicious)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn kernel_panic_string_yields_candidates_and_staging_heuristic() {
+        let panic = r#"{"name":"kernel","bug_type":"210","timestamp":"2026-07-06 03:00:00.00 -0700","os_version":"iPhone OS 17.2.1 (21C66)"}
+{"panicString":"panic(cpu 4): Panicked task 0xffffff80211a5f80: 306 threads: pid 2143: bh, ran from /private/var/db/com.apple.xpc.roleaccountd.staging/bh","osVersion":{"train":"iPhone OS 17.2.1","build":"21C66"}}"#;
+        let mut findings = Vec::new();
+        analyze(
+            "root/crashes_and_spins/Panics/panic-full-2026-07-06.ips",
+            panic,
+            &db_with_bh(),
+            &mut findings,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.severity == Severity::Match)
+                .count(),
+            1,
+            "panicString pid extraction should match the seeded IOC"
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.severity == Severity::Suspicious)
+                .count(),
+            1,
+            "staging path inside panicString should raise the heuristic"
         );
     }
 

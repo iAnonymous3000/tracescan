@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::io::{self, Write};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     ShutdownLog,
@@ -107,7 +107,11 @@ fn pax_path(data: &[u8]) -> Option<String> {
     let mut i = 0;
     while i < data.len() {
         let sp = data[i..].iter().position(|&b| b == b' ')? + i;
-        let len: usize = std::str::from_utf8(&data[i..sp]).ok()?.trim().parse().ok()?;
+        let len: usize = std::str::from_utf8(&data[i..sp])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
         if len == 0 || i + len > data.len() {
             return None;
         }
@@ -295,8 +299,7 @@ impl TarCollector {
                                 }
                             }
                             MetaKind::LongName => {
-                                let end =
-                                    buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                                 self.next_path =
                                     Some(String::from_utf8_lossy(&buf[..end]).into_owned());
                             }
@@ -360,7 +363,7 @@ pub mod test_util {
         out.extend_from_slice(&header(name, data.len(), b'0'));
         out.extend_from_slice(data);
         let pad = (512 - data.len() % 512) % 512;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         out
     }
 
@@ -382,13 +385,13 @@ pub mod test_util {
         out.extend_from_slice(&header("PaxHeaders/x", record.len(), b'x'));
         out.extend_from_slice(record.as_bytes());
         let pad = (512 - record.len() % 512) % 512;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         out.extend_from_slice(&entry("truncated-name", data));
         out
     }
 
     pub fn finish(mut archive: Vec<u8>) -> Vec<u8> {
-        archive.extend(std::iter::repeat(0u8).take(1024));
+        archive.extend(std::iter::repeat_n(0u8, 1024));
         archive
     }
 }
