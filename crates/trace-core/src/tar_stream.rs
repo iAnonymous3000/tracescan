@@ -525,16 +525,27 @@ impl TarCollector {
 
 impl Write for TarCollector {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Every decompressed byte counts against the budget, including
+        // bytes arriving after the end-of-archive marker: a gzip bomb with
+        // an early tar end must not stream an unbounded tail through the
+        // decompressor. The write that crosses the budget mid-archive
+        // still yields a report (surfaced as a scan limit); anything past
+        // that point halts the pipeline with an error.
+        self.stream_bytes += buf.len() as u64;
+        if self.stream_bytes > self.limits.max_stream_bytes {
+            if !matches!(self.state, State::Done) {
+                self.stream_cap_hit = true;
+                self.state = State::Done;
+                self.pending = Vec::new();
+                return Ok(buf.len());
+            }
+            return Err(io::Error::other(
+                "the archive decompressed past the scanner's safety budget; a real sysdiagnose is far smaller",
+            ));
+        }
         // Once parsing is done (end marker or an early stop), the rest of
         // the stream is accepted and dropped without buffering.
         if matches!(self.state, State::Done) {
-            return Ok(buf.len());
-        }
-        self.stream_bytes += buf.len() as u64;
-        if self.stream_bytes > self.limits.max_stream_bytes {
-            self.stream_cap_hit = true;
-            self.state = State::Done;
-            self.pending = Vec::new();
             return Ok(buf.len());
         }
         self.pending.extend_from_slice(buf);
@@ -750,10 +761,43 @@ mod tests {
             max_stream_bytes: 2048,
             ..Limits::default()
         });
+        // The write crossing the budget flags the cap; anything past that
+        // halts the pipeline with an error.
+        let mut errored = false;
         for chunk in archive.chunks(700) {
-            col.write_all(chunk).unwrap();
+            if col.write_all(chunk).is_err() {
+                errored = true;
+                break;
+            }
         }
         assert!(col.stream_cap_hit);
+        assert!(
+            errored,
+            "continuing past the budget must halt with an error"
+        );
+    }
+
+    #[test]
+    fn bytes_after_end_marker_still_count_against_budget() {
+        // A gzip bomb can hide its payload after an early tar end-of-archive
+        // marker; those bytes must not stream unbounded past the budget.
+        let archive = test_util::finish(test_util::entry("root/ps.txt", b"PS"));
+        let mut col = TarCollector::with_limits(Limits {
+            max_stream_bytes: 8192,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert!(col.terminated_cleanly(), "end marker reached");
+        let tail = [0xAAu8; 4096];
+        let mut errored = false;
+        for _ in 0..8 {
+            if col.write_all(&tail).is_err() {
+                errored = true;
+                break;
+            }
+        }
+        assert!(errored, "an unbounded post-marker tail must be refused");
+        assert_eq!(col.files.len(), 1, "the completed scan data is intact");
     }
 
     #[test]

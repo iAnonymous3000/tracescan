@@ -4,6 +4,43 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.6.1 - 2026-07-09
+
+Focused integrity follow-up to the v0.6.0 audit release, closing the
+remaining paths where a scan could overstate what it checked.
+
+- **Live indicator data no longer reaches scans at all.** A count-based
+  floor cannot tell a legitimate update from a feed that swapped reviewed
+  indicators for unreviewed ones while preserving counts, so scans now use
+  only the bundled, reviewed snapshots. The upstream fetch powers a
+  "newer data published upstream" notice (shown only for plausible
+  updates that meet the reviewed floor); updates ship through the weekly
+  reviewed-snapshot PR process.
+- **Structural parse success is now defined per surface.** An empty or
+  unrecognizable shutdown.log is `unparsed` (a real log with no delayed
+  clients still counts as parsed); a crash log whose body JSON fails is
+  `parsed_partial` even when the header line parses; a unified-log
+  inventory in which zero processes resolved to binary paths is
+  `parsed_partial`. Each downgrades the verdict to inconclusive via scan
+  limits.
+- **A scan with no applicable indicators loaded can never be clear** -
+  "no traces found" with nothing to match would be vacuously true. Guards
+  the native harness and embedders; the browser always loads the bundled
+  sets. Garbage input still reads as "not a sysdiagnose".
+- **The decompression budget now counts every byte**, including data
+  arriving after the tar end-of-archive marker, closing the gzip-bomb
+  bypass; a stream continuing past the budget halts with an error.
+- Deployment: `deploy-production.yml` deploys the exact CI-validated
+  commit via wrangler after CI succeeds and verifies the served
+  service-worker SHA, headers, and fixtures (inert until Cloudflare
+  secrets are configured; cutover documented in the workflow).
+- Hygiene: npm dependabot coverage for e2e, explicit read-only CI
+  permissions, and a README disclosure of Cloudflare's injected
+  NEL/Report-To headers.
+- Narrow scans announce themselves: a clear verdict resting on one or two
+  present surfaces now says so in the banner instead of reading like a
+  full four-surface scan.
+
 ## v0.6.0 - 2026-07-09
 
 Result-integrity release from an external audit: every path by which a

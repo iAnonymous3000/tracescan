@@ -136,19 +136,70 @@ test('an archive whose ps.txt cannot be parsed is inconclusive, never clear', as
   await expect(page.locator('.verdict.inconclusive')).toContainText('process listing');
 });
 
-test('an empty live indicator bundle is rejected for the bundled snapshot', async ({ page }) => {
-  // "{"objects":[]}" is valid JSON and a valid-shaped bundle, but loading it
-  // would scan with zero indicators; the reviewed floor must win
-  await page.route('https://raw.githubusercontent.com/**', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: '{"objects":[]}' })
-  );
-  await page.goto('/');
-  await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('#ioc-list .badge.live')).toHaveCount(0);
-  await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
-  // and scanning with the snapshots still detects the seeded indicator
-  await page.click('#demo-infected');
-  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+test.describe('upstream indicator interception', () => {
+  // page.route cannot reliably intercept requests once the service worker
+  // has claimed the page (its cross-origin pass-through bypasses routing in
+  // WebKit, racing sw activation); interception tests run without SW. The
+  // mocked responses also carry ACAO like the real host, or WebKit rejects
+  // the fulfilled cross-origin response and the test measures a network
+  // failure instead of the code under test.
+  test.use({ serviceWorkers: 'block' });
+
+  test('an empty live indicator bundle is neither loaded nor announced', async ({ page }) => {
+    // "{"objects":[]}" is valid JSON and a valid-shaped bundle, but it is
+    // below every reviewed floor: it must not become an "update available"
+    // notice, and scans must run on the snapshots regardless
+    await page.route('https://raw.githubusercontent.com/**', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: '{"objects":[]}',
+      })
+    );
+    await page.goto('/');
+    await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
+    await expect(page.locator('#ioc-note')).not.toContainText('newer data');
+    // and scanning with the snapshots still detects the seeded indicator
+    await page.click('#demo-infected');
+    await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  });
+
+  test('live indicator data never reaches a scan, even when plausible', async ({ page }) => {
+    // A live feed that swaps reviewed indicators for different ones while
+    // preserving counts must not influence verdicts: scans always run on the
+    // reviewed snapshots, and upstream changes only produce a notice
+    const decoy = {
+      objects: [
+        { type: 'malware', name: 'Pegasus' },
+        ...Array.from({ length: 2000 }, (_, i) => ({
+          type: 'indicator', pattern: `[process:name='decoy${i}']`,
+        })),
+      ],
+    };
+    await page.route('https://raw.githubusercontent.com/**', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: JSON.stringify(decoy),
+      })
+    );
+    await page.goto('/');
+    await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+    // the plausible upstream change is announced, not loaded
+    await expect(page.locator('#ioc-note')).toContainText('newer data');
+    await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
+    // the infected demo still matches via the reviewed snapshot indicator
+    await page.click('#demo-infected');
+    await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+    const provenance = await page.evaluate(() => window.__trace.lastReport.indicator_provenance);
+    for (const p of provenance) {
+      expect(p.loaded_from).toBe('bundled');
+      expect(p.upstream).toBe('update-available');
+    }
+  });
 });
 
 test('a second file arriving mid-scan is ignored, not interleaved', async ({ page }) => {

@@ -34,11 +34,7 @@ async function fetchTextWithTimeout(url, ms) {
   try {
     const r = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
     if (!r.ok) return null;
-    return {
-      text: await r.text(),
-      etag: r.headers.get('etag'),
-      last_modified: r.headers.get('last-modified'),
-    };
+    return await r.text();
   } catch {
     return null; // offline, blocked, or timed out
   } finally {
@@ -70,13 +66,14 @@ function backToLanding() {
 
 /* ---------- indicator loading ---------- */
 
-// Live indicator data may only ever add to the reviewed bundled floor. A
-// live file that parses but would lower a set below its manifest floor
-// (an empty-but-valid bundle, a rate-limit page shaped like JSON, an
-// upstream regression) is rejected in favor of the bundled snapshot -
-// otherwise a scan could quietly run with zero indicators and still
-// render "no traces found".
-function meetsBundledFloor(set, text) {
+// Scans use only the bundled, reviewed indicator snapshots. Live upstream
+// data never reaches a verdict: a count-based check cannot tell a
+// legitimate update from a feed that swapped reviewed indicators for
+// unreviewed ones, so the upstream fetch is used solely to announce that
+// an update has been published (it ships here through the weekly reviewed
+// snapshot process). A live file only counts as a real update when it is
+// a plausible bundle that still meets the set's reviewed floor.
+function isPlausibleUpdate(set, text) {
   try {
     if (!Array.isArray(JSON.parse(text).objects)) return false;
     const probe = new Scanner();
@@ -98,27 +95,21 @@ async function loadIndicators() {
   // production the service worker answers these before HTTP caching
   // matters, so this only costs a conditional request on first load.
   const manifest = await (await fetch('./iocs/manifest.json', { cache: 'no-cache' })).json();
-  // Sets refresh in parallel: on a network that silently drops the requests,
-  // sequential 6-second timeouts would stall the panel for their sum.
+  // Upstream checks run in parallel: on a network that silently drops the
+  // requests, sequential 6-second timeouts would stall the panel.
   state.stix = await Promise.all(manifest.sets.map(async (set) => {
-    let text = null;
-    let loaded_from = 'bundled';
-    let date = manifest.bundled_date;
-    let etag = null;
-    let last_modified = null;
-    const live = await fetchTextWithTimeout(set.url, 6000);
-    if (live && meetsBundledFloor(set, live.text)) {
-      text = live.text;
-      loaded_from = 'live';
-      date = new Date().toISOString().slice(0, 10);
-      etag = live.etag;
-      last_modified = live.last_modified;
-    }
-    if (!text) {
-      text = await (await fetch(set.file, { cache: 'no-cache' })).text();
-    }
+    const text = await (await fetch(set.file, { cache: 'no-cache' })).text();
     const sha256 = await sha256hex(text);
-    return { ...set, text, loaded_from, date, sha256, etag, last_modified };
+    // 'current' | 'update-available' | 'unknown' (offline or unreachable)
+    let upstream = 'unknown';
+    const live = await fetchTextWithTimeout(set.url, 6000);
+    if (live !== null) {
+      const liveSha = await sha256hex(live);
+      upstream = liveSha !== sha256 && isPlausibleUpdate(set, live)
+        ? 'update-available'
+        : 'current';
+    }
+    return { ...set, text, loaded_from: 'bundled', date: manifest.bundled_date, sha256, upstream };
   }));
 }
 
@@ -134,15 +125,20 @@ function renderIocPanel() {
   const rows = state.stix.map((s) => `
     <div class="ioc-row">
       <span><span class="campaign">${esc(s.stats.campaign)}</span>
-        <span class="badge ${s.loaded_from}">${s.loaded_from === 'live' ? 'live · ' + esc(s.date) : 'snapshot · ' + esc(s.date)}</span></span>
+        <span class="badge bundled">reviewed snapshot · ${esc(s.date)}</span></span>
       <span class="meta">${s.stats.extracted} indicators, ${s.stats.applicable} checkable here · ${esc(s.source)}${s.sha256 ? ` · <code title="SHA-256 of the indicator file used: ${esc(s.sha256)}">sha256:${esc(s.sha256.slice(0, 12))}…</code>` : ''}</span>
     </div>`).join('');
   $('#ioc-list').innerHTML = rows;
   const total = state.stix.reduce((a, s) => a + s.stats.extracted, 0);
   const applicable = state.stix.reduce((a, s) => a + s.stats.applicable, 0);
+  const updates = state.stix.filter((s) => s.upstream === 'update-available').length;
+  const updateNote = updates
+    ? ` Upstream has published newer data for ${updates} indicator set${updates > 1 ? 's' : ''}; scans use the reviewed snapshots, and updates ship here after review (typically within a week).`
+    : '';
   $('#ioc-note').textContent =
     `${applicable} of ${total} loaded indicators are process and file names or paths that can be checked against the process activity in sysdiagnose artifacts (file indicators match only when a process ran from that file - there is no filesystem listing to check). ` +
-    `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.`;
+    `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.` +
+    updateNote;
   $('#ioc-panel').hidden = false;
 }
 
@@ -261,7 +257,7 @@ async function handleFile(file) {
     report.scanned_via = state.lastScanVia;
     report.indicator_provenance = state.stix.map((s) => ({
       name: s.name, campaign: s.stats.campaign, loaded_from: s.loaded_from, date: s.date, url: s.url,
-      sha256: s.sha256, etag: s.etag, last_modified: s.last_modified,
+      sha256: s.sha256, upstream: s.upstream,
     }));
     state.lastReport = report;
     renderReport(report);
@@ -337,8 +333,14 @@ function verdictHtml(report) {
     </div>`;
   }
   const missing = report.missing_artifacts || [];
+  // A one- or two-surface scan is a much narrower look than a full
+  // sysdiagnose; the banner must not read identically to a four-surface
+  // scan.
+  const narrow = missing.length >= 2
+    ? `<p><strong>This was a narrow scan.</strong> Most of this tool's detection surfaces were not present in the archive, so this result rests on ${4 - missing.length === 1 ? 'a single artifact type' : 'only ' + (4 - missing.length) + ' artifact types'}. A complete, freshly captured sysdiagnose gives a much stronger result.</p>`
+    : '';
   const coverageNote = missing.length
-    ? `<p><strong>Coverage note:</strong> ${missing.length} of the 4 artifact types this tool reads ${missing.length > 1 ? 'were' : 'was'} not present in this archive (${missing.map((m) => esc(m.kind.replace(/_/g, ' '))).join(', ')}), so ${missing.length > 1 ? 'those surfaces' : 'that surface'} could not be checked. Details are in the table below.</p>`
+    ? `${narrow}<p><strong>Coverage note:</strong> ${missing.length} of the 4 artifact types this tool reads ${missing.length > 1 ? 'were' : 'was'} not present in this archive (${missing.map((m) => esc(m.kind.replace(/_/g, ' '))).join(', ')}), so ${missing.length > 1 ? 'those surfaces' : 'that surface'} could not be checked. Details are in the table below.</p>`
     : '';
   return `<div class="verdict clear">
     <h2>No known spyware traces found</h2>
@@ -425,11 +427,11 @@ function provenanceHtml(report) {
   const rows = (report.indicator_provenance || []).map((p) => `
     <div class="ioc-row">
       <span><span class="campaign">${esc(p.campaign)}</span>
-        <span class="badge ${esc(p.loaded_from)}">${p.loaded_from === 'live' ? 'live · ' : 'snapshot · '}${esc(p.date)}</span></span>
+        <span class="badge bundled">reviewed snapshot · ${esc(p.date)}</span></span>
       <span class="meta">${p.sha256 ? `<code title="SHA-256 of the indicator file used: ${esc(p.sha256)}">sha256:${esc(p.sha256.slice(0, 12))}…</code> · ` : ''}<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">source</a></span>
     </div>`).join('');
   return `<div class="panel"><h2>Indicators used</h2>${rows}
-    <p class="fine">The hash identifies the exact indicator revision this scan used; it is recorded in the exported report. Public indicators inherit a time lag: new campaigns appear here only after researchers publish them. A scan can only be as current as the open ecosystem.</p></div>`;
+    <p class="fine">Scans use only reviewed snapshot indicators; the hash identifies the exact revision this scan used and is recorded in the exported report. Public indicators inherit a time lag: new campaigns appear here only after researchers publish them and the snapshots are reviewed. A scan can only be as current as the open ecosystem.</p></div>`;
 }
 
 function renderReport(report) {

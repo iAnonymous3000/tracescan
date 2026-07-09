@@ -171,9 +171,13 @@ impl Aggregator {
             "cap_hit": self.cap_hit,
         });
         // Wholesale parse failure must not read as a normally analyzed
-        // surface: it downgrades the artifact status.
+        // surface, and neither may an inventory in which no process could
+        // be resolved to a binary path: with nothing to match against,
+        // the surface was never effectively checked. Both downgrade the
+        // artifact status, which the engine turns into a scan limit.
         let all_failed = self.tracev3_files > 0 && self.tracev3_failures == self.tracev3_files;
-        Some(if all_failed {
+        let nothing_resolved = !self.procs.is_empty() && resolved == 0;
+        Some(if all_failed || nothing_resolved {
             ArtifactSummary::problem(
                 "system_logs.logarchive",
                 "unified_log",
@@ -262,6 +266,9 @@ mod tests {
         assert_eq!(summary.details["processes_seen"], 1);
         assert_eq!(summary.details["processes_resolved_to_path"], 0);
         assert!(findings.is_empty());
+        // an inventory in which nothing resolved was never effectively
+        // checked; the status must say so
+        assert_eq!(summary.status, "parsed_partial");
     }
 
     #[test]

@@ -143,7 +143,15 @@ impl Engine {
         let uuidtext_files = unified.uuidtext_files;
         let uuidtext_failures = unified.uuidtext_failures;
         let unified_cap_hit = unified.cap_hit;
+        let mut unified_unresolved: Option<u64> = None;
         if let Some(summary) = unified.finalize(&self.db, &mut findings) {
+            let seen = summary.details["processes_seen"].as_u64().unwrap_or(0);
+            let resolved = summary.details["processes_resolved_to_path"]
+                .as_u64()
+                .unwrap_or(0);
+            if seen > 0 && resolved == 0 {
+                unified_unresolved = Some(seen);
+            }
             artifacts.push(summary);
         }
 
@@ -216,13 +224,27 @@ impl Engine {
                 "{unparsed_ps} process listing file(s) could not be parsed; the processes they list were not checked."
             ));
         }
+        let unparsed_shutdown = artifacts
+            .iter()
+            .filter(|a| a.kind == "shutdown_log" && a.status == "unparsed")
+            .count();
+        if unparsed_shutdown > 0 {
+            scan_limits.push(format!(
+                "{unparsed_shutdown} shutdown log file(s) contained no recognizable content; processes that delayed shutdown were not checked."
+            ));
+        }
         let partial_crashes = artifacts
             .iter()
             .filter(|a| a.kind == "crash_log" && a.status == "parsed_partial")
             .count();
         if partial_crashes > 0 {
             scan_limits.push(format!(
-                "{partial_crashes} crash log file(s) could not be parsed; only their file names were checked against indicators."
+                "{partial_crashes} crash log file(s) could not be fully parsed; parts of their contents were not checked against indicators."
+            ));
+        }
+        if let Some(seen) = unified_unresolved {
+            scan_limits.push(format!(
+                "None of the {seen} processes in the unified log inventory could be resolved to a binary path (no readable uuidtext files), so that surface could not be checked against indicators."
             ));
         }
         if tracev3_failures > 0 {
@@ -271,6 +293,17 @@ impl Engine {
         {
             scan_limits.push(
                 "The archive ended before its end-of-archive marker, so it may be incomplete; anything after the cut-off was not analyzed.".into(),
+            );
+        }
+        // A scan without applicable indicators cannot match anything, so
+        // "no known spyware traces found" would be vacuously true. The
+        // browser always loads the bundled sets before scanning; this
+        // guards the native harness and any embedder that does not. Gated
+        // on artifacts being present so garbage input still reads as "not
+        // a sysdiagnose" rather than inconclusive.
+        if self.db.applicable_total() == 0 && (!collector.files.is_empty() || unified_seen) {
+            scan_limits.push(
+                "No process or file indicators were loaded, so nothing in this archive could be checked against known spyware.".into(),
             );
         }
 
@@ -605,6 +638,69 @@ mod tests {
         let device = report.device.unwrap();
         assert_eq!(device.os_version, "iPhone OS 18.5 (22F76)");
         assert!(device.source.contains("b-2026-06-30"));
+    }
+
+    #[test]
+    fn artifacts_with_no_loaded_indicators_are_never_clear() {
+        // "No known spyware traces found" with zero indicators loaded would
+        // be vacuously true. The browser always loads the bundled sets;
+        // this guards the native harness and embedders.
+        let tar = build_archive(false);
+        let mut engine = Engine::new(); // note: no load_stix
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.stats.applicable_indicators, 0);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("indicators")));
+        // garbage input stays "not a sysdiagnose" even with no indicators
+        let mut engine = Engine::new();
+        engine.push(&[0x50, 0x4b, 0x03, 0x04]).unwrap();
+        engine.push(&[0xABu8; 2048]).unwrap();
+        assert_eq!(engine.finish().unwrap().verdict, Verdict::Invalid);
+    }
+
+    #[test]
+    fn empty_shutdown_log_is_never_clear() {
+        // An empty (or unrecognizable) shutdown.log has zero entries just
+        // like a garbage file; it must read as an unchecked surface, not
+        // as a normally parsed one.
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/Extra/shutdown.log",
+            b"",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "unparsed");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|l| l.contains("shutdown log")));
+    }
+
+    #[test]
+    fn header_only_crash_log_is_never_clear() {
+        // A parseable one-line header with a malformed body means the
+        // substantive document (procPath, parentProc, panicString) was
+        // never checked.
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/app-2026-07-01-120000.ips",
+            br#"{"name":"app","bug_type":"309","os_version":"iPhone OS 17.2.1 (21C66)"}
+this body is not json"#,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("crash log")));
     }
 
     #[test]

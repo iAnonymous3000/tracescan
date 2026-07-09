@@ -4,9 +4,10 @@
 //!
 //!   cargo run --example ioc_stats
 //!
-//! The floors are the invariant the browser enforces on live-fetched
-//! indicator files: live data may add indicators but never reduce the
-//! reviewed bundled floor. tests/bundled_iocs.rs checks them in CI.
+//! The floors gate the browser's "upstream update available" notice (a
+//! hollow upstream file is not an update) and are pinned against the
+//! snapshots themselves by tests/bundled_iocs.rs in CI. Scans only ever
+//! use the bundled, reviewed snapshots.
 
 use trace_core::ioc::IocDb;
 

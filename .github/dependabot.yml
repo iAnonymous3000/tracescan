@@ -20,3 +20,10 @@ updates:
     groups:
       crates:
         patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]

@@ -1,10 +1,11 @@
-//! The bundled STIX snapshots are the reviewed indicator floor: the browser
-//! rejects a live-fetched file that would drop a set below the manifest's
-//! `min_indicators` / `min_applicable`. This test keeps that contract
-//! honest in both directions - every bundled snapshot must itself meet its
-//! declared floor, so a snapshot-update PR that regresses a set fails CI
-//! until the floor is consciously adjusted (`cargo run --example ioc_stats`
-//! prints the current numbers).
+//! The bundled STIX snapshots are the reviewed indicator floor - the only
+//! indicators scans ever use. The manifest's `min_indicators` /
+//! `min_applicable` gate two things: the browser's "upstream update
+//! available" notice (a hollow upstream file is not an update), and this
+//! test, which requires every bundled snapshot to meet its declared floor
+//! so a snapshot-update PR that regresses a set fails CI until the floor
+//! is consciously adjusted (`cargo run --example ioc_stats` prints the
+//! current numbers).
 
 use trace_core::ioc::IocDb;
 

@@ -111,15 +111,25 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
         }
     }
 
-    ArtifactSummary::parsed(
-        path,
-        "shutdown_log",
-        json!({
-            "reboot_blocks": blocks.len(),
-            "unique_clients": client_pids.len(),
-            "entries": entries,
-        }),
-    )
+    // Structural success requires recognizing the format at all: an empty
+    // or garbage file has zero entries too, and treating it as a normally
+    // parsed surface would let "nothing found" read as "nothing there".
+    // A real shutdown.log with no delayed clients still carries phase
+    // markers and delay/SIGTERM lines, which count as recognized content.
+    let recognized = entries > 0
+        || content.lines().any(|l| {
+            l.contains("Entering phase") || l.contains("SIGTERM") || delay_re().is_match(l)
+        });
+    let details = json!({
+        "reboot_blocks": blocks.len(),
+        "unique_clients": client_pids.len(),
+        "entries": entries,
+    });
+    if recognized {
+        ArtifactSummary::parsed(path, "shutdown_log", details)
+    } else {
+        ArtifactSummary::problem(path, "shutdown_log", "unparsed", details)
+    }
 }
 
 #[cfg(test)]
@@ -155,8 +165,35 @@ After 0.2s, remaining client pid: 2143 (/private/var/db/com.apple.xpc.roleaccoun
     fn splits_reboot_blocks_on_delay_reset() {
         let mut findings = Findings::new();
         let summary = analyze("shutdown.log", SAMPLE, &IocDb::new(), &mut findings);
+        assert_eq!(summary.status, "parsed");
         assert_eq!(summary.details["reboot_blocks"], 2);
         assert_eq!(summary.details["unique_clients"], 2);
+    }
+
+    #[test]
+    fn unrecognizable_content_is_unparsed_not_parsed() {
+        let mut findings = Findings::new();
+        // empty file: zero entries must not read as a checked surface
+        let summary = analyze("shutdown.log", "", &IocDb::new(), &mut findings);
+        assert_eq!(summary.status, "unparsed");
+        // garbage text: same
+        let summary = analyze(
+            "shutdown.log",
+            "not a shutdown log\nat all\n",
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "unparsed");
+        // a real log with phase markers but no delayed clients is a
+        // legitimate quick shutdown, and stays parsed
+        let summary = analyze(
+            "shutdown.log",
+            "%%%%% Entering phase: Waiting for apps to exit\n",
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["entries"], 0);
     }
 
     // iOS 26 form: delay header line, tab-indented clients, binary-UUID

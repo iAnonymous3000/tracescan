@@ -118,7 +118,11 @@ pub fn analyze(
         candidates.insert(name.to_string());
     }
 
-    let status = if header.is_some() || body.is_some() {
+    // The body is the substantive document (procPath, parentProc,
+    // panicString); a crash whose body did not parse had most of its
+    // signal unchecked, and must not count as a fully analyzed artifact
+    // even when the one-line header parsed.
+    let status = if body.is_some() {
         "parsed"
     } else {
         "parsed_partial"
@@ -357,6 +361,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn header_only_crash_is_parsed_partial() {
+        // A valid header with a malformed body means procPath, parentProc,
+        // and panicString were never checked: not a fully parsed artifact.
+        let sample = r#"{"name":"app","bug_type":"309","os_version":"iPhone OS 17.2.1 (21C66)"}
+not json"#;
+        let mut findings = Findings::new();
+        let (summary, device) = analyze(
+            "root/crashes_and_spins/app-2026.ips",
+            sample,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        // the header's os_version is still harvested
+        assert_eq!(device.unwrap().os_version, "iPhone OS 17.2.1 (21C66)");
     }
 
     #[test]
