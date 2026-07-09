@@ -13,6 +13,13 @@ name: Deploy production
 #   2. Confirm one green run of this workflow deploys successfully.
 #   3. Disconnect the git integration on the Pages project so this
 #      workflow is the only deploy path.
+#
+# Deploys refuse to run unless the validated commit is still the tip of
+# main, checked once up front and again immediately before the upload:
+# CI runs can finish out of order (a newer push's CI completing before an
+# older one's), and without the guard the later-finishing older run would
+# roll production backward - and then "verify" its own stale commit.
+# Concurrency serializes deploys so the guard cannot be raced mid-build.
 on:
   workflow_run:
     workflows: [CI]
@@ -21,6 +28,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -31,33 +42,39 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
-      - name: Check deploy credentials
-        id: creds
+      - name: Preflight (credentials and freshness)
+        id: pre
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
             echo "Cloudflare secrets not configured; skipping CI-gated deploy."
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)
+          if [ "$tip" != "$HEAD_SHA" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "main is now at ${tip}; not deploying stale ${HEAD_SHA} (its own deploy run handles it)."
+            exit 0
+          fi
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Install Rust (pinned by rust-toolchain.toml)
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         run: rustup toolchain install
 
       - name: Install wasm-pack
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
         with:
           tool: wasm-pack@0.14.0
 
       - name: Build the deployable artifact
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         run: |
           set -euo pipefail
           wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
@@ -66,16 +83,27 @@ jobs:
           grep -q "trace-${HEAD_SHA}" web/sw.js
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         with:
           node-version: 22
 
       - name: Deploy to Cloudflare Pages
-        if: steps.creds.outputs.configured == 'true'
-        run: npx --yes wrangler@4.110.0 pages deploy web --project-name tracescan --branch main --commit-hash "$HEAD_SHA"
+        if: steps.pre.outputs.deploy == 'true'
+        run: |
+          set -euo pipefail
+          # Re-check at the last moment: the build above takes minutes, and
+          # main may have moved since preflight. Failing here is correct -
+          # the newer commit's own deploy run (queued behind this one by the
+          # concurrency group) brings production forward.
+          tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)
+          if [ "$tip" != "$HEAD_SHA" ]; then
+            echo "main moved to ${tip} during the build; refusing to deploy stale ${HEAD_SHA}." >&2
+            exit 1
+          fi
+          npx --yes wrangler@4.110.0 pages deploy web --project-name tracescan --branch main --commit-hash "$HEAD_SHA"
 
       - name: Verify production serves this commit
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.pre.outputs.deploy == 'true'
         run: |
           set -euo pipefail
           for i in $(seq 1 20); do

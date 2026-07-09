@@ -4,6 +4,21 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.6.2 - 2026-07-09
+
+One fix: the CI-gated deploy workflow could roll production backward.
+
+- **Stale deploys are refused.** Deploy runs trigger on CI completion, and
+  CI runs can finish out of order - a newer push's CI completing before an
+  older one's. The later-finishing older run would then deploy its older
+  commit over the newer one, and "verify" its own stale commit as success.
+  (Observed dormant on 2026-07-09: `fecdac3`'s CI finished two minutes
+  before `4119475`'s.) Deploys now confirm the validated commit is still
+  the tip of `main` at preflight and again immediately before the upload,
+  and a concurrency group serializes deploy runs so the check cannot be
+  raced mid-build. The workflow remains inert until the Cloudflare
+  secrets exist; the fix ships before cutover so the race never goes live.
+
 ## v0.6.1 - 2026-07-09
 
 Focused integrity follow-up to the v0.6.0 audit release, closing the
