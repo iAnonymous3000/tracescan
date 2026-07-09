@@ -6,7 +6,46 @@ use crate::report::*;
 use crate::tar_stream::{ArtifactKind, Limits, TarCollector};
 use crate::{crash_log, ps, shutdown_log};
 use flate2::write::GzDecoder;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::io::Write;
+
+fn hex(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex(&Sha256::digest(data))
+}
+
+/// Catalog metadata for one indicator set, supplied by the producer at
+/// load time. The engine records it verbatim as provenance; the set's
+/// hash is computed by the engine, never taken from here.
+#[derive(Default, Deserialize)]
+pub struct SetMeta {
+    pub date: Option<String>,
+    pub url: Option<String>,
+    pub source: Option<String>,
+    pub loaded_from: Option<String>,
+    pub upstream: Option<String>,
+}
+
+/// Scan-level metadata from the producer: what file it fed the engine and
+/// its clock readings (the engine has neither a clock nor the file handle
+/// on wasm32). Everything here is descriptive; nothing influences the
+/// verdict.
+#[derive(Default, Deserialize)]
+pub struct ScanMeta {
+    pub source_name: Option<String>,
+    pub source_size: Option<u64>,
+    pub scanned_via: Option<String>,
+    pub generated_at: Option<String>,
+    pub duration_ms: Option<u64>,
+}
 
 enum Sink {
     Gz(GzDecoder<TarCollector>),
@@ -30,6 +69,11 @@ pub struct Engine {
     prelude: Vec<u8>,
     limits: Limits,
     bytes_in: u64,
+    /// Hash of every byte pushed - the archive exactly as received, before
+    /// any decoding. Identifies which file a report describes.
+    input_hash: Sha256,
+    provenance: Vec<SetProvenance>,
+    scan_meta: ScanMeta,
 }
 
 impl Default for Engine {
@@ -46,11 +90,38 @@ impl Engine {
             prelude: Vec::new(),
             limits: Limits::default(),
             bytes_in: 0,
+            input_hash: Sha256::new(),
+            provenance: Vec::new(),
+            scan_meta: ScanMeta::default(),
         }
     }
 
     pub fn load_stix(&mut self, set_name: &str, json: &str) -> Result<SetStats, String> {
-        self.db.load_stix(set_name, json)
+        self.load_stix_with_meta(set_name, json, SetMeta::default())
+    }
+
+    pub fn load_stix_with_meta(
+        &mut self,
+        set_name: &str,
+        json: &str,
+        meta: SetMeta,
+    ) -> Result<SetStats, String> {
+        let stats = self.db.load_stix(set_name, json)?;
+        self.provenance.push(SetProvenance {
+            name: stats.name.clone(),
+            campaign: stats.campaign.clone(),
+            sha256: sha256_hex(json.as_bytes()),
+            loaded_from: meta.loaded_from.unwrap_or_else(|| "bundled".into()),
+            date: meta.date,
+            url: meta.url,
+            source: meta.source,
+            upstream: meta.upstream,
+        });
+        Ok(stats)
+    }
+
+    pub fn set_scan_meta(&mut self, meta: ScanMeta) {
+        self.scan_meta = meta;
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
@@ -58,6 +129,7 @@ impl Engine {
             return Ok(());
         }
         self.bytes_in += chunk.len() as u64;
+        self.input_hash.update(chunk);
         if self.sink.is_none() {
             self.prelude.extend_from_slice(chunk);
             if self.prelude.len() < 2 {
@@ -322,6 +394,36 @@ impl Engine {
             Verdict::Clear
         };
 
+        // Machine-readable completeness, derived from the same facts as the
+        // verdict. A surface is partial when any of its artifacts parsed
+        // less than fully; global limits are covered by `complete`.
+        let missing_kinds: std::collections::HashSet<&str> =
+            missing_artifacts.iter().map(|m| m.kind.as_str()).collect();
+        let surfaces: Vec<SurfaceState> =
+            ["shutdown_log", "crash_log", "ps_listing", "unified_log"]
+                .into_iter()
+                .map(|kind| SurfaceState {
+                    kind,
+                    state: if missing_kinds.contains(kind) {
+                        "absent"
+                    } else if artifacts
+                        .iter()
+                        .any(|a| a.kind == kind && a.status != "parsed")
+                    {
+                        "partial"
+                    } else {
+                        "complete"
+                    },
+                })
+                .collect();
+        let surfaces_examined = surfaces.iter().filter(|s| s.state != "absent").count();
+        let assurance = Assurance {
+            complete: scan_limits.is_empty(),
+            surfaces_total: surfaces.len(),
+            surfaces,
+            surfaces_examined,
+        };
+
         // Coverage is per scan: only surfaces actually present are listed as
         // examined, so the report cannot claim a missing surface was read.
         let mut examined: Vec<&'static str> = Vec::new();
@@ -342,14 +444,24 @@ impl Engine {
         }
 
         Ok(Report {
-            schema_version: 2,
+            schema_version: 3,
             tool: ToolInfo {
                 name: "Trace",
                 version: env!("CARGO_PKG_VERSION"),
+                build_commit: option_env!("TRACE_BUILD_COMMIT").filter(|s| !s.is_empty()),
             },
             verdict,
+            generated_at: self.scan_meta.generated_at,
+            duration_ms: self.scan_meta.duration_ms,
+            scanned_via: self.scan_meta.scanned_via,
+            source_file: SourceFile {
+                name: self.scan_meta.source_name,
+                size: self.scan_meta.source_size,
+                sha256: hex(&self.input_hash.finalize()),
+            },
             device,
             indicator_sets: self.db.sets.clone(),
+            indicator_provenance: self.provenance,
             artifacts,
             missing_artifacts,
             findings,
@@ -361,6 +473,7 @@ impl Engine {
                 applicable_indicators: self.db.applicable_total(),
             },
             scan_limits,
+            assurance,
             coverage: Coverage {
                 examined,
                 not_examined: vec![

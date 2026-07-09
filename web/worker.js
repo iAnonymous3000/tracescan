@@ -16,9 +16,10 @@ self.onmessage = async (e) => {
   const { id } = msg;
   try {
     await ready;
+    const started = Date.now();
     const scanner = new Scanner();
     for (const s of msg.sets) {
-      scanner.load_stix(s.name, s.text);
+      scanner.load_stix_with_meta(s.name, s.text, JSON.stringify(s.meta || {}));
     }
     const reader = msg.file.stream().getReader();
     let processed = 0;
@@ -35,6 +36,16 @@ self.onmessage = async (e) => {
       }
     }
     self.postMessage({ type: 'progress', id, processed });
+    // The report envelope is assembled entirely in Rust; the producer only
+    // supplies what the engine cannot know: the file's declared identity
+    // and clock readings.
+    scanner.set_scan_meta(JSON.stringify({
+      source_name: msg.file.name,
+      source_size: msg.file.size,
+      scanned_via: 'worker',
+      generated_at: new Date().toISOString(),
+      duration_ms: Date.now() - started,
+    }));
     self.postMessage({ type: 'report', id, report: JSON.parse(scanner.finish()) });
   } catch (err) {
     self.postMessage({ type: 'error', id, message: err?.message || String(err) });

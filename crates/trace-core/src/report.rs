@@ -155,6 +155,64 @@ pub struct DeviceInfo {
 pub struct ToolInfo {
     pub name: &'static str,
     pub version: &'static str,
+    /// Exact commit the running scanner was built from, injected at build
+    /// time via TRACE_BUILD_COMMIT. An untagged commit can reach production
+    /// while `version` stays the same, so version alone does not identify
+    /// the build. Null when built outside the release paths (local dev).
+    pub build_commit: Option<&'static str>,
+}
+
+/// What was scanned, as declared by the producer (file name and size) and
+/// as measured by the engine (SHA-256 of every byte actually pushed). The
+/// hash lets a responder confirm which exact archive a report describes.
+#[derive(Serialize)]
+pub struct SourceFile {
+    pub name: Option<String>,
+    pub size: Option<u64>,
+    pub sha256: String,
+}
+
+/// Provenance of one loaded indicator set: which reviewed snapshot, hashed
+/// by the engine from the exact text it extracted indicators from. The
+/// producer supplies catalog metadata (date, url, source); the hash is
+/// never producer-claimed.
+#[derive(Serialize)]
+pub struct SetProvenance {
+    pub name: String,
+    pub campaign: String,
+    pub sha256: String,
+    pub loaded_from: String,
+    pub date: Option<String>,
+    pub url: Option<String>,
+    pub source: Option<String>,
+    /// Load-time upstream check result ('current' | 'update-available' |
+    /// 'unknown'); informational only - scans always use the reviewed text
+    /// hashed above.
+    pub upstream: Option<String>,
+}
+
+/// Per-surface completeness, machine-readable. `complete` means every
+/// artifact of that kind parsed fully; any parser degradation makes it
+/// `partial` (the human-readable reason is in scan_limits). Global limits
+/// (entry caps, decompression budget) live in `Assurance::complete`, not
+/// per surface.
+#[derive(Serialize)]
+pub struct SurfaceState {
+    pub kind: &'static str,
+    pub state: &'static str,
+}
+
+/// Machine-readable completeness summary for comparison tooling and
+/// responder triage. Everything here is derived from the same inputs as
+/// the verdict; it adds no new semantics, only structure.
+#[derive(Serialize)]
+pub struct Assurance {
+    /// True when no safety limit was hit and every parser succeeded fully:
+    /// the scan analyzed everything it recognizes.
+    pub complete: bool,
+    pub surfaces: Vec<SurfaceState>,
+    pub surfaces_examined: usize,
+    pub surfaces_total: usize,
 }
 
 #[derive(Serialize)]
@@ -204,16 +262,34 @@ pub enum Verdict {
     Invalid,
 }
 
+/// Field policy: producer-supplied metadata (`generated_at`, `scanned_via`,
+/// `duration_ms`, `source_file.name/size`, provenance details) is always
+/// serialized, null when unknown, so every producer emits the identical
+/// field set for identical input - the producer-parity golden test depends
+/// on this. Content-derived fields (`device`, a finding's `indicator`) may
+/// be omitted, because their presence depends only on the archive.
 #[derive(Serialize)]
 pub struct Report {
     /// Bumped when the report shape changes incompatibly. Consumers
     /// (helplines, future comparison tooling) can key on it.
+    /// v3: Rust owns the whole envelope (no fields appended by the UI),
+    /// adds source_file with archive SHA-256, build identity,
+    /// generated_at/duration, indicator_provenance, and assurance.
     pub schema_version: u32,
     pub tool: ToolInfo,
     pub verdict: Verdict,
+    /// RFC 3339 timestamp supplied by the producer's clock (the engine has
+    /// no clock on wasm32).
+    pub generated_at: Option<String>,
+    /// Wall-clock scan duration measured by the producer, milliseconds.
+    pub duration_ms: Option<u64>,
+    /// 'worker' | 'inline' | 'native'.
+    pub scanned_via: Option<String>,
+    pub source_file: SourceFile,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
     pub indicator_sets: Vec<crate::ioc::SetStats>,
+    pub indicator_provenance: Vec<SetProvenance>,
     pub artifacts: Vec<ArtifactSummary>,
     pub missing_artifacts: Vec<MissingArtifact>,
     pub findings: Vec<Finding>,
@@ -222,5 +298,6 @@ pub struct Report {
     /// part of the input, so not everything was analyzed. Any entry here
     /// forces the verdict away from `Clear`.
     pub scan_limits: Vec<String>,
+    pub assurance: Assurance,
     pub coverage: Coverage,
 }

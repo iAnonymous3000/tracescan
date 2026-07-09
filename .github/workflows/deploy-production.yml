@@ -103,6 +103,10 @@ jobs:
         if: steps.pre.outputs.deploy == 'true'
         run: |
           set -euo pipefail
+          # Reports embed the exact commit they were built from
+          # (tool.build_commit); version alone cannot identify an untagged
+          # production build.
+          export TRACE_BUILD_COMMIT="$HEAD_SHA"
           wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
           rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts
           sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${HEAD_SHA}'/" web/sw.js

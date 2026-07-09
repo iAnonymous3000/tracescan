@@ -34,6 +34,40 @@ cutover makes the workflow the only production writer.
   metadata; worst case is a crafted file aborting its own scan, an
   availability nuisance rather than a result-integrity risk).
 
+## v0.7.0 - 2026-07-09
+
+Report v3: the evidence-package foundation. The exported report is now a
+single Rust-owned contract; no field is appended by the UI.
+
+- **Rust owns the whole envelope.** `generated_at`, `source_file`,
+  `scanned_via`, and `indicator_provenance` were previously appended by
+  JavaScript after serialization, unversioned. Producers now hand the
+  engine descriptive metadata (file identity, clock readings, catalog
+  info) and the engine emits everything; what the UI renders is exactly
+  what exports. `schema_version` is 3.
+- **The archive is identified by hash.** The engine computes SHA-256 over
+  every byte it receives, so a report states exactly which file it
+  describes (`source_file.sha256`) - responders can match a report to an
+  archive, and two reports to each other.
+- **Reports carry build identity.** `tool.build_commit` records the exact
+  commit the running scanner was built from (an untagged commit can reach
+  production while `tool.version` stays the same). Injected in CI, the
+  deploy workflow, and the Cloudflare build command; null for local dev
+  builds and dirty trees, which are not any commit.
+- **Machine-readable completeness.** A new `assurance` block gives
+  comparison tooling per-surface states (complete / partial / absent) and
+  an overall completeness flag, derived from the same facts as the
+  verdict. Indicator-set provenance (engine-hashed text, catalog date,
+  source, upstream freshness) moved inside the envelope, and scans record
+  wall-clock duration.
+- **The contract is enforced three ways.** `docs/report.schema.json` is
+  the checked-in JSON Schema; Rust tests validate real fixture reports
+  against it and pin the field shape to a golden list; the browser E2E
+  suite holds the worker and inline producers to the same golden, so all
+  three producers provably emit one shape.
+
+Verdict semantics and UI behavior are unchanged.
+
 ## v0.6.2 - 2026-07-09
 
 One fix: the CI-gated deploy workflow could roll production backward.

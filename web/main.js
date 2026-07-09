@@ -109,14 +109,20 @@ async function loadIndicators() {
         ? 'update-available'
         : 'current';
     }
-    return { ...set, text, loaded_from: 'bundled', date: manifest.bundled_date, sha256, upstream };
+    // Catalog metadata recorded as provenance in the report envelope; the
+    // engine hashes the set text itself, so nothing here is trusted.
+    const meta = {
+      date: manifest.bundled_date, url: set.url, source: set.source,
+      loaded_from: 'bundled', upstream,
+    };
+    return { ...set, text, loaded_from: 'bundled', date: manifest.bundled_date, sha256, upstream, meta };
   }));
 }
 
 function newScanner() {
   const s = new Scanner();
   for (const set of state.stix) {
-    set.stats = JSON.parse(s.load_stix(set.name, set.text));
+    set.stats = JSON.parse(s.load_stix_with_meta(set.name, set.text, JSON.stringify(set.meta)));
   }
   return s;
 }
@@ -197,7 +203,7 @@ function scanWithWorker(file) {
       type: 'scan',
       id,
       file,
-      sets: state.stix.map((s) => ({ name: s.name, text: s.text })),
+      sets: state.stix.map((s) => ({ name: s.name, text: s.text, meta: s.meta })),
     });
   });
 }
@@ -205,6 +211,7 @@ function scanWithWorker(file) {
 async function scanInline(file) {
   const scanner = state.scanner ?? newScanner();
   state.scanner = null;
+  const started = Date.now();
   try {
     const reader = file.stream().getReader();
     let processed = 0;
@@ -217,6 +224,16 @@ async function scanInline(file) {
       updateProgress(processed, file.size);
       if (++n % 2 === 0) await new Promise((r) => setTimeout(r, 0));
     }
+    // The report envelope is assembled entirely in Rust; the producer only
+    // supplies what the engine cannot know: the file's declared identity
+    // and clock readings.
+    scanner.set_scan_meta(JSON.stringify({
+      source_name: file.name,
+      source_size: file.size,
+      scanned_via: 'inline',
+      generated_at: new Date().toISOString(),
+      duration_ms: Date.now() - started,
+    }));
     return JSON.parse(scanner.finish());
   } finally {
     try { state.scanner = newScanner(); } catch { /* keep last error visible */ }
@@ -252,13 +269,8 @@ async function handleFile(file) {
       state.lastScanVia = 'inline';
       report = await scanInline(file);
     }
-    report.generated_at = new Date().toISOString();
-    report.source_file = { name: file.name, size: file.size };
-    report.scanned_via = state.lastScanVia;
-    report.indicator_provenance = state.stix.map((s) => ({
-      name: s.name, campaign: s.stats.campaign, loaded_from: s.loaded_from, date: s.date, url: s.url,
-      sha256: s.sha256, upstream: s.upstream,
-    }));
+    // Schema v3: the report arrives complete from Rust - no fields are
+    // appended here. What the UI renders is exactly what exports.
     state.lastReport = report;
     renderReport(report);
   } catch (err) {
@@ -581,6 +593,9 @@ window.__trace = {
   get lastReport() { return state.lastReport; },
   get lastScanVia() { return state.lastScanVia; },
   get ready() { return state.scanner !== null; },
+  // For producer-parity tests: forces the inline path, exactly what a
+  // browser without worker support gets.
+  disableWorker() { worker = null; },
 };
 
 boot();

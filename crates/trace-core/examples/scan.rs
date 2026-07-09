@@ -6,7 +6,7 @@
 //!   cargo run --release --example scan -- <archive.tar.gz> <set.stix2>...
 
 use std::io::Read;
-use trace_core::engine::Engine;
+use trace_core::engine::{Engine, ScanMeta, SetMeta};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -24,7 +24,14 @@ fn main() {
             .unwrap_or(&stix_path)
             .trim_end_matches(".stix2")
             .to_string();
-        let stats = engine.load_stix(&name, &json).expect("parse STIX file");
+        let meta = SetMeta {
+            source: Some("local file".into()),
+            url: Some(stix_path.clone()),
+            ..Default::default()
+        };
+        let stats = engine
+            .load_stix_with_meta(&name, &json, meta)
+            .expect("parse STIX file");
         eprintln!(
             "loaded {}: {} indicators, {} applicable",
             stats.name, stats.extracted, stats.applicable
@@ -44,6 +51,22 @@ fn main() {
             std::process::exit(1);
         }
     }
+    let size = std::fs::metadata(&archive_path).ok().map(|m| m.len());
+    engine.set_scan_meta(ScanMeta {
+        source_name: Some(
+            archive_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&archive_path)
+                .to_string(),
+        ),
+        source_size: size,
+        scanned_via: Some("native".into()),
+        generated_at: Some(
+            humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
+        ),
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+    });
     match engine.finish() {
         Ok(report) => {
             eprintln!("scanned in {:.1?}", started.elapsed());

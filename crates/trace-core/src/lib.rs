@@ -37,14 +37,42 @@ impl Scanner {
 
     /// Load a STIX2 bundle (JSON text). Returns per-set stats as JSON.
     pub fn load_stix(&mut self, set_name: &str, stix_json: &str) -> Result<String, JsError> {
+        self.load_stix_with_meta(set_name, stix_json, "{}")
+    }
+
+    /// Load a STIX2 bundle with catalog metadata (JSON: date, url, source,
+    /// loaded_from, upstream) recorded as provenance in the report. The
+    /// set's hash is computed here from the text, never taken from meta.
+    pub fn load_stix_with_meta(
+        &mut self,
+        set_name: &str,
+        stix_json: &str,
+        meta_json: &str,
+    ) -> Result<String, JsError> {
         let engine = self
             .inner
             .as_mut()
             .ok_or_else(|| JsError::new("scanner already finished"))?;
+        let meta: engine::SetMeta =
+            serde_json::from_str(meta_json).map_err(|e| JsError::new(&e.to_string()))?;
         let stats = engine
-            .load_stix(set_name, stix_json)
+            .load_stix_with_meta(set_name, stix_json, meta)
             .map_err(|m| JsError::new(&m))?;
         serde_json::to_string(&stats).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Record scan-level metadata (JSON: source_name, source_size,
+    /// scanned_via, generated_at, duration_ms) for the report envelope.
+    /// Descriptive only; nothing here can influence the verdict.
+    pub fn set_scan_meta(&mut self, meta_json: &str) -> Result<(), JsError> {
+        let engine = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("scanner already finished"))?;
+        let meta: engine::ScanMeta =
+            serde_json::from_str(meta_json).map_err(|e| JsError::new(&e.to_string()))?;
+        engine.set_scan_meta(meta);
+        Ok(())
     }
 
     /// Stream the next chunk of the sysdiagnose archive (.tar.gz or .tar).

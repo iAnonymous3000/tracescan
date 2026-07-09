@@ -53,6 +53,7 @@ Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` and `b
 Layout:
 
 - `crates/trace-core/` - Rust core: streaming tar/gzip, STIX2 extraction, the four artifact parsers, report assembly, and the verdict (computed in Rust, in one place - the UI renders it and never re-derives safety semantics). `cargo test` covers all of it natively, including proptest property tests over the hostile-input surface (`tests/properties.rs`).
+- `docs/report.schema.json` - the exported report contract (schema_version 3). The whole envelope is assembled in Rust; every producer (browser worker, inline, native CLI) emits the same shape, pinned by a golden field list (`crates/trace-core/tests/report_v3.rs`) that the browser E2E suite checks too.
 - `web/` - the static site (framework-free JS + CSS, service worker for offline, strict CSP). This directory is the entire deployable artifact.
 - `e2e/` - Playwright browser tests: demo scans, verdict rendering, report export, scan-limit handling, and offline operation.
 - `fixtures/make_fixtures.sh` - synthetic demo archive generator.
@@ -62,7 +63,7 @@ CI runs fmt, clippy, tests, `cargo audit`, and the browser E2E suite on every pu
 Deployment notes: production is **Cloudflare Pages** (`tracescan.pages.dev`), built by its git integration on every push to `main` with output directory `web/`. The dashboard build command is kept in sync with this canonical copy (dash-compatible; the toolchain version comes from `rust-toolchain.toml` and wasm-pack is pinned by checksum):
 
 ```
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none && . "$HOME/.cargo/env" && rustup toolchain install && curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/wp.tgz && echo "278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d  /tmp/wp.tgz" | sha256sum -c - && tar -xzf /tmp/wp.tgz -C /tmp && /tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg && rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts && sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${CF_PAGES_COMMIT_SHA}'/" web/sw.js && grep -q "trace-${CF_PAGES_COMMIT_SHA}" web/sw.js
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none && . "$HOME/.cargo/env" && rustup toolchain install && curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/wp.tgz && echo "278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d  /tmp/wp.tgz" | sha256sum -c - && tar -xzf /tmp/wp.tgz -C /tmp && TRACE_BUILD_COMMIT="${CF_PAGES_COMMIT_SHA}" /tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg && rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts && sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${CF_PAGES_COMMIT_SHA}'/" web/sw.js && grep -q "trace-${CF_PAGES_COMMIT_SHA}" web/sw.js
 ```
 
 The trailing `grep -q` makes the cache-name substitution fail loudly: if `sw.js` is ever edited so the `sed` no longer matches, the build fails instead of shipping a service worker that serves stale caches forever.

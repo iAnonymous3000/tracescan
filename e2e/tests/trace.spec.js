@@ -3,6 +3,7 @@
 // privacy claim (load once, go offline, scanning still works).
 const { test, expect } = require('@playwright/test');
 const fs = require('fs');
+const path = require('path');
 
 // Builds a minimal ustar archive in the page and hands it to the same
 // handleFile the drop zone uses. Used for inputs no fixture should ship.
@@ -231,4 +232,59 @@ test('scanning still works fully offline once the app is cached', async ({ page,
   // offline means the live refresh failed and bundled snapshots were used
   await expect(page.locator('#ioc-list')).toContainText('snapshot');
   await context.setOffline(false);
+});
+
+// Report v3 producer parity: the worker and inline producers must emit the
+// exact field shape pinned by the Rust golden (which the native producer is
+// held to in crates/trace-core/tests/report_v3.rs). Same flattening rules
+// as that test: array indices normalize to [], and paths whose contents
+// legitimately vary (evidence, details, by_kind) are opaque leaves.
+const GOLDEN_FIELDS = path.join(__dirname, '../../crates/trace-core/tests/report_fields_v3.json');
+const OPAQUE_PATHS = new Set(['/findings[]/evidence', '/artifacts[]/details', '/indicator_sets[]/by_kind']);
+
+function fieldPaths(v, prefix, out) {
+  if (OPAQUE_PATHS.has(prefix)) { out.add(prefix); return; }
+  if (Array.isArray(v)) {
+    if (!v.length) { out.add(prefix); return; }
+    for (const x of v) fieldPaths(x, prefix + '[]', out);
+  } else if (v !== null && typeof v === 'object') {
+    const keys = Object.keys(v);
+    if (!keys.length) { out.add(prefix); return; }
+    for (const k of keys) fieldPaths(v[k], prefix + '/' + k, out);
+  } else {
+    out.add(prefix);
+  }
+}
+
+test('worker and inline producers emit the golden report shape', async ({ page }) => {
+  const golden = new Set(JSON.parse(fs.readFileSync(GOLDEN_FIELDS, 'utf8')));
+  await page.goto('/');
+  await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  const workerReport = await page.evaluate(() => window.__trace.lastReport);
+
+  await page.evaluate(async () => {
+    window.__trace.disableWorker();
+    const blob = await (await fetch('./fixtures/sysdiagnose_demo_infected.tar.gz')).blob();
+    window.__trace.handleFile(new File([blob], 'sysdiagnose_demo_infected.tar.gz'));
+  });
+  await page.waitForFunction(() => window.__trace.lastReport?.scanned_via === 'inline', null, { timeout: 30_000 });
+  const inlineReport = await page.evaluate(() => window.__trace.lastReport);
+
+  expect(workerReport.scanned_via).toBe('worker');
+  expect(inlineReport.scanned_via).toBe('inline');
+  for (const [producer, report] of [['worker', workerReport], ['inline', inlineReport]]) {
+    expect(report.schema_version).toBe(3);
+    const got = new Set();
+    fieldPaths(report, '', got);
+    const missing = [...golden].filter((p) => !got.has(p));
+    const extra = [...got].filter((p) => !golden.has(p));
+    expect(missing, `${producer} report is missing golden fields`).toEqual([]);
+    expect(extra, `${producer} report has fields outside the golden shape`).toEqual([]);
+  }
+  // Same bytes, same engine-computed hash, regardless of producer.
+  expect(workerReport.source_file.sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(inlineReport.source_file.sha256).toBe(workerReport.source_file.sha256);
 });
