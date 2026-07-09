@@ -39,6 +39,9 @@ fn main() {
     }
 
     let started = std::time::Instant::now();
+    // Same contract as the browser wrapper: the engine measures duration
+    // itself, through the end of report assembly.
+    engine.set_clock(Box::new(move || started.elapsed().as_secs_f64() * 1000.0));
     let mut file = std::fs::File::open(&archive_path).expect("open archive");
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -62,11 +65,10 @@ fn main() {
         ),
         source_size: size,
         scanned_via: Some("native".into()),
-        generated_at: Some(
-            humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
-        ),
-        duration_ms: Some(started.elapsed().as_millis() as u64),
     });
+    engine.set_generated_at(
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
+    );
     match engine.finish() {
         Ok(report) => {
             eprintln!("scanned in {:.1?}", started.elapsed());

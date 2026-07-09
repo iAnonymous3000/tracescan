@@ -53,7 +53,7 @@ Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` and `b
 Layout:
 
 - `crates/trace-core/` - Rust core: streaming tar/gzip, STIX2 extraction, the four artifact parsers, report assembly, and the verdict (computed in Rust, in one place - the UI renders it and never re-derives safety semantics). `cargo test` covers all of it natively, including proptest property tests over the hostile-input surface (`tests/properties.rs`).
-- `docs/report.schema.json` - the exported report contract (schema_version 3). The whole envelope is assembled in Rust; every producer (browser worker, inline, native CLI) emits the same shape, pinned by a golden field list (`crates/trace-core/tests/report_v3.rs`) that the browser E2E suite checks too.
+- `web/report.schema.json` - the exported report contract (schema_version 3). The whole envelope is assembled in Rust; every producer (browser worker, inline, native CLI) emits the same shape, pinned by a golden field list (`crates/trace-core/tests/report_v3.rs`) that the browser E2E suite checks too.
 - `web/` - the static site (framework-free JS + CSS, service worker for offline, strict CSP). This directory is the entire deployable artifact.
 - `e2e/` - Playwright browser tests: demo scans, verdict rendering, report export, scan-limit handling, and offline operation.
 - `fixtures/make_fixtures.sh` - synthetic demo archive generator.

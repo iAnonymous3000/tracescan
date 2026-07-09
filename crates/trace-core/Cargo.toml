@@ -1,6 +1,6 @@
 [package]
 name = "trace-core"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
 license = "MIT"
@@ -25,6 +25,9 @@ sha2 = { version = "0.11.0", default-features = false }
 humantime = "2.4.0"
 jsonschema = "0.47.0"
 proptest = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.103"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false

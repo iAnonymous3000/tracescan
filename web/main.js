@@ -211,7 +211,6 @@ function scanWithWorker(file) {
 async function scanInline(file) {
   const scanner = state.scanner ?? newScanner();
   state.scanner = null;
-  const started = Date.now();
   try {
     const reader = file.stream().getReader();
     let processed = 0;
@@ -225,14 +224,13 @@ async function scanInline(file) {
       if (++n % 2 === 0) await new Promise((r) => setTimeout(r, 0));
     }
     // The report envelope is assembled entirely in Rust; the producer only
-    // supplies what the engine cannot know: the file's declared identity
-    // and clock readings.
+    // supplies the file's declared identity. Timing comes from the engine
+    // itself (its injected clock runs through parsing and assembly inside
+    // finish, which a reading taken here would miss).
     scanner.set_scan_meta(JSON.stringify({
       source_name: file.name,
       source_size: file.size,
       scanned_via: 'inline',
-      generated_at: new Date().toISOString(),
-      duration_ms: Date.now() - started,
     }));
     return JSON.parse(scanner.finish());
   } finally {

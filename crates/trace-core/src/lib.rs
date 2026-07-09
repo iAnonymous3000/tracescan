@@ -30,9 +30,14 @@ impl Scanner {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Scanner {
         console_error_panic_hook::set_once();
-        Scanner {
-            inner: Some(engine::Engine::new()),
-        }
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
+        let mut inner = engine::Engine::new();
+        // The engine measures scan duration itself (the expensive work is
+        // inside finish, past any reading a JS producer could take); it
+        // just needs a clock, which wasm32 does not have natively.
+        #[cfg(target_arch = "wasm32")]
+        inner.set_clock(Box::new(js_sys::Date::now));
+        Scanner { inner: Some(inner) }
     }
 
     /// Load a STIX2 bundle (JSON text). Returns per-set stats as JSON.
@@ -86,10 +91,17 @@ impl Scanner {
 
     /// Finalize the scan and return the full report as JSON.
     pub fn finish(&mut self) -> Result<String, JsError> {
-        let engine = self
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
+        let mut engine = self
             .inner
             .take()
             .ok_or_else(|| JsError::new("scanner already finished"))?;
+        // Stamped when finalization begins: the closest observable moment
+        // to "when the report was generated".
+        #[cfg(target_arch = "wasm32")]
+        if let Some(iso) = js_sys::Date::new_0().to_iso_string().as_string() {
+            engine.set_generated_at(iso);
+        }
         let report = engine.finish().map_err(|m| JsError::new(&m))?;
         serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))
     }

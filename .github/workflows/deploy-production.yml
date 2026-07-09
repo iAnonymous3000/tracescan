@@ -156,4 +156,7 @@ jobs:
           curl -fsSI "https://tracescan.pages.dev/" | grep -qi "^content-security-policy:"
           curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_clean.tar.gz"
           curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_infected.tar.gz"
+          # The report schema must resolve at its declared $id, not fall
+          # back to the SPA's index.html.
+          curl -fsS "https://tracescan.pages.dev/report.schema.json" | grep -q '"schema_version"'
           echo "production verified at trace-${HEAD_SHA}"

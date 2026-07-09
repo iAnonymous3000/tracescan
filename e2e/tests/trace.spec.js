@@ -287,4 +287,17 @@ test('worker and inline producers emit the golden report shape', async ({ page }
   // Same bytes, same engine-computed hash, regardless of producer.
   expect(workerReport.source_file.sha256).toMatch(/^[0-9a-f]{64}$/);
   expect(inlineReport.source_file.sha256).toBe(workerReport.source_file.sha256);
+  // Engine-measured timing (its clock runs through parsing and assembly
+  // inside finish; producers no longer supply readings).
+  expect(typeof workerReport.duration_ms).toBe('number');
+  expect(typeof inlineReport.duration_ms).toBe('number');
+  expect(workerReport.generated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('the report schema is served at its declared $id path', async ({ page }) => {
+  await page.goto('/');
+  const schema = await page.evaluate(async () =>
+    (await fetch('./report.schema.json')).json());
+  expect(schema.$id).toBe('https://tracescan.pages.dev/report.schema.json');
+  expect(schema.properties.schema_version.const).toBe(3);
 });

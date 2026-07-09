@@ -1,0 +1,468 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracescan.pages.dev/report.schema.json",
+  "title": "Trace scan report (schema_version 3)",
+  "description": "The complete report envelope, assembled entirely by the Rust engine. Producers (browser worker, inline browser, native CLI) supply only descriptive metadata; every producer emits the identical field set for identical input. Producer-supplied metadata is always present and nullable; content-derived fields (device, a finding's indicator) may be absent because their presence depends only on the archive.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tool",
+    "verdict",
+    "generated_at",
+    "duration_ms",
+    "scanned_via",
+    "source_file",
+    "indicator_sets",
+    "indicator_provenance",
+    "artifacts",
+    "missing_artifacts",
+    "findings",
+    "stats",
+    "scan_limits",
+    "assurance",
+    "coverage"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "build_commit"
+      ],
+      "properties": {
+        "name": {
+          "const": "Trace"
+        },
+        "version": {
+          "type": "string"
+        },
+        "build_commit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Exact commit the scanner was built from; null for local dev builds."
+        }
+      }
+    },
+    "verdict": {
+      "enum": [
+        "match",
+        "suspicious",
+        "clear",
+        "inconclusive",
+        "invalid"
+      ]
+    },
+    "generated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "RFC 3339, from the host's calendar clock, stamped when finalization begins."
+    },
+    "duration_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Measured by the engine through its injected clock: first byte received through the end of report assembly (parsing, matching, and verdict all happen inside finalization). Null when the host injected no clock."
+    },
+    "scanned_via": {
+      "enum": [
+        "worker",
+        "inline",
+        "native",
+        null
+      ]
+    },
+    "source_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "size",
+        "sha256"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Hash of every byte the engine received - the archive exactly as scanned, computed by the engine."
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os_version",
+        "source"
+      ],
+      "properties": {
+        "os_version": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string"
+        }
+      }
+    },
+    "indicator_sets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "campaign",
+          "stix_indicators",
+          "extracted",
+          "by_kind",
+          "applicable"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "campaign": {
+            "type": "string"
+          },
+          "stix_indicators": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "extracted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "by_kind": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "applicable": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "indicator_provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "campaign",
+          "sha256",
+          "loaded_from",
+          "date",
+          "url",
+          "source",
+          "upstream"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "campaign": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hash of the exact indicator text scanned against, computed by the engine."
+          },
+          "loaded_from": {
+            "type": "string"
+          },
+          "date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "upstream": {
+            "enum": [
+              "current",
+              "update-available",
+              "unknown",
+              null
+            ]
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "kind",
+          "status",
+          "details"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "shutdown_log",
+              "crash_log",
+              "ps_listing",
+              "unified_log"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "details": {
+            "description": "Parser-specific; intentionally unconstrained."
+          }
+        }
+      }
+    },
+    "missing_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "note"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "shutdown_log",
+              "crash_log",
+              "ps_listing",
+              "unified_log"
+            ]
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "kind",
+          "artifact",
+          "summary",
+          "evidence"
+        ],
+        "properties": {
+          "severity": {
+            "enum": [
+              "note",
+              "suspicious",
+              "match"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "artifact": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "evidence": {
+            "description": "Finding-specific; intentionally unconstrained."
+          },
+          "indicator": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "value",
+              "kind",
+              "set",
+              "campaign"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "set": {
+                "type": "string"
+              },
+              "campaign": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bytes_read",
+        "archive_entries",
+        "artifacts_found",
+        "total_indicators",
+        "applicable_indicators"
+      ],
+      "properties": {
+        "bytes_read": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "archive_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifacts_found": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_indicators": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "applicable_indicators": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "scan_limits": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assurance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "surfaces",
+        "surfaces_examined",
+        "surfaces_total"
+      ],
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "state"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "shutdown_log",
+                  "crash_log",
+                  "ps_listing",
+                  "unified_log"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "absent",
+                  "partial",
+                  "complete"
+                ]
+              }
+            }
+          }
+        },
+        "surfaces_examined": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "surfaces_total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "examined",
+        "not_examined",
+        "note"
+      ],
+      "properties": {
+        "examined": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_examined": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

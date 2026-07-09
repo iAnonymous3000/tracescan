@@ -43,6 +43,8 @@ fn scan_fixture(fixture: &str) -> serde_json::Value {
             .unwrap();
     }
     let data = std::fs::read(root.join("web/fixtures").join(fixture)).unwrap();
+    let started = std::time::Instant::now();
+    engine.set_clock(Box::new(move || started.elapsed().as_secs_f64() * 1000.0));
     for chunk in data.chunks(65536) {
         engine.push(chunk).unwrap();
     }
@@ -50,9 +52,8 @@ fn scan_fixture(fixture: &str) -> serde_json::Value {
         source_name: Some(fixture.into()),
         source_size: Some(data.len() as u64),
         scanned_via: Some("native".into()),
-        generated_at: Some("2026-01-01T00:00:00Z".into()),
-        duration_ms: Some(1),
     });
+    engine.set_generated_at("2026-01-01T00:00:00Z".into());
     serde_json::to_value(engine.finish().unwrap()).unwrap()
 }
 
@@ -96,7 +97,7 @@ fn paths_of(report: &serde_json::Value) -> BTreeSet<String> {
 #[test]
 fn reports_validate_against_checked_in_schema() {
     let schema: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(repo_root().join("docs/report.schema.json")).unwrap(),
+        &std::fs::read_to_string(repo_root().join("web/report.schema.json")).unwrap(),
     )
     .unwrap();
     let validator = jsonschema::validator_for(&schema).expect("schema itself must be valid");
@@ -111,7 +112,7 @@ fn reports_validate_against_checked_in_schema() {
             .collect();
         assert!(
             errors.is_empty(),
-            "{fixture} report violates docs/report.schema.json:\n{}",
+            "{fixture} report violates web/report.schema.json:\n{}",
             errors.join("\n")
         );
     }
@@ -158,6 +159,8 @@ fn producer_metadata_lands_in_envelope() {
     assert!(sha
         .chars()
         .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    // Engine-measured duration: present whenever a clock was injected.
+    assert!(report["duration_ms"].as_u64().is_some());
     // Every loaded set has engine-computed provenance.
     assert_eq!(
         report["indicator_provenance"].as_array().unwrap().len(),

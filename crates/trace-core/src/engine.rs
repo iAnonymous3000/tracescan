@@ -34,17 +34,17 @@ pub struct SetMeta {
     pub upstream: Option<String>,
 }
 
-/// Scan-level metadata from the producer: what file it fed the engine and
-/// its clock readings (the engine has neither a clock nor the file handle
-/// on wasm32). Everything here is descriptive; nothing influences the
-/// verdict.
+/// Scan-level metadata from the producer: what file it fed the engine
+/// (the engine has no file handle, only bytes). Descriptive only; nothing
+/// here influences the verdict. Timing is not producer-supplied: duration
+/// is measured by the engine through an injected clock, because the
+/// expensive work (parsing, matching, verdict assembly) happens inside
+/// `finish`, after any reading a producer could take.
 #[derive(Default, Deserialize)]
 pub struct ScanMeta {
     pub source_name: Option<String>,
     pub source_size: Option<u64>,
     pub scanned_via: Option<String>,
-    pub generated_at: Option<String>,
-    pub duration_ms: Option<u64>,
 }
 
 enum Sink {
@@ -74,6 +74,12 @@ pub struct Engine {
     input_hash: Sha256,
     provenance: Vec<SetProvenance>,
     scan_meta: ScanMeta,
+    /// Millisecond clock injected by the host (js Date.now in the browser,
+    /// a monotonic timer natively). Only differences are taken, so any
+    /// epoch works. Without one, duration_ms is null.
+    clock: Option<Box<dyn Fn() -> f64>>,
+    scan_started: Option<f64>,
+    generated_at: Option<String>,
 }
 
 impl Default for Engine {
@@ -93,7 +99,21 @@ impl Engine {
             input_hash: Sha256::new(),
             provenance: Vec::new(),
             scan_meta: ScanMeta::default(),
+            clock: None,
+            scan_started: None,
+            generated_at: None,
         }
+    }
+
+    pub fn set_clock(&mut self, clock: Box<dyn Fn() -> f64>) {
+        self.clock = Some(clock);
+    }
+
+    /// RFC 3339 timestamp for the report, from the host's calendar clock.
+    /// Meant to be stamped when finalization begins - the closest a
+    /// producer can get to "when the report was generated" from outside.
+    pub fn set_generated_at(&mut self, iso: String) {
+        self.generated_at = Some(iso);
     }
 
     pub fn load_stix(&mut self, set_name: &str, json: &str) -> Result<SetStats, String> {
@@ -129,6 +149,9 @@ impl Engine {
             return Ok(());
         }
         self.bytes_in += chunk.len() as u64;
+        if self.scan_started.is_none() {
+            self.scan_started = self.clock.as_ref().map(|c| c());
+        }
         self.input_hash.update(chunk);
         if self.sink.is_none() {
             self.prelude.extend_from_slice(chunk);
@@ -443,6 +466,13 @@ impl Engine {
             examined.push("Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)");
         }
 
+        // Duration closes here, after parsing, matching, and assembly - the
+        // expensive part of the scan, which all happens in this function.
+        let duration_ms = match (&self.clock, self.scan_started) {
+            (Some(clock), Some(started)) => Some((clock() - started).max(0.0) as u64),
+            _ => None,
+        };
+
         Ok(Report {
             schema_version: 3,
             tool: ToolInfo {
@@ -451,8 +481,8 @@ impl Engine {
                 build_commit: option_env!("TRACE_BUILD_COMMIT").filter(|s| !s.is_empty()),
             },
             verdict,
-            generated_at: self.scan_meta.generated_at,
-            duration_ms: self.scan_meta.duration_ms,
+            generated_at: self.generated_at,
+            duration_ms,
             scanned_via: self.scan_meta.scanned_via,
             source_file: SourceFile {
                 name: self.scan_meta.source_name,

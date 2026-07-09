@@ -34,6 +34,24 @@ cutover makes the workflow the only production writer.
   metadata; worst case is a crafted file aborting its own scan, an
   availability nuisance rather than a result-integrity risk).
 
+## v0.7.1 - 2026-07-09
+
+Two Report v3 corrections; the shape is unchanged.
+
+- **`duration_ms` now measures the whole scan.** It was captured by the
+  producers before `finish()`, which is where parsing, indicator
+  matching, and verdict assembly actually happen, so it recorded only
+  streaming time. The engine now measures duration itself through a
+  host-injected millisecond clock (js `Date.now` in the browser wrapper,
+  a monotonic timer natively), from the first byte received to the end
+  of report assembly. `generated_at` is likewise stamped by the wrapper
+  when finalization begins, not when streaming ends.
+- **The schema is served at its declared `$id`.** `report.schema.json`
+  moved from `docs/` into `web/`, so
+  `https://tracescan.pages.dev/report.schema.json` resolves to the
+  contract instead of the HTML fallback. The deploy workflow's
+  post-deploy verification now checks it.
+
 ## v0.7.0 - 2026-07-09
 
 Report v3: the evidence-package foundation. The exported report is now a
