@@ -5,7 +5,7 @@
 
 use crate::heuristics::{path_flag, path_flag_finding, PathFlag};
 use crate::ioc::{basename, IocDb, IocKind};
-use crate::report::{ArtifactSummary, DeviceInfo, Finding, Severity};
+use crate::report::{ArtifactSummary, DeviceInfo, Finding, Findings, Severity};
 use regex_lite::Regex;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -43,7 +43,7 @@ pub fn analyze(
     path: &str,
     content: &str,
     db: &IocDb,
-    findings: &mut Vec<Finding>,
+    findings: &mut Findings,
 ) -> (ArtifactSummary, Option<DeviceInfo>) {
     let (first_line, rest) = match content.split_once('\n') {
         Some((a, b)) => (a, b),
@@ -177,6 +177,7 @@ pub fn analyze(
     let device = os_version.as_ref().map(|ov| DeviceInfo {
         os_version: ov.clone(),
         source: path.to_string(),
+        timestamp: timestamp.clone(),
     });
 
     (
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn extracts_device_info_and_matches_ioc() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let (summary, device) = analyze(
             "root/crashes_and_spins/bh-2026-07-01-120311.ips",
             SAMPLE,
@@ -244,7 +245,7 @@ mod tests {
     fn kernel_panic_string_yields_candidates_and_staging_heuristic() {
         let panic = r#"{"name":"kernel","bug_type":"210","timestamp":"2026-07-06 03:00:00.00 -0700","os_version":"iPhone OS 17.2.1 (21C66)"}
 {"panicString":"panic(cpu 4): Panicked task 0xffffff80211a5f80: 306 threads: pid 2143: bh, ran from /private/var/db/com.apple.xpc.roleaccountd.staging/bh","osVersion":{"train":"iPhone OS 17.2.1","build":"21C66"}}"#;
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze(
             "root/crashes_and_spins/Panics/panic-full-2026-07-06.ips",
             panic,
@@ -277,7 +278,7 @@ mod tests {
             r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[file:path='/private/var/db/com.apple.xpc.roleaccountd.staging/bh']"}]}"#,
         )
         .unwrap();
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze(
             "root/crashes_and_spins/bh-2026-07-01-120311.ips",
             SAMPLE,
@@ -303,7 +304,7 @@ mod tests {
     fn crash_from_unusual_location_yields_note() {
         let sample = r#"{"app_name":"agent","name":"agent","bug_type":"309"}
 {"procName":"agent","procPath":"/private/var/tmp/agent","parentProc":"launchd"}"#;
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze(
             "root/crashes_and_spins/agent-2026.ips",
             sample,
@@ -341,7 +342,7 @@ mod tests {
             r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[process:name='Diagnostics-2543']"}]}"#,
         )
         .unwrap();
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let (summary, _) = analyze(
             "root/crashes_and_spins/Diagnostics-2543-2026-07-01-120311.ips",
             "not json at all",
@@ -362,7 +363,7 @@ mod tests {
     fn benign_crash_produces_no_findings() {
         let benign = r#"{"app_name":"MobileSafari","name":"MobileSafari","bug_type":"309","os_version":"iPhone OS 17.2.1 (21C66)"}
 {"procName":"MobileSafari","procPath":"/Applications/MobileSafari.app/MobileSafari","parentProc":"launchd"}"#;
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze(
             "root/crashes_and_spins/MobileSafari-2026.ips",
             benign,

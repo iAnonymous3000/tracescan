@@ -14,7 +14,7 @@
 
 use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
-use crate::report::{ArtifactSummary, Finding};
+use crate::report::{ArtifactSummary, Finding, Findings};
 use macos_unifiedlogs::parser::parse_log;
 use macos_unifiedlogs::uuidtext::UUIDText;
 use serde_json::json;
@@ -25,6 +25,9 @@ use std::io::Cursor;
 /// for hostile input, and hitting one surfaces in the artifact details.
 const MAX_TRACKED_UUIDS: usize = 65_536;
 const MAX_PIDS_PER_PROCESS: usize = 4_096;
+/// Real binary paths are well under 1 KB; a crafted uuidtext footer must not
+/// be able to store megabytes per tracked UUID.
+const MAX_PATH_BYTES: usize = 4_096;
 /// Kernel entries carry an all-zeros main UUID and no binary path.
 const ZERO_UUID: &str = "00000000000000000000000000000000";
 
@@ -42,10 +45,10 @@ pub struct Aggregator {
     paths: BTreeMap<String, String>,
     pub(crate) tracev3_files: u64,
     pub(crate) tracev3_failures: u64,
-    uuidtext_files: u64,
-    uuidtext_failures: u64,
+    pub(crate) uuidtext_files: u64,
+    pub(crate) uuidtext_failures: u64,
     catalogs: u64,
-    cap_hit: bool,
+    pub(crate) cap_hit: bool,
     /// Files our own size cap cut short; parsing a partial file would
     /// silently under-report, so they are skipped and surfaced instead.
     pub truncated_files: u64,
@@ -61,8 +64,9 @@ fn image_path(ut: &UUIDText) -> Option<String> {
         .map(|e| e.entry_size as usize)
         .sum();
     let footer = ut.footer_data.get(offset..)?;
-    let end = footer.iter().position(|&b| b == 0).unwrap_or(footer.len());
-    let path = String::from_utf8_lossy(&footer[..end]).trim().to_string();
+    let scan = &footer[..footer.len().min(MAX_PATH_BYTES)];
+    let end = scan.iter().position(|&b| b == 0).unwrap_or(scan.len());
+    let path = String::from_utf8_lossy(&scan[..end]).trim().to_string();
     (!path.is_empty()).then_some(path)
 }
 
@@ -114,7 +118,7 @@ impl Aggregator {
         self.tracev3_files > 0 || self.uuidtext_files > 0
     }
 
-    pub fn finalize(self, db: &IocDb, findings: &mut Vec<Finding>) -> Option<ArtifactSummary> {
+    pub fn finalize(self, db: &IocDb, findings: &mut Findings) -> Option<ArtifactSummary> {
         if !self.saw_content() {
             return None;
         }
@@ -215,7 +219,7 @@ mod tests {
 
     #[test]
     fn no_content_yields_no_summary() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         assert!(Aggregator::default()
             .finalize(&seeded_db(), &mut findings)
             .is_none());
@@ -234,7 +238,7 @@ mod tests {
                 ("BBBB", "/usr/libexec/nfcd"),
             ],
         );
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
         assert_eq!(summary.kind, "unified_log");
         assert_eq!(summary.status, "parsed");
@@ -253,7 +257,7 @@ mod tests {
     #[test]
     fn unresolved_uuid_is_counted_not_matched() {
         let agg = agg_with(&[("CCCC", 42)], &[]);
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
         assert_eq!(summary.details["processes_seen"], 1);
         assert_eq!(summary.details["processes_resolved_to_path"], 0);
@@ -268,7 +272,7 @@ mod tests {
         assert_eq!(agg.tracev3_failures, 1);
         assert_eq!(agg.uuidtext_failures, 1);
         // wholesale failure downgrades the artifact status
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
         assert_eq!(summary.status, "parsed_partial");
     }

@@ -5,15 +5,10 @@
 
 use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
-use crate::report::{ArtifactSummary, Finding};
+use crate::report::{ArtifactSummary, Finding, Findings};
 use serde_json::json;
 
-pub fn analyze(
-    path: &str,
-    content: &str,
-    db: &IocDb,
-    findings: &mut Vec<Finding>,
-) -> ArtifactSummary {
+pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -> ArtifactSummary {
     let Some(header) = content
         .lines()
         .find(|l| l.contains("PID") && l.contains("COMMAND"))
@@ -103,7 +98,7 @@ root               0  2143     1   0.0  0.2 Tue07PM  0:00.11 /private/var/db/com
 
     #[test]
     fn counts_processes_and_flags_ioc() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = analyze("root/ps.txt", SAMPLE, &db_with_bh(), &mut findings);
         assert_eq!(summary.details["processes"], 4);
         let matches: Vec<_> = findings
@@ -117,7 +112,7 @@ root               0  2143     1   0.0  0.2 Tue07PM  0:00.11 /private/var/db/com
 
     #[test]
     fn commands_with_arguments_keep_argv0() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let mut db = IocDb::new();
         db.load_stix(
             "t",
@@ -156,7 +151,7 @@ mobile           501   777     1   0.0  0.3 Tue07PM  0:00.55 /private/var/app/My
             r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/app/My App.app/My App']"}]}"#,
         )
         .unwrap();
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze("root/ps.txt", SPACED, &db, &mut findings);
         let matches: Vec<_> = findings
             .iter()

@@ -1,6 +1,10 @@
 /* Trace service worker: makes the whole app work offline so the privacy
    claim is verifiable - load once, go to Airplane Mode, scan. */
 
+// The production build replaces this exact string with a per-commit name
+// ('trace-<sha>') and then verifies the substitution took (see the deploy
+// command in README.md). Renaming or reformatting this line breaks that
+// verification on purpose: update both together.
 const CACHE = 'trace-v1';
 const SHELL = [
   './',

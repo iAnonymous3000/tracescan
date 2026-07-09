@@ -4,6 +4,54 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.6.0 - 2026-07-09
+
+Result-integrity release from an external audit: every path by which a
+degraded scan could still render "No known spyware traces found" is closed.
+
+- **The Rust engine now owns the verdict** (`verdict` in every report,
+  `schema_version` 2). Parser failures - an unparseable ps.txt, crash logs
+  whose JSON does not parse, tracev3/uuidtext parse failures, inventory cap
+  hits - surface as scan limits and force the verdict to inconclusive.
+  Previously the UI derived the verdict from findings and scan limits alone,
+  so a scan whose parsers failed could read as clear. Indicator matches
+  still escalate over a degraded scan, never wash out.
+- **Live indicator refresh can no longer reduce coverage.** Each set in
+  `manifest.json` carries the reviewed bundled floor (`min_indicators`,
+  `min_applicable`); a live file below either floor (empty bundle,
+  rate-limit page shaped like JSON, upstream regression) is rejected in
+  favor of the snapshot. A CI test (`bundled_iocs`) keeps the floors honest
+  against the snapshots themselves.
+- **Scan results can no longer attach to the wrong file.** Worker messages
+  carry a scan id and stale/foreign messages are dropped; concurrent scan
+  starts are refused while one is in flight.
+- Tar reader hardening: header checksums are validated (corruption mid-
+  archive is inconclusive, not silently misparsed); the entry cap counts
+  every header type so directory/PAX floods cannot bypass it; a total
+  decompressed-byte budget (8 GB) caps gzip bombs; PAX record lengths use
+  checked arithmetic (a crafted length could previously trap the WASM
+  module on 32-bit).
+- Output hardening: findings are capped at 5,000 (capped scans are
+  inconclusive unless a match was already found), the DOM renders at most
+  200 finding cards (the exported JSON always has all of them), and
+  uuidtext binary paths are truncated at 4 KB.
+- `crashes_and_spins` is matched as a path component, so lookalike
+  directories in unrelated archives no longer classify as crash logs.
+- STIX AND/FOLLOWEDBY rejection is token-based: a multi-line or
+  tab-separated `AND` pattern can no longer be half-matched.
+- Report accuracy: coverage "examined" lists only surfaces actually present;
+  a unified-log-only archive is no longer labeled "not a sysdiagnose";
+  device OS provenance prefers the newest crash log (with its timestamp
+  recorded) instead of the first encountered.
+- UI/UX: verdicts render from the engine verdict; scan errors are announced
+  to screen readers (focus + `role="alert"`); the artifact table scrolls
+  inside its own container on narrow screens; the live-indicator fetch
+  timeout covers the response body, so a stalling server cannot hang
+  startup.
+- Validation: the real-capture integration test now loads all eight bundled
+  indicator sets, so it reproduces the documented zero-false-positive claim;
+  `cargo run --example ioc_stats` regenerates the manifest floors.
+
 ## v0.5.0 - 2026-07-08
 
 - **Unified log analysis** - the fourth detection surface, and the largest:

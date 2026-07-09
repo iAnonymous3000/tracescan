@@ -91,7 +91,7 @@ impl Engine {
             Some(Sink::Plain(c)) => c,
         };
 
-        let mut findings: Vec<Finding> = Vec::new();
+        let mut findings = Findings::new();
         let mut artifacts: Vec<ArtifactSummary> = Vec::new();
         let mut device: Option<DeviceInfo> = None;
 
@@ -109,8 +109,15 @@ impl Engine {
                 ArtifactKind::CrashLog => {
                     let (a, d) = crash_log::analyze(&f.path, &text, &self.db, &mut findings);
                     artifacts.push(a);
-                    if device.is_none() {
-                        device = d;
+                    // Prefer the newest crash: an old crash log can predate
+                    // an OS upgrade and misstate the capture-time OS.
+                    if let Some(d) = d {
+                        if device
+                            .as_ref()
+                            .is_none_or(|cur| d.timestamp > cur.timestamp)
+                        {
+                            device = Some(d);
+                        }
                     }
                 }
                 ArtifactKind::PsListing => {
@@ -126,13 +133,22 @@ impl Engine {
 
         // Unified logs were consumed during streaming; reduce them to
         // findings and a summary now that the whole archive has been seen.
+        // Health counters are captured first: parse failures must reach the
+        // verdict, not just the artifact details.
         let unified = std::mem::take(&mut collector.unified);
         let unified_truncated = unified.truncated_files;
         let unified_seen = unified.saw_content();
+        let tracev3_files = unified.tracev3_files;
+        let tracev3_failures = unified.tracev3_failures;
+        let uuidtext_files = unified.uuidtext_files;
+        let uuidtext_failures = unified.uuidtext_failures;
+        let unified_cap_hit = unified.cap_hit;
         if let Some(summary) = unified.finalize(&self.db, &mut findings) {
             artifacts.push(summary);
         }
 
+        let findings_capped = findings.capped;
+        let mut findings = findings.into_vec();
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
         let found: std::collections::HashSet<ArtifactKind> =
@@ -188,6 +204,63 @@ impl Engine {
                 "{unified_truncated} unified log file(s) exceeded size limits and were skipped; the process history is incomplete."
             ));
         }
+        // Parser health. A surface that failed to parse - fully or in part -
+        // was not fully analyzed, and the verdict must not read as clear.
+        // Findings already produced from what did parse are unaffected.
+        let unparsed_ps = artifacts
+            .iter()
+            .filter(|a| a.kind == "ps_listing" && a.status == "unparsed")
+            .count();
+        if unparsed_ps > 0 {
+            scan_limits.push(format!(
+                "{unparsed_ps} process listing file(s) could not be parsed; the processes they list were not checked."
+            ));
+        }
+        let partial_crashes = artifacts
+            .iter()
+            .filter(|a| a.kind == "crash_log" && a.status == "parsed_partial")
+            .count();
+        if partial_crashes > 0 {
+            scan_limits.push(format!(
+                "{partial_crashes} crash log file(s) could not be parsed; only their file names were checked against indicators."
+            ));
+        }
+        if tracev3_failures > 0 {
+            scan_limits.push(format!(
+                "{tracev3_failures} of {tracev3_files} unified log (tracev3) file(s) could not be parsed; the process history is incomplete."
+            ));
+        }
+        if uuidtext_failures > 0 {
+            scan_limits.push(format!(
+                "{uuidtext_failures} of {uuidtext_files} unified log support (uuidtext) file(s) could not be parsed; some processes could not be resolved to binary paths."
+            ));
+        }
+        if unified_cap_hit {
+            scan_limits.push(
+                "The unified log process inventory reached its tracking cap; processes beyond it were not recorded.".into(),
+            );
+        }
+        // A checksum failure after valid entries means the archive is
+        // corrupt from that point on and nothing after it was seen. On the
+        // very first header it just means "not a tar", which the invalid
+        // verdict below covers without a scan limit.
+        if collector.bad_checksum
+            && (collector.entries > 0 || !collector.files.is_empty() || unified_seen)
+        {
+            scan_limits.push(
+                "An archive entry failed its integrity checksum; scanning stopped there and the rest of the archive was not analyzed.".into(),
+            );
+        }
+        if collector.stream_cap_hit {
+            scan_limits.push(
+                "The archive expanded past the scanner's decompression budget; scanning stopped early and the rest was not analyzed.".into(),
+            );
+        }
+        if findings_capped {
+            scan_limits.push(format!(
+                "The scan produced more than {MAX_FINDINGS} findings; the excess was not recorded."
+            ));
+        }
         // A raw tar that stops before its end-of-archive marker may have been
         // truncated in transit; whatever followed the cut-off was never seen,
         // so the scan must not read as complete. Only flagged when the stream
@@ -201,11 +274,47 @@ impl Engine {
             );
         }
 
+        // The verdict is decided here, in one place, from everything above.
+        // Consumers render it; they never re-derive safety semantics.
+        let has = |sev: Severity| findings.iter().any(|f| f.severity == sev);
+        let verdict = if has(Severity::Match) {
+            Verdict::Match
+        } else if has(Severity::Suspicious) {
+            Verdict::Suspicious
+        } else if !scan_limits.is_empty() {
+            Verdict::Inconclusive
+        } else if collector.files.is_empty() && !unified_seen {
+            Verdict::Invalid
+        } else {
+            Verdict::Clear
+        };
+
+        // Coverage is per scan: only surfaces actually present are listed as
+        // examined, so the report cannot claim a missing surface was read.
+        let mut examined: Vec<&'static str> = Vec::new();
+        if found.contains(&ArtifactKind::ShutdownLog) {
+            examined.push("shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots");
+        }
+        if found.contains(&ArtifactKind::CrashLog) {
+            examined
+                .push("Crash logs (crashes_and_spins/*.ips) - crashing process names and paths");
+        }
+        if found.contains(&ArtifactKind::PsListing) {
+            examined.push(
+                "Process listings (ps.txt, ps_thread.txt) - processes running at capture time",
+            );
+        }
+        if unified_seen {
+            examined.push("Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)");
+        }
+
         Ok(Report {
+            schema_version: 2,
             tool: ToolInfo {
                 name: "Trace",
                 version: env!("CARGO_PKG_VERSION"),
             },
+            verdict,
             device,
             indicator_sets: self.db.sets.clone(),
             artifacts,
@@ -220,20 +329,16 @@ impl Engine {
             },
             scan_limits,
             coverage: Coverage {
-                examined: vec![
-                    "shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots",
-                    "Crash logs (crashes_and_spins/*.ips) - crashing process names and paths",
-                    "Process listings (ps.txt, ps_thread.txt) - processes running at capture time",
-                    "Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)",
-                ],
+                examined,
                 not_examined: vec![
+                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file name and path indicators match only when a process was observed running from that file",
                     "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
                     "SMS/iMessage link payloads - device backups only",
                     "Per-process network usage (DataUsage) - device backups only",
                     "Installed apps and configuration profiles - device backups only",
                 ],
-                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
+                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts, and file indicators are checked only against observed process paths. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
             },
         })
     }
@@ -291,6 +396,7 @@ mod tests {
             engine.push(chunk).unwrap();
         }
         let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Match);
         assert_eq!(report.stats.artifacts_found, 3);
         assert_eq!(
             report.device.unwrap().os_version,
@@ -351,6 +457,7 @@ mod tests {
         let report = engine.finish().unwrap();
         assert!(!report.scan_limits.is_empty());
         assert!(report.scan_limits[0].contains("skipped"));
+        assert_eq!(report.verdict, Verdict::Inconclusive);
     }
 
     #[test]
@@ -362,6 +469,162 @@ mod tests {
         let report = engine.finish().unwrap();
         assert_eq!(report.stats.artifacts_found, 3);
         assert!(report.findings.is_empty());
+        assert_eq!(report.verdict, Verdict::Clear);
+        // coverage lists exactly the surfaces that were present
+        assert_eq!(report.coverage.examined.len(), 3);
+        assert!(!report
+            .coverage
+            .examined
+            .iter()
+            .any(|e| e.contains("Unified system logs")));
+    }
+
+    #[test]
+    fn unparsed_ps_listing_is_never_clear() {
+        // An empty ps.txt parses to "unparsed"; that surface was not
+        // checked, so nothing about this scan may read as "no traces found".
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry("sysdiagnose_t/ps.txt", b""));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "unparsed");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|l| l.contains("process listing")));
+    }
+
+    #[test]
+    fn unparseable_crash_log_is_never_clear() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/benign-2026-07-01-120000.ips",
+            b"not json at all",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("crash log")));
+    }
+
+    #[test]
+    fn corrupt_tracev3_is_never_clear() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER   PID COMMAND\nroot     1 /sbin/launchd\n",
+        ));
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            &[0xAB; 700],
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("tracev3")));
+    }
+
+    #[test]
+    fn unified_only_archive_is_not_invalid() {
+        // No retained artifacts, but unified-log content was seen: this is
+        // an archive with data in it, not "not a sysdiagnose".
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            &[0xAB; 700],
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_ne!(report.verdict, Verdict::Invalid);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn match_verdict_survives_scan_limits() {
+        // An indicator match stands even when the scan was degraded: the
+        // verdict must escalate, not wash out to inconclusive.
+        let gz = gzip(&build_archive(true));
+        let mut engine = Engine::new();
+        engine.limits = crate::tar_stream::Limits {
+            max_retained_files: 2, // drops the crash log, keeps the match
+            ..Default::default()
+        };
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&gz).unwrap();
+        let report = engine.finish().unwrap();
+        assert!(!report.scan_limits.is_empty());
+        assert_eq!(report.verdict, Verdict::Match);
+    }
+
+    #[test]
+    fn corrupt_header_mid_archive_is_inconclusive() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER   PID COMMAND\nroot     1 /sbin/launchd\n",
+        ));
+        let mut corrupt = test_util::entry("sysdiagnose_t/other.txt", b"x");
+        corrupt[0] ^= 0xFF; // invalidates the header checksum
+        a.extend_from_slice(&corrupt);
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("checksum")));
+    }
+
+    #[test]
+    fn newest_crash_log_provides_device_os() {
+        let old = br#"{"name":"a","timestamp":"2026-01-01 10:00:00.00 -0700","bug_type":"309","os_version":"iPhone OS 17.0 (21A1)"}
+{"procName":"a"}"#;
+        let new = br#"{"name":"b","timestamp":"2026-06-30 10:00:00.00 -0700","bug_type":"309","os_version":"iPhone OS 18.5 (22F76)"}
+{"procName":"b"}"#;
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/a-2026-01-01-100000.ips",
+            old,
+        ));
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/b-2026-06-30-100000.ips",
+            new,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        let device = report.device.unwrap();
+        assert_eq!(device.os_version, "iPhone OS 18.5 (22F76)");
+        assert!(device.source.contains("b-2026-06-30"));
+    }
+
+    #[test]
+    fn findings_cap_is_enforced_and_surfaces() {
+        // A crafted ps.txt whose every line raises a heuristic must not
+        // allocate unbounded findings, and the cap must force the verdict
+        // away from clear (a real match could hide beyond the cap).
+        let mut ps = String::from("USER PID COMMAND\n");
+        for i in 0..(MAX_FINDINGS + 10) {
+            ps.push_str(&format!("root {:>3} /private/var/tmp/x{i}\n", i % 999));
+        }
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry("sysdiagnose_t/ps.txt", ps.as_bytes()));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.findings.len(), MAX_FINDINGS);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|l| l.contains("findings")));
     }
 
     #[test]
@@ -399,6 +662,7 @@ mod tests {
                 .any(|l| l.contains("end-of-archive")),
             "a truncated raw tar must surface as an incomplete scan"
         );
+        assert_eq!(report.verdict, Verdict::Inconclusive);
     }
 
     #[test]
@@ -411,6 +675,7 @@ mod tests {
         let report = engine.finish().unwrap();
         assert_eq!(report.stats.artifacts_found, 0);
         assert!(report.scan_limits.is_empty());
+        assert_eq!(report.verdict, Verdict::Invalid);
     }
 
     #[test]

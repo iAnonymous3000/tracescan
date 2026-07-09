@@ -142,9 +142,11 @@ impl IocDb {
             // FOLLOWEDBY) only matches when every clause holds. Extracting a
             // single clause from one would let a partial condition claim a
             // full indicator match, so such patterns are skipped rather than
-            // half-checked. The bundled Amnesty sets contain none; OR-joined
-            // clauses are safe to split and are handled below.
-            if pattern.contains(" AND ") || pattern.contains("FOLLOWEDBY") {
+            // half-checked. The check is token-based so a multi-line or
+            // tab-separated pattern cannot smuggle an AND past it. The
+            // bundled Amnesty sets contain none; OR-joined clauses are safe
+            // to split and are handled below.
+            if pattern.split_whitespace().any(|t| t == "AND") || pattern.contains("FOLLOWEDBY") {
                 continue;
             }
             for cap in clause_re().captures_iter(pattern) {
@@ -255,6 +257,25 @@ mod tests {
         // matching one clause of an AND must never claim the full indicator
         assert!(db.match_process("safe").is_empty());
         assert_eq!(db.match_process("alone").len(), 1);
+    }
+
+    #[test]
+    fn multiline_and_patterns_are_also_skipped() {
+        // AND separated by newlines or tabs instead of spaces must be caught
+        // by the token-based check, not slip through a literal " AND " match.
+        let mut db = IocDb::new();
+        let stats = db
+            .load_stix(
+                "t",
+                "{\"objects\":[
+                    {\"type\":\"indicator\",\"pattern\":\"[process:name='safe'\\nAND\\nfile:hashes.'SHA-256'='abc']\"},
+                    {\"type\":\"indicator\",\"pattern\":\"[process:name='tabbed'\\tAND\\tfile:name='x']\"}
+                ]}",
+            )
+            .unwrap();
+        assert_eq!(stats.extracted, 0, "no clause of an AND pattern extracts");
+        assert!(db.match_process("safe").is_empty());
+        assert!(db.match_process("tabbed").is_empty());
     }
 
     #[test]

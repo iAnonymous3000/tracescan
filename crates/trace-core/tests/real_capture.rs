@@ -4,9 +4,14 @@
 //!
 //!   TRACE_REAL_SYSDIAGNOSE=path/to/sysdiagnose_….tar.gz \
 //!     cargo test --release --test real_capture -- --ignored --nocapture
+//!
+//! It loads the eight bundled indicator sets, so a passing run reproduces
+//! the VALIDATION.md claim end to end: a clean capture must parse fully and
+//! produce zero indicator matches and zero suspicious findings.
 
 use std::io::Read;
 use trace_core::engine::Engine;
+use trace_core::report::{Severity, Verdict};
 
 #[test]
 #[ignore = "needs TRACE_REAL_SYSDIAGNOSE pointing at a real capture"]
@@ -14,6 +19,25 @@ fn real_capture_end_to_end() {
     let path = std::env::var("TRACE_REAL_SYSDIAGNOSE")
         .expect("set TRACE_REAL_SYSDIAGNOSE to a sysdiagnose .tar.gz");
     let mut engine = Engine::new();
+
+    let iocs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/iocs");
+    let mut sets = 0usize;
+    for entry in std::fs::read_dir(iocs_dir).expect("read web/iocs") {
+        let p = entry.expect("dir entry").path();
+        if p.extension().and_then(|e| e.to_str()) != Some("stix2") {
+            continue;
+        }
+        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+        let json = std::fs::read_to_string(&p).expect("read STIX file");
+        let stats = engine.load_stix(&name, &json).expect("load STIX set");
+        sets += 1;
+        println!(
+            "loaded {}: {} indicators, {} applicable",
+            stats.name, stats.extracted, stats.applicable
+        );
+    }
+    assert_eq!(sets, 8, "all bundled indicator sets must load");
+
     let mut file = std::fs::File::open(&path).expect("open capture");
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -60,4 +84,19 @@ fn real_capture_end_to_end() {
         "most binaries should resolve to paths"
     );
     assert_eq!(failures, 0, "real tracev3 files should all parse");
+
+    // The false-positive bar: a clean capture against the full bundled
+    // indicator load must produce no matches and no suspicious findings.
+    for f in report
+        .findings
+        .iter()
+        .filter(|f| f.severity != Severity::Note)
+    {
+        println!("unexpected finding [{:?}]: {}", f.severity, f.summary);
+    }
+    assert!(
+        report.findings.iter().all(|f| f.severity == Severity::Note),
+        "clean capture must yield no match/suspicious findings"
+    );
+    assert_eq!(report.verdict, Verdict::Clear);
 }

@@ -99,6 +99,73 @@ test('dropping a file anywhere on the page scans it instead of navigating away',
   await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
 });
 
+test('an archive whose ps.txt cannot be parsed is inconclusive, never clear', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+  // a ps.txt with no header row parses to "unparsed": that surface was not
+  // checked, so the scan must not render "no known spyware traces found"
+  await page.evaluate(() => {
+    function header(name, size) {
+      const h = new Uint8Array(512);
+      const enc = new TextEncoder();
+      h.set(enc.encode(name), 0);
+      h.set(enc.encode('0000644\0'), 100);
+      h.set(enc.encode('0000000\0'), 108);
+      h.set(enc.encode('0000000\0'), 116);
+      h.set(enc.encode(size.toString(8).padStart(11, '0') + '\0'), 124);
+      h.set(enc.encode('00000000000\0'), 136);
+      h.set(enc.encode('        '), 148);
+      h[156] = 48; // '0'
+      h.set(enc.encode('ustar\0'), 257);
+      h.set(enc.encode('00'), 263);
+      let sum = 0;
+      for (const b of h) sum += b;
+      h.set(enc.encode(sum.toString(8).padStart(6, '0') + '\0 '), 148);
+      return h;
+    }
+    const data = new TextEncoder().encode('no header row in this file');
+    const padded = new Uint8Array(512);
+    padded.set(data);
+    window.__trace.handleFile(new File(
+      [header('root/ps.txt', data.length), padded, new Uint8Array(1024)],
+      'sysdiagnose_badps.tar'
+    ));
+  });
+  await expect(page.locator('.verdict.inconclusive')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('.verdict.inconclusive')).toContainText('no verdict can be given');
+  await expect(page.locator('.verdict.inconclusive')).toContainText('process listing');
+});
+
+test('an empty live indicator bundle is rejected for the bundled snapshot', async ({ page }) => {
+  // "{"objects":[]}" is valid JSON and a valid-shaped bundle, but loading it
+  // would scan with zero indicators; the reviewed floor must win
+  await page.route('https://raw.githubusercontent.com/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: '{"objects":[]}' })
+  );
+  await page.goto('/');
+  await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('#ioc-list .badge.live')).toHaveCount(0);
+  await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
+  // and scanning with the snapshots still detects the seeded indicator
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+});
+
+test('a second file arriving mid-scan is ignored, not interleaved', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+  await page.evaluate(async () => {
+    const clean = await (await fetch('./fixtures/sysdiagnose_demo_clean.tar.gz')).blob();
+    const infected = await (await fetch('./fixtures/sysdiagnose_demo_infected.tar.gz')).blob();
+    window.__trace.handleFile(new File([clean], 'sysdiagnose_demo_clean.tar.gz'));
+    // racing second scan: must be refused while the first is in flight
+    window.__trace.handleFile(new File([infected], 'sysdiagnose_demo_infected.tar.gz'));
+  });
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  const name = await page.evaluate(() => window.__trace.lastReport.source_file.name);
+  expect(name).toBe('sysdiagnose_demo_clean.tar.gz');
+});
+
 test('scanning still works fully offline once the app is cached', async ({ page, context, browserName }) => {
   test.skip(
     browserName === 'webkit',

@@ -173,6 +173,9 @@ main { padding: 28px 0 8px; }
 .finding pre { background: var(--note-bg); border-radius: 6px; padding: 10px; overflow-x: auto; font-size: 0.8rem; font-family: var(--mono); }
 .ind-chip { font-size: 0.85rem; background: var(--note-bg); border-radius: 6px; padding: 3px 8px; display: inline-block; margin: 4px 6px 0 0; }
 
+/* The four-column artifact table is wider than a phone screen; it scrolls
+   inside its own container so the page body never scrolls horizontally. */
+.table-scroll { overflow-x: auto; }
 table.artifacts { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
 table.artifacts th, table.artifacts td { text-align: left; padding: 7px 8px; border-top: 1px solid var(--line); vertical-align: top; }
 table.artifacts th { border-top: none; color: var(--muted); font-weight: 600; font-size: 0.83rem; }

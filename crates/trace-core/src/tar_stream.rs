@@ -38,7 +38,8 @@ pub fn classify(path: &str) -> Option<ArtifactKind> {
     if is_shutdown_log(base) {
         return Some(ArtifactKind::ShutdownLog);
     }
-    if p.contains("crashes_and_spins/") && base.ends_with(".ips") {
+    // Component-wise match: "notcrashes_and_spins/x.ips" must not qualify.
+    if base.ends_with(".ips") && p.split('/').any(|seg| seg == "crashes_and_spins") {
         return Some(ArtifactKind::CrashLog);
     }
     if base == "ps.txt" || base == "ps_thread.txt" {
@@ -103,8 +104,14 @@ pub struct Limits {
     pub total_retain_cap: usize,
     /// Number of files retained for analysis.
     pub max_retained_files: usize,
-    /// Archive entries walked before parsing stops.
+    /// Archive header blocks walked before parsing stops. Counts every
+    /// entry type - directories, links, and PAX/GNU metadata included - so
+    /// a metadata flood cannot bypass it.
     pub max_entries: u64,
+    /// Total (decompressed) bytes accepted before parsing stops: the
+    /// decompression-ratio ceiling against gzip bombs. A real sysdiagnose
+    /// expands to a few gigabytes.
+    pub max_stream_bytes: u64,
 }
 
 impl Default for Limits {
@@ -114,6 +121,7 @@ impl Default for Limits {
             total_retain_cap: 192 * 1024 * 1024,
             max_retained_files: 4096,
             max_entries: 1_000_000,
+            max_stream_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -160,12 +168,25 @@ pub struct TarCollector {
     /// Streaming consumer for unified-log files (never retained; each file
     /// is reduced to process facts on completion and dropped).
     pub(crate) unified: crate::unified_log::Aggregator,
+    /// Regular-file entries seen (user-facing "files in archive" stat).
     pub entries: u64,
+    /// Every header block walked, metadata and directories included; this
+    /// is what the entry cap applies to.
+    headers: u64,
+    /// Total bytes accepted, for the stream-size budget.
+    stream_bytes: u64,
     /// Artifact files the scanner wanted but dropped because a global cap
     /// was already reached. Any nonzero value means the scan is incomplete.
     pub dropped_artifacts: u64,
     /// Parsing stopped early because the archive had too many entries.
     pub entry_cap_hit: bool,
+    /// Parsing stopped early because the stream exceeded the total byte
+    /// budget (decompression bomb).
+    pub stream_cap_hit: bool,
+    /// Parsing stopped at a header whose checksum did not verify. On the
+    /// first header this means "not a tar"; after valid entries it means
+    /// the archive is corrupt and the remainder was never seen.
+    pub bad_checksum: bool,
     zero_blocks: u8,
 }
 
@@ -199,17 +220,33 @@ fn pax_path(data: &[u8]) -> Option<String> {
             .trim()
             .parse()
             .ok()?;
-        if len == 0 || i + len > data.len() {
-            return None;
-        }
-        let rec = std::str::from_utf8(&data[sp + 1..i + len]).ok()?;
+        // Checked arithmetic: a crafted length near usize::MAX would wrap
+        // on 32-bit wasm, slip past the bounds check, and trap on the slice.
+        let end = i.checked_add(len).filter(|&e| e <= data.len() && e > sp)?;
+        let rec = std::str::from_utf8(&data[sp + 1..end]).ok()?;
         let rec = rec.strip_suffix('\n').unwrap_or(rec);
         if let Some(v) = rec.strip_prefix("path=") {
             return Some(v.to_string());
         }
-        i += len;
+        i = end;
     }
     None
+}
+
+/// Tar header checksum: sum of all header bytes with the checksum field
+/// itself read as spaces. Historic tar implementations wrote a signed-byte
+/// sum, so both are accepted; anything else is a corrupt or fabricated
+/// header, and parsing must not continue past it on guessed offsets.
+fn checksum_ok(block: &[u8]) -> bool {
+    let stored = parse_num(&block[148..156]);
+    let mut unsigned: u64 = 0;
+    let mut signed: i64 = 0;
+    for (i, &b) in block.iter().enumerate() {
+        let v = if (148..156).contains(&i) { b' ' } else { b };
+        unsigned += v as u64;
+        signed += (v as i8) as i64;
+    }
+    stored == unsigned || (signed >= 0 && stored == signed as u64)
 }
 
 impl TarCollector {
@@ -223,16 +260,21 @@ impl TarCollector {
             files: Vec::new(),
             unified: Default::default(),
             entries: 0,
+            headers: 0,
+            stream_bytes: 0,
             dropped_artifacts: 0,
             entry_cap_hit: false,
+            stream_cap_hit: false,
+            bad_checksum: false,
             zero_blocks: 0,
         }
     }
 
-    /// True once the archive reached its end-of-archive marker (two zero
-    /// blocks). A stream that stops mid-entry or without the marker may have
-    /// been truncated in transit, and a scan of it must not be presented as
-    /// complete - files after the cut-off were never seen.
+    /// True once parsing reached a terminal state: the end-of-archive marker,
+    /// or a deliberate early stop (entry cap, byte budget, bad checksum -
+    /// each of which raises its own flag and its own scan-limit message).
+    /// False means the stream just stopped mid-archive: it may have been
+    /// truncated in transit, and the scan must not be presented as complete.
     pub fn terminated_cleanly(&self) -> bool {
         matches!(self.state, State::Done)
     }
@@ -262,6 +304,19 @@ impl TarCollector {
                         continue;
                     }
                     self.zero_blocks = 0;
+                    if !checksum_ok(block) {
+                        // Offsets derived from a corrupt header are garbage;
+                        // continuing would misparse everything after it.
+                        self.bad_checksum = true;
+                        self.state = State::Done;
+                        continue;
+                    }
+                    self.headers += 1;
+                    if self.headers > self.limits.max_entries {
+                        self.entry_cap_hit = true;
+                        self.state = State::Done;
+                        continue;
+                    }
                     let size = parse_num(&block[124..136]);
                     let typeflag = block[156];
                     let name = cstr(&block[0..100]);
@@ -287,11 +342,6 @@ impl TarCollector {
                     match typeflag {
                         b'0' | 0 | b'7' => {
                             self.entries += 1;
-                            if self.entries > self.limits.max_entries {
-                                self.entry_cap_hit = true;
-                                self.state = State::Done;
-                                continue;
-                            }
                             let at_cap = self.files.len() >= self.limits.max_retained_files
                                 || self.retained_bytes >= self.limits.total_retain_cap;
                             let keep = match classify(&path) {
@@ -475,6 +525,18 @@ impl TarCollector {
 
 impl Write for TarCollector {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Once parsing is done (end marker or an early stop), the rest of
+        // the stream is accepted and dropped without buffering.
+        if matches!(self.state, State::Done) {
+            return Ok(buf.len());
+        }
+        self.stream_bytes += buf.len() as u64;
+        if self.stream_bytes > self.limits.max_stream_bytes {
+            self.stream_cap_hit = true;
+            self.state = State::Done;
+            self.pending = Vec::new();
+            return Ok(buf.len());
+        }
         self.pending.extend_from_slice(buf);
         self.process();
         Ok(buf.len())
@@ -647,6 +709,70 @@ mod tests {
     }
 
     #[test]
+    fn metadata_flood_hits_entry_cap() {
+        // Directories, links, and PAX/GNU metadata count against the entry
+        // cap too; a flood of them must not walk unbounded.
+        let mut archive = Vec::new();
+        for i in 0..5 {
+            archive.extend_from_slice(&test_util::header(&format!("root/d{i}/"), 0, b'5'));
+        }
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            max_entries: 3,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert!(col.entry_cap_hit);
+    }
+
+    #[test]
+    fn bad_checksum_stops_parsing() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        let mut corrupt = test_util::entry("root/ps_thread.txt", b"PS2");
+        corrupt[0] ^= 0xFF;
+        archive.extend_from_slice(&corrupt);
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+        assert!(col.bad_checksum);
+        assert_eq!(col.files.len(), 1, "entries before the corruption stay");
+    }
+
+    #[test]
+    fn stream_byte_budget_stops_parsing() {
+        let mut archive = Vec::new();
+        for i in 0..8 {
+            archive.extend_from_slice(&test_util::entry(&format!("root/f{i}.bin"), &[0u8; 512]));
+        }
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            max_stream_bytes: 2048,
+            ..Limits::default()
+        });
+        for chunk in archive.chunks(700) {
+            col.write_all(chunk).unwrap();
+        }
+        assert!(col.stream_cap_hit);
+    }
+
+    #[test]
+    fn pax_length_overflow_is_rejected_not_panicking() {
+        // A record length near usize::MAX would wrap on 32-bit wasm and trap
+        // on the slice; checked arithmetic must reject it instead.
+        let huge = format!("{} path=/x\n", u64::MAX);
+        assert_eq!(pax_path(huge.as_bytes()), None);
+        let also_huge = b"99999999999999999999 path=/x\n"; // > u64::MAX: parse fails
+        assert_eq!(pax_path(also_huge), None);
+        // a well-formed record still parses (length is self-inclusive)
+        assert_eq!(
+            pax_path(b"15 path=/a/b/c\n").as_deref(),
+            Some("/a/b/c"),
+            "sanity: valid record"
+        );
+    }
+
+    #[test]
     fn classify_consume_patterns() {
         let lp = "root/system_logs.logarchive";
         assert!(matches!(
@@ -713,6 +839,8 @@ mod tests {
         );
         assert_eq!(classify("root/ps.txt"), Some(ArtifactKind::PsListing));
         assert_eq!(classify("root/otherdir/x.ips"), None);
+        // component boundary: a lookalike directory must not qualify
+        assert_eq!(classify("root/notcrashes_and_spins/x.ips"), None);
         assert_eq!(classify("root/sysdiagnose.log"), None);
         // AppleDouble companions must be ignored even when the suffix matches
         assert_eq!(classify("root/crashes_and_spins/._bh-2026.ips"), None);

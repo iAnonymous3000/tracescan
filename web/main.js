@@ -8,6 +8,7 @@ const state = {
   ready: null,       // resolves once WASM + indicators are loaded
   lastReport: null,
   lastScanVia: null, // 'worker' | 'inline'
+  scanning: false,   // a scan is in flight; new files are ignored until done
 };
 
 /* ---------- utilities ---------- */
@@ -25,11 +26,21 @@ function fmtBytes(n) {
   return n + ' B';
 }
 
-async function fetchWithTimeout(url, ms) {
+// The timeout covers the body read too: a server that sends headers and
+// then stalls the body must not hang startup indefinitely.
+async function fetchTextWithTimeout(url, ms) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    return await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+    const r = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+    if (!r.ok) return null;
+    return {
+      text: await r.text(),
+      etag: r.headers.get('etag'),
+      last_modified: r.headers.get('last-modified'),
+    };
+  } catch {
+    return null; // offline, blocked, or timed out
   } finally {
     clearTimeout(t);
   }
@@ -59,12 +70,23 @@ function backToLanding() {
 
 /* ---------- indicator loading ---------- */
 
-// The scanner rejects anything without an objects array, so a live file
-// that fails this must fall back to the bundled snapshot - accepting it
-// would take scanning down entirely (e.g. a valid-JSON rate-limit page).
-function isStixBundle(text) {
+// Live indicator data may only ever add to the reviewed bundled floor. A
+// live file that parses but would lower a set below its manifest floor
+// (an empty-but-valid bundle, a rate-limit page shaped like JSON, an
+// upstream regression) is rejected in favor of the bundled snapshot -
+// otherwise a scan could quietly run with zero indicators and still
+// render "no traces found".
+function meetsBundledFloor(set, text) {
   try {
-    return Array.isArray(JSON.parse(text).objects);
+    if (!Array.isArray(JSON.parse(text).objects)) return false;
+    const probe = new Scanner();
+    try {
+      const stats = JSON.parse(probe.load_stix(set.name, text));
+      return stats.extracted >= (set.min_indicators ?? 1)
+        && stats.applicable >= (set.min_applicable ?? 0);
+    } finally {
+      probe.free();
+    }
   } catch {
     return false;
   }
@@ -84,19 +106,14 @@ async function loadIndicators() {
     let date = manifest.bundled_date;
     let etag = null;
     let last_modified = null;
-    try {
-      const r = await fetchWithTimeout(set.url, 6000);
-      if (r.ok) {
-        const live = await r.text();
-        if (isStixBundle(live)) {
-          text = live;
-          loaded_from = 'live';
-          date = new Date().toISOString().slice(0, 10);
-          etag = r.headers.get('etag');
-          last_modified = r.headers.get('last-modified');
-        }
-      }
-    } catch { /* offline or blocked - bundled snapshot below */ }
+    const live = await fetchTextWithTimeout(set.url, 6000);
+    if (live && meetsBundledFloor(set, live.text)) {
+      text = live.text;
+      loaded_from = 'live';
+      date = new Date().toISOString().slice(0, 10);
+      etag = live.etag;
+      last_modified = live.last_modified;
+    }
     if (!text) {
       text = await (await fetch(set.file, { cache: 'no-cache' })).text();
     }
@@ -124,7 +141,7 @@ function renderIocPanel() {
   const total = state.stix.reduce((a, s) => a + s.stats.extracted, 0);
   const applicable = state.stix.reduce((a, s) => a + s.stats.applicable, 0);
   $('#ioc-note').textContent =
-    `${applicable} of ${total} loaded indicators are process or file names that can appear in sysdiagnose artifacts. ` +
+    `${applicable} of ${total} loaded indicators are process and file names or paths that can be checked against the process activity in sysdiagnose artifacts (file indicators match only when a process ran from that file - there is no filesystem listing to check). ` +
     `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.`;
   $('#ioc-panel').hidden = false;
 }
@@ -146,11 +163,19 @@ function updateProgress(processed, total) {
   $('#progress-text').textContent = `${fmtBytes(processed)} of ${fmtBytes(total)} read`;
 }
 
+// Monotonic scan id: every worker message carries the id of the scan it
+// belongs to, and listeners drop anything else. Without this, two scans
+// racing (or a stale message from an aborted one) could attach findings
+// to the wrong file - an evidence-provenance failure.
+let scanSeq = 0;
+
 function scanWithWorker(file) {
   return new Promise((resolve, reject) => {
     const w = worker;
+    const id = ++scanSeq;
     const onMsg = (e) => {
       const m = e.data;
+      if (m.id !== id) return; // not this scan's message
       if (m.type === 'progress') {
         updateProgress(m.processed, file.size);
       } else if (m.type === 'report') {
@@ -174,6 +199,7 @@ function scanWithWorker(file) {
     w.addEventListener('error', onErr);
     w.postMessage({
       type: 'scan',
+      id,
       file,
       sets: state.stix.map((s) => ({ name: s.name, text: s.text })),
     });
@@ -202,6 +228,10 @@ async function scanInline(file) {
 }
 
 async function handleFile(file) {
+  // One scan at a time: a second file racing the first (double-clicked
+  // demo button, scripted calls) must not interleave results.
+  if (state.scanning) return;
+  state.scanning = true;
   showSection('scanning');
   updateProgress(0, file.size);
   try {
@@ -237,20 +267,19 @@ async function handleFile(file) {
     renderReport(report);
   } catch (err) {
     renderError(err);
+  } finally {
+    state.scanning = false;
   }
 }
 
 /* ---------- rendering results ---------- */
 
+// The Rust engine owns the verdict: every safety consideration (parser
+// health, scan limits, artifact presence) already funnels into it there.
+// Rendering must never re-derive safety semantics from other report fields.
+// A report without one is from an unknown source; inconclusive, never clear.
 function verdictOf(report) {
-  const limited = (report.scan_limits || []).length > 0;
-  if (report.stats.artifacts_found === 0 && !limited) return 'invalid';
-  if (report.findings.some((f) => f.severity === 'match')) return 'match';
-  if (report.findings.some((f) => f.severity === 'suspicious')) return 'suspicious';
-  // A partially analyzed archive with nothing found must never read as
-  // "no traces found" - only a full pass earns the clear verdict.
-  if (limited) return 'inconclusive';
-  return 'clear';
+  return report.verdict || 'inconclusive';
 }
 
 const HELP_BLOCK = `
@@ -304,7 +333,7 @@ function verdictHtml(report) {
   if (v === 'invalid') {
     return `<div class="verdict invalid">
       <h2>This doesn't look like a sysdiagnose archive</h2>
-      <p>None of the expected artifacts (shutdown.log, crash logs, ps.txt) were found inside. Make sure you're scanning a file named like <code>sysdiagnose_….tar.gz</code>, captured following the guide on the start page.</p>
+      <p>None of the expected artifacts (shutdown.log, crash logs, ps.txt, unified system logs) were found inside. Make sure you're scanning a file named like <code>sysdiagnose_….tar.gz</code>, captured following the guide on the start page.</p>
     </div>`;
   }
   const missing = report.missing_artifacts || [];
@@ -319,9 +348,14 @@ function verdictHtml(report) {
   </div>`;
 }
 
+// DOM cards for findings are capped: a hostile archive can produce
+// thousands, and rendering them all would hang the tab. The exported JSON
+// always carries the full list.
+const MAX_RENDERED_FINDINGS = 200;
+
 function findingsHtml(report) {
   if (!report.findings.length) return '';
-  const cards = report.findings.map((f) => {
+  const cards = report.findings.slice(0, MAX_RENDERED_FINDINGS).map((f) => {
     const ind = f.indicator
       ? `<div><span class="ind-chip">indicator: <code>${esc(f.indicator.value)}</code></span>
          <span class="ind-chip">campaign: ${esc(f.indicator.campaign)}</span>
@@ -335,7 +369,11 @@ function findingsHtml(report) {
       <details><summary>Technical evidence</summary><pre>${esc(JSON.stringify(f.evidence, null, 2))}</pre></details>
     </div>`;
   }).join('');
-  return `<h2>Findings (${report.findings.length})</h2>${cards}`;
+  const omitted = report.findings.length - Math.min(report.findings.length, MAX_RENDERED_FINDINGS);
+  const more = omitted > 0
+    ? `<p class="fine">Showing the first ${MAX_RENDERED_FINDINGS} findings (sorted most severe first); ${omitted} more are in the exported report.</p>`
+    : '';
+  return `<h2>Findings (${report.findings.length})</h2>${cards}${more}`;
 }
 
 function artifactsHtml(report) {
@@ -357,8 +395,8 @@ function artifactsHtml(report) {
       <td>${esc(m.note)}</td>
     </tr>`).join('');
   return `<div class="panel"><h2>What was examined (${report.artifacts.length} artifacts, ${report.stats.archive_entries} files in archive)</h2>
-    <table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
-    <tbody>${rows}${missingRows}</tbody></table></div>`;
+    <div class="table-scroll"><table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
+    <tbody>${rows}${missingRows}</tbody></table></div></div>`;
 }
 
 function limitsHtml(report) {
@@ -419,7 +457,7 @@ function renderReport(report) {
 }
 
 function renderError(err) {
-  $('#results').innerHTML = `<div class="error-box">
+  $('#results').innerHTML = `<div class="error-box" role="alert">
     <h2>Couldn't scan that file</h2>
     <p>${esc(err?.message || err)}</p>
     <p>Make sure you're choosing the original <code>sysdiagnose_….tar.gz</code> file, not an unpacked folder or a renamed copy. Nothing was uploaded; you can simply try again.</p>
@@ -427,6 +465,9 @@ function renderError(err) {
   <div class="actions"><button class="btn secondary" id="rescan-btn">Back</button></div>`;
   $('#rescan-btn').addEventListener('click', backToLanding);
   showSection('results');
+  // Same focus treatment as a successful scan, so screen readers announce
+  // the failure instead of leaving focus stranded on <body>.
+  $('#results').focus();
 }
 
 function exportReport() {

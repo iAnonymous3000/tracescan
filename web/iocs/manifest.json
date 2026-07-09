@@ -1,62 +1,78 @@
 {
   "bundled_date": "2026-07-08",
-  "comment": "Bundled snapshots are the offline floor; the app opportunistically fetches the same URLs live at load time. Selection criterion: iOS-relevant campaigns from reputable public sources (Amnesty, Citizen Lab, Kaspersky, Google TIG, Microsoft, iVerify), via the AmnestyTech and mvt-project repos. Excluded from the MVT indicator index by scope: Android-only sets (2023-03-29_android_campaign, wyrmspy_dragonegg, novispy, stalkerware, residentbat), Windows-focused Candiru, and cellebrite (single app:id, nothing checkable in any artifact this tool reads).",
+  "comment": "Bundled snapshots are the offline floor; the app opportunistically fetches the same URLs live at load time. Selection criterion: iOS-relevant campaigns from reputable public sources (Amnesty, Citizen Lab, Kaspersky, Google TIG, Microsoft, iVerify), via the AmnestyTech and mvt-project repos. Excluded from the MVT indicator index by scope: Android-only sets (2023-03-29_android_campaign, wyrmspy_dragonegg, novispy, stalkerware, residentbat), Windows-focused Candiru, and cellebrite (single app:id, nothing checkable in any artifact this tool reads). min_indicators/min_applicable are the reviewed floor for each set (regenerate with `cargo run --example ioc_stats`): a live-fetched file below either floor is rejected in favor of the bundled snapshot, so live data can add indicators but never silently reduce coverage.",
   "sets": [
     {
       "name": "pegasus",
       "campaign_hint": "Pegasus (NSO Group)",
       "file": "iocs/pegasus.stix2",
       "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2021-07-18_nso/pegasus.stix2",
-      "source": "Amnesty International Security Lab"
+      "source": "Amnesty International Security Lab",
+      "min_indicators": 1549,
+      "min_applicable": 82
     },
     {
       "name": "predator",
       "campaign_hint": "Predator (Cytrox/Intellexa)",
       "file": "iocs/predator.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/intellexa_predator/predator.stix2",
-      "source": "Meta, Amnesty, Citizen Lab, Cisco (MVT aggregate)"
+      "source": "Meta, Amnesty, Citizen Lab, Cisco (MVT aggregate)",
+      "min_indicators": 585,
+      "min_applicable": 15
     },
     {
       "name": "kingspawn",
       "campaign_hint": "KingSpawn (QuaDream)",
       "file": "iocs/kingspawn.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2023-04-11_quadream/kingspawn.stix2",
-      "source": "Citizen Lab, Microsoft (via MVT)"
+      "source": "Citizen Lab, Microsoft (via MVT)",
+      "min_indicators": 167,
+      "min_applicable": 3
     },
     {
       "name": "triangulation",
       "campaign_hint": "Operation Triangulation",
       "file": "iocs/triangulation.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2023-06_01_operation_triangulation/operation_triangulation.stix2",
-      "source": "Kaspersky Lab (via MVT)"
+      "source": "Kaspersky Lab (via MVT)",
+      "min_indicators": 112,
+      "min_applicable": 1
     },
     {
       "name": "rcs",
       "campaign_hint": "RCS Lab (Hermit)",
       "file": "iocs/rcs.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2022-06-23_rcs_lab/rcs.stix2",
-      "source": "Google, Lookout (via MVT)"
+      "source": "Google, Lookout (via MVT)",
+      "min_indicators": 40,
+      "min_applicable": 0
     },
     {
       "name": "wintego_helios",
       "campaign_hint": "Wintego Helios",
       "file": "iocs/wintego_helios.stix2",
       "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2024-05-02_wintego_helios/wintego_helios.stix2",
-      "source": "Amnesty International Security Lab"
+      "source": "Amnesty International Security Lab",
+      "min_indicators": 175,
+      "min_applicable": 0
     },
     {
       "name": "coruna",
       "campaign_hint": "Coruna",
       "file": "iocs/coruna.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2026-03-03_coruna_cryptowaters/coruna.stix2",
-      "source": "Google Threat Intelligence Group (via MVT)"
+      "source": "Google Threat Intelligence Group (via MVT)",
+      "min_indicators": 216,
+      "min_applicable": 19
     },
     {
       "name": "darksword",
       "campaign_hint": "DarkSword",
       "file": "iocs/darksword.stix2",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2026-03-30_darksword/darksword.stix2",
-      "source": "iVerify, Google Threat Intelligence Group (via MVT)"
+      "source": "iVerify, Google Threat Intelligence Group (via MVT)",
+      "min_indicators": 43,
+      "min_applicable": 29
     }
   ]
 }

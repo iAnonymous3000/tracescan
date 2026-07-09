@@ -53,3 +53,8 @@ jobs:
             Automated refresh of the bundled STIX2 snapshots from
             AmnestyTech/investigations. Review the indicator diff before
             merging; merging redeploys the site with the new bundled floor.
+            If CI fails on `bundled_iocs`, an upstream set shrank below its
+            reviewed floor in `web/iocs/manifest.json` - verify the removal
+            is legitimate, then regenerate the floors with
+            `cargo run --example ioc_stats` and update the manifest in this
+            PR.

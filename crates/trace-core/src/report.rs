@@ -33,6 +33,46 @@ pub struct Finding {
     pub indicator: Option<IndicatorRef>,
 }
 
+/// Hard cap on accumulated findings. Real scans produce well under a
+/// hundred; only a crafted archive (e.g. a ps.txt whose every line raises a
+/// heuristic) approaches this. Each finding is duplicated into report JSON
+/// and a DOM card, so unbounded growth is a memory exhaustion vector.
+pub const MAX_FINDINGS: usize = 5_000;
+
+/// Findings accumulator enforcing [`MAX_FINDINGS`]. Once the cap is hit,
+/// further findings are dropped and `capped` is set; the engine surfaces
+/// that as a scan limit, so the verdict can never read as clear.
+#[derive(Default)]
+pub struct Findings {
+    items: Vec<Finding>,
+    pub capped: bool,
+}
+
+impl Findings {
+    pub fn new() -> Self {
+        Findings::default()
+    }
+
+    pub fn push(&mut self, f: Finding) {
+        if self.items.len() < MAX_FINDINGS {
+            self.items.push(f);
+        } else {
+            self.capped = true;
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<Finding> {
+        self.items
+    }
+}
+
+impl std::ops::Deref for Findings {
+    type Target = [Finding];
+    fn deref(&self) -> &[Finding] {
+        &self.items
+    }
+}
+
 impl Finding {
     pub fn ioc_match(
         artifact: &str,
@@ -104,6 +144,11 @@ impl ArtifactSummary {
 pub struct DeviceInfo {
     pub os_version: String,
     pub source: String,
+    /// Timestamp of the crash log the OS version came from. A crash can
+    /// predate an OS upgrade, so the engine prefers the newest one; keeping
+    /// the timestamp in the report makes that provenance checkable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,14 +177,40 @@ pub struct MissingArtifact {
 
 #[derive(Serialize)]
 pub struct Coverage {
+    /// Surfaces actually present and analyzed in this archive - built per
+    /// scan, so a missing surface can never be listed as examined.
     pub examined: Vec<&'static str>,
     pub not_examined: Vec<&'static str>,
     pub note: &'static str,
 }
 
+/// The scan outcome, owned by the Rust engine. Rendering code must display
+/// this verdict, never re-derive its own from other report fields: every
+/// safety consideration (parser health, scan limits, artifact presence)
+/// funnels into this one value.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// At least one exact match against a published indicator.
+    Match,
+    /// No indicator match, but research-documented anomalies present.
+    Suspicious,
+    /// Every present surface parsed fully and nothing matched.
+    Clear,
+    /// Part of the archive was not (or could not be) analyzed; absence of
+    /// findings is not meaningful. Never rendered as "no traces found".
+    Inconclusive,
+    /// Nothing recognizable as a sysdiagnose was found in the input.
+    Invalid,
+}
+
 #[derive(Serialize)]
 pub struct Report {
+    /// Bumped when the report shape changes incompatibly. Consumers
+    /// (helplines, future comparison tooling) can key on it.
+    pub schema_version: u32,
     pub tool: ToolInfo,
+    pub verdict: Verdict,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
     pub indicator_sets: Vec<crate::ioc::SetStats>,
@@ -147,10 +218,9 @@ pub struct Report {
     pub missing_artifacts: Vec<MissingArtifact>,
     pub findings: Vec<Finding>,
     pub stats: ScanStats,
-    /// Non-empty when the scan hit a safety limit (oversized or too many
-    /// files, too many archive entries) and therefore did not analyze
-    /// everything. Consumers must not present such a scan as a clean result;
-    /// the UI renders it as inconclusive.
+    /// Non-empty when the scan hit a safety limit or a parser failed on
+    /// part of the input, so not everything was analyzed. Any entry here
+    /// forces the verdict away from `Clear`.
     pub scan_limits: Vec<String>,
     pub coverage: Coverage,
 }

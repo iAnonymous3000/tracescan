@@ -1,7 +1,9 @@
 # Design: unified log (tracev3) analysis
 
-Status: validated feasibility, not yet implemented. This documents the spike
-results and the chosen architecture so implementation can start cold.
+Status: implemented in v0.5.0 (`crates/trace-core/src/unified_log.rs`),
+following the architecture below. This documents the spike results and the
+design rationale; it is kept as the record of why catalog-level analysis
+was chosen over full log reconstruction.
 
 ## Spike results (2026-07-08)
 

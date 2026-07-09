@@ -17,7 +17,7 @@
 
 use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
-use crate::report::{ArtifactSummary, Finding};
+use crate::report::{ArtifactSummary, Finding, Findings};
 use regex_lite::Regex;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,12 +52,7 @@ fn delay_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"After\s+([0-9]+(?:\.[0-9]+)?)s").unwrap())
 }
 
-pub fn analyze(
-    path: &str,
-    content: &str,
-    db: &IocDb,
-    findings: &mut Vec<Finding>,
-) -> ArtifactSummary {
+pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -> ArtifactSummary {
     let mut blocks: Vec<BTreeSet<String>> = Vec::new();
     let mut current: BTreeSet<String> = BTreeSet::new();
     let mut client_pids: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
@@ -158,7 +153,7 @@ After 0.2s, remaining client pid: 2143 (/private/var/db/com.apple.xpc.roleaccoun
 
     #[test]
     fn splits_reboot_blocks_on_delay_reset() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = analyze("shutdown.log", SAMPLE, &IocDb::new(), &mut findings);
         assert_eq!(summary.details["reboot_blocks"], 2);
         assert_eq!(summary.details["unique_clients"], 2);
@@ -178,7 +173,7 @@ After 1.26s, these clients are still here:
 
     #[test]
     fn ios26_format_strips_uuid_and_matches() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         let summary = analyze("shutdown.0.log", SAMPLE_IOS26, &db_with_bh(), &mut findings);
         // the delay reset (1.77 -> 1.26) delimits the second reboot block
         assert_eq!(summary.details["reboot_blocks"], 2);
@@ -221,7 +216,7 @@ After 1.26s, these clients are still here:
 
     #[test]
     fn flags_ioc_match_and_staging_heuristic() {
-        let mut findings = Vec::new();
+        let mut findings = Findings::new();
         analyze("shutdown.log", SAMPLE, &db_with_bh(), &mut findings);
         let matches: Vec<_> = findings
             .iter()

@@ -10,6 +10,10 @@ const ready = init();
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type !== 'scan') return;
+  // Every message carries the id of the scan it belongs to; the page drops
+  // anything whose id doesn't match the scan it is waiting for, so results
+  // can never attach to the wrong file.
+  const { id } = msg;
   try {
     await ready;
     const scanner = new Scanner();
@@ -27,12 +31,12 @@ self.onmessage = async (e) => {
       const now = Date.now();
       if (now - lastPost > 100) {
         lastPost = now;
-        self.postMessage({ type: 'progress', processed });
+        self.postMessage({ type: 'progress', id, processed });
       }
     }
-    self.postMessage({ type: 'progress', processed });
-    self.postMessage({ type: 'report', report: JSON.parse(scanner.finish()) });
+    self.postMessage({ type: 'progress', id, processed });
+    self.postMessage({ type: 'report', id, report: JSON.parse(scanner.finish()) });
   } catch (err) {
-    self.postMessage({ type: 'error', message: err?.message || String(err) });
+    self.postMessage({ type: 'error', id, message: err?.message || String(err) });
   }
 };

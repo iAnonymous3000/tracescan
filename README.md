@@ -25,7 +25,7 @@ The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar →
 
 Both shutdown.log generations are handled and were verified against a real iOS 26.5.2 capture: the classic one-line format, and the iOS 26 format with rotated filenames, indented client lines, and a trailing binary-UUID path component (stripped before matching, or no name indicator could ever hit).
 
-Indicators are STIX2 bundles from the open threat-intel ecosystem: [Amnesty International's Security Lab](https://github.com/AmnestyTech/investigations) publications plus the [MVT project's aggregated indicator collection](https://github.com/mvt-project/mvt-indicators) (Citizen Lab, Kaspersky, Google Threat Intelligence, Microsoft, iVerify, and others). Eight iOS-relevant campaigns are bundled: Pegasus, Predator, KingSpawn (QuaDream), Operation Triangulation, RCS Lab, Wintego Helios, Coruna, and DarkSword. Bundled snapshots are the offline floor; a scheduled workflow PRs upstream changes into the snapshots weekly, the app opportunistically refreshes them live at load, and every scan records the SHA-256 of the exact indicator files it used.
+Indicators are STIX2 bundles from the open threat-intel ecosystem: [Amnesty International's Security Lab](https://github.com/AmnestyTech/investigations) publications plus the [MVT project's aggregated indicator collection](https://github.com/mvt-project/mvt-indicators) (Citizen Lab, Kaspersky, Google Threat Intelligence, Microsoft, iVerify, and others). Eight iOS-relevant campaigns are bundled: Pegasus, Predator, KingSpawn (QuaDream), Operation Triangulation, RCS Lab, Wintego Helios, Coruna, and DarkSword. Bundled snapshots are the reviewed floor; a scheduled workflow PRs upstream changes into the snapshots weekly, the app opportunistically refreshes them live at load, and every scan records the SHA-256 of the exact indicator files it used. Live data can only ever add to the floor: a live file that would drop a set below its bundled indicator counts (an empty bundle, a rate-limit page shaped like JSON, an upstream regression) is rejected in favor of the snapshot.
 
 ## Honest epistemics - the part that matters
 
@@ -52,7 +52,7 @@ Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` and `b
 
 Layout:
 
-- `crates/trace-core/` - Rust core: streaming tar/gzip, STIX2 extraction, the three parsers, report assembly. `cargo test` covers all of it natively, including proptest property tests over the hostile-input surface (`tests/properties.rs`).
+- `crates/trace-core/` - Rust core: streaming tar/gzip, STIX2 extraction, the four artifact parsers, report assembly, and the verdict (computed in Rust, in one place - the UI renders it and never re-derives safety semantics). `cargo test` covers all of it natively, including proptest property tests over the hostile-input surface (`tests/properties.rs`).
 - `web/` - the static site (framework-free JS + CSS, service worker for offline, strict CSP). This directory is the entire deployable artifact.
 - `e2e/` - Playwright browser tests: demo scans, verdict rendering, report export, scan-limit handling, and offline operation.
 - `fixtures/make_fixtures.sh` - synthetic demo archive generator.
@@ -62,8 +62,10 @@ CI runs fmt, clippy, tests, `cargo audit`, and the browser E2E suite on every pu
 Deployment notes: production is **Cloudflare Pages** (`tracescan.pages.dev`), built by its git integration on every push to `main` with output directory `web/`. The dashboard build command is kept in sync with this canonical copy (dash-compatible; the toolchain version comes from `rust-toolchain.toml` and wasm-pack is pinned by checksum):
 
 ```
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none && . "$HOME/.cargo/env" && rustup toolchain install && curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/wp.tgz && echo "278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d  /tmp/wp.tgz" | sha256sum -c - && tar -xzf /tmp/wp.tgz -C /tmp && /tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg && rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts && sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${CF_PAGES_COMMIT_SHA}'/" web/sw.js
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none && . "$HOME/.cargo/env" && rustup toolchain install && curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/wp.tgz && echo "278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d  /tmp/wp.tgz" | sha256sum -c - && tar -xzf /tmp/wp.tgz -C /tmp && /tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg && rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts && sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${CF_PAGES_COMMIT_SHA}'/" web/sw.js && grep -q "trace-${CF_PAGES_COMMIT_SHA}" web/sw.js
 ```
+
+The trailing `grep -q` makes the cache-name substitution fail loudly: if `sw.js` is ever edited so the `sed` no longer matches, the build fails instead of shipping a service worker that serves stale caches forever.
 
 Cloudflare enforces `web/_headers` automatically, so the CSP, COOP, and nosniff headers are real there; the `<meta>` CSP in `index.html` remains as defense in depth for any host that cannot send headers. Note that Cloudflare builds track `main` directly rather than waiting for CI, so don't push to `main` with CI red. The old GitHub Pages URL now serves only a redirect plus a service-worker kill switch (`redirect/`, published by `.github/workflows/deploy.yml`); leave it in place indefinitely so returning visitors with the old origin cached get moved over.
 
