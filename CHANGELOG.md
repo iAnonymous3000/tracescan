@@ -4,6 +4,36 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.6.3 - 2026-07-09
+
+Deploy-pipeline liveness and credential hygiene, before the Cloudflare
+cutover makes the workflow the only production writer.
+
+- **The newest green commit can no longer be evicted from the deploy
+  queue.** GitHub's default concurrency keeps a single pending slot and
+  *replaces* its occupant: with deploys serialized, an older commit's
+  late-finishing CI could evict the newest commit's queued deploy, then
+  skip itself as stale (v0.6.2's guard), leaving production stuck on an
+  old commit with every run green. Concurrency now sits on the deploy
+  job itself with `queue: max`, so runs queue instead of replacing each
+  other, stale ones drain as no-op skips, and failed-CI events (whose
+  job is skipped) never enter the group.
+- **Production credentials are scoped to the two steps that use them.**
+  The Cloudflare token was previously job-level environment, visible to
+  checkout, toolchain installers, and the build. It now reaches only
+  preflight (which checks its presence) and the wrangler upload.
+- **wrangler installs from a committed lockfile** (`deploy/package.json`
+  + `package-lock.json`, exact-pinned) in a credential-free step, instead
+  of `npx` resolving transitive npm dependencies at deploy time.
+- **Missing credentials fail loudly after cutover.** Once the
+  `PRODUCTION_DEPLOY_REQUIRED` repository variable is set (cutover step 4
+  in the workflow header), a missing or deleted secret fails the run
+  instead of green-skipping while production silently stops updating.
+- README: the memory-safety claim now discloses the one known gap (the
+  upstream unified-log parser sizes some allocations from archive
+  metadata; worst case is a crafted file aborting its own scan, an
+  availability nuisance rather than a result-integrity risk).
+
 ## v0.6.2 - 2026-07-09
 
 One fix: the CI-gated deploy workflow could roll production backward.

@@ -1,0 +1,8 @@
+{
+  "name": "trace-deploy",
+  "private": true,
+  "description": "Pins wrangler for the CI-gated production deploy so the workflow installs from a committed lockfile instead of resolving npm dependencies at deploy time.",
+  "devDependencies": {
+    "wrangler": "4.110.0"
+  }
+}

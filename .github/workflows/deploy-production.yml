@@ -13,13 +13,17 @@ name: Deploy production
 #   2. Confirm one green run of this workflow deploys successfully.
 #   3. Disconnect the git integration on the Pages project so this
 #      workflow is the only deploy path.
+#   4. Set the repository variable PRODUCTION_DEPLOY_REQUIRED to true
+#      (Settings -> Secrets and variables -> Actions -> Variables).
+#      From then on a missing or deleted secret fails this workflow
+#      loudly instead of green-skipping while production silently
+#      stops updating.
 #
 # Deploys refuse to run unless the validated commit is still the tip of
 # main, checked once up front and again immediately before the upload:
 # CI runs can finish out of order (a newer push's CI completing before an
 # older one's), and without the guard the later-finishing older run would
 # roll production backward - and then "verify" its own stale commit.
-# Concurrency serializes deploys so the guard cannot be raced mid-build.
 on:
   workflow_run:
     workflows: [CI]
@@ -29,23 +33,40 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: production-deploy
-  cancel-in-progress: false
-
 jobs:
   deploy:
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # Job-level, not workflow-level: runs skipped by the `if` above
+    # (failed-CI events) never enter the group. queue: max, because the
+    # default single pending slot *replaces* the pending run when a new
+    # one arrives - an older commit's late CI completion would evict the
+    # newest commit's queued deploy, and with the stale-guard below the
+    # evictor then skips itself, leaving the newest green commit
+    # undeployed forever. A real queue preserves every run; stale ones
+    # drain as fast no-op skips.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+      queue: max
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
+      # The Cloudflare secrets are exposed only to this step (which reads
+      # their presence, nothing else) and the deploy step that hands them
+      # to wrangler - never to checkout, toolchain installers, or builds.
       - name: Preflight (credentials and freshness)
         id: pre
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEPLOY_REQUIRED: ${{ vars.PRODUCTION_DEPLOY_REQUIRED }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            if [ "$DEPLOY_REQUIRED" = "true" ]; then
+              echo "PRODUCTION_DEPLOY_REQUIRED is set but the Cloudflare secrets are missing: production is no longer being deployed." >&2
+              exit 1
+            fi
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             echo "Cloudflare secrets not configured; skipping CI-gated deploy."
             exit 0
@@ -87,8 +108,19 @@ jobs:
         with:
           node-version: 22
 
+      # Installed from the committed lockfile, and before any step holds
+      # the production token: transitive npm resolution never runs with
+      # credentials in the environment.
+      - name: Install wrangler (pinned by deploy/package-lock.json)
+        if: steps.pre.outputs.deploy == 'true'
+        working-directory: deploy
+        run: npm ci
+
       - name: Deploy to Cloudflare Pages
         if: steps.pre.outputs.deploy == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           # Re-check at the last moment: the build above takes minutes, and
@@ -100,7 +132,7 @@ jobs:
             echo "main moved to ${tip} during the build; refusing to deploy stale ${HEAD_SHA}." >&2
             exit 1
           fi
-          npx --yes wrangler@4.110.0 pages deploy web --project-name tracescan --branch main --commit-hash "$HEAD_SHA"
+          ./deploy/node_modules/.bin/wrangler pages deploy web --project-name tracescan --branch main --commit-hash "$HEAD_SHA"
 
       - name: Verify production serves this commit
         if: steps.pre.outputs.deploy == 'true'
