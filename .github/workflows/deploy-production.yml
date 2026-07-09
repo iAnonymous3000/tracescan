@@ -10,9 +10,14 @@ name: Deploy production
 #   1. Create a Pages API token (Cloudflare dashboard -> My Profile ->
 #      API Tokens -> "Cloudflare Pages: Edit") and add both secrets
 #      (Settings -> Secrets and variables -> Actions).
-#   2. Confirm one green run of this workflow deploys successfully.
-#   3. Disconnect the git integration on the Pages project so this
-#      workflow is the only deploy path.
+#   2. Confirm one green run of this workflow deploys successfully
+#      (rerun the latest run from the Actions tab; every step after
+#      preflight must execute, not skip).
+#   3. Stop Cloudflare's own builds so this workflow is the only
+#      production writer: Pages project -> Settings -> Builds ->
+#      Branch control -> disable automatic production deployments,
+#      and set preview branches to None. (Cloudflare's documented
+#      path for deploying via wrangler while keeping the repo linked.)
 #   4. Set the repository variable PRODUCTION_DEPLOY_REQUIRED to true
 #      (Settings -> Secrets and variables -> Actions -> Variables).
 #      From then on a missing or deleted secret fails this workflow
@@ -90,7 +95,7 @@ jobs:
 
       - name: Install wasm-pack
         if: steps.pre.outputs.deploy == 'true'
-        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
           tool: wasm-pack@0.14.0
 

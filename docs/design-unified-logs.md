@@ -54,14 +54,16 @@ Streaming plan, single pass, bounded memory:
 3. Missing-artifact handling: a sysdiagnose without a logarchive reports the
    surface as unavailable, same as the other three.
 
-## Open needs
+## Open needs (both resolved in v0.5.0)
 
-- **Real test data.** No public sysdiagnose ships real tracev3 content, and
-  synthesizing tracev3 is not realistic. Development and validation need a
-  real capture: either the maintainer's sysdiagnose, or a logarchive from
-  `sudo log collect` on a Mac (same format family). Test fixtures committed
-  to the repo must be reviewed for personal data first; catalog-level
-  fixtures (no message strings) carry far less.
-- **Version bump and coverage copy.** Shipping this moves the "unified
-  system logs" line from `not_examined` to `examined`, changes the
-  README/about copy, and warrants a minor version.
+- **Real test data.** Resolved: validated against the maintainer's real
+  iOS 26.5.2 sysdiagnose (617/617 catalog processes resolved to paths,
+  zero false positives; sanitized aggregates in VALIDATION.md). The
+  capture itself stays private; the repeatable gate is
+  `tests/real_capture.rs`, run locally via the `TRACE_REAL_SYSDIAGNOSE`
+  environment variable.
+- **Version bump and coverage copy.** Resolved: shipped as v0.5.0 with
+  the coverage line moved to `examined` and README/about copy updated.
+  v0.6.1 later tightened the surface's structural-success semantics (a
+  catalog inventory that resolves zero process paths is `parsed_partial`,
+  never silently complete).

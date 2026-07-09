@@ -27,3 +27,12 @@ updates:
     groups:
       npm:
         patterns: ["*"]
+  # Wrangler is deploy-path tooling: it runs holding the production
+  # Cloudflare token, so its updates matter more than test tooling.
+  - package-ecosystem: npm
+    directory: /deploy
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
