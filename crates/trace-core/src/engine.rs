@@ -239,6 +239,7 @@ impl Engine {
         let uuidtext_failures = unified.uuidtext_failures;
         let unified_cap_hit = unified.cap_hit;
         let mut unified_unresolved: Option<u64> = None;
+        let mut unified_empty_inventory = false;
         if let Some(summary) = unified.finalize(&self.db, &mut findings) {
             let seen = summary.details["processes_seen"].as_u64().unwrap_or(0);
             let resolved = summary.details["processes_resolved_to_path"]
@@ -246,6 +247,12 @@ impl Engine {
                 .unwrap_or(0);
             if seen > 0 && resolved == 0 {
                 unified_unresolved = Some(seen);
+            }
+            // tracev3 that parsed to an empty inventory: real tracev3
+            // always carries catalog processes, so nothing was checked.
+            // (Wholesale parse failure has its own limit below.)
+            if seen == 0 && tracev3_failures < tracev3_files {
+                unified_empty_inventory = true;
             }
             artifacts.push(summary);
         }
@@ -341,6 +348,11 @@ impl Engine {
             scan_limits.push(format!(
                 "None of the {seen} processes in the unified log inventory could be resolved to a binary path (no readable uuidtext files), so that surface could not be checked against indicators."
             ));
+        }
+        if unified_empty_inventory {
+            scan_limits.push(
+                "The unified log (tracev3) files parsed but contained no process inventory, so that surface could not be checked; a real sysdiagnose's logs always list processes.".into(),
+            );
         }
         if tracev3_failures > 0 {
             scan_limits.push(format!(
@@ -441,7 +453,9 @@ impl Engine {
                 .collect();
         let surfaces_examined = surfaces.iter().filter(|s| s.state != "absent").count();
         let assurance = Assurance {
-            complete: scan_limits.is_empty(),
+            // Input that was never recognizably a sysdiagnose was not
+            // "completely processed" in any sense a consumer should rely on.
+            complete: scan_limits.is_empty() && verdict != Verdict::Invalid,
             surfaces_total: surfaces.len(),
             surfaces,
             surfaces_examined,
@@ -850,7 +864,7 @@ this body is not json"#,
     fn findings_cap_is_enforced_and_surfaces() {
         // A crafted ps.txt whose every line raises a heuristic must not
         // allocate unbounded findings, and the cap must force the verdict
-        // away from clear (a real match could hide beyond the cap).
+        // away from clear.
         let mut ps = String::from("USER PID COMMAND\n");
         for i in 0..(MAX_FINDINGS + 10) {
             ps.push_str(&format!("root {:>3} /private/var/tmp/x{i}\n", i % 999));
@@ -864,6 +878,138 @@ this body is not json"#,
         assert_eq!(report.findings.len(), MAX_FINDINGS);
         assert_eq!(report.verdict, Verdict::Inconclusive);
         assert!(report.scan_limits.iter().any(|l| l.contains("findings")));
+    }
+
+    #[test]
+    fn match_survives_findings_flood() {
+        // Retention is severity-aware: an exact IOC match arriving after
+        // thousands of crafted informational findings must evict one of
+        // them, survive, and control the verdict - a note flood must never
+        // suppress a real detection.
+        let mut ps = String::from("USER PID COMMAND\n");
+        for i in 0..(MAX_FINDINGS + 10) {
+            ps.push_str(&format!("root {:>3} /private/var/tmp/x{i}\n", i % 999));
+        }
+        // The match candidate comes last, well past the cap.
+        ps.push_str("root 2143 /private/var/db/com.apple.xpc.roleaccountd.staging/bh\n");
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry("sysdiagnose_t/ps.txt", ps.as_bytes()));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.findings.len(), MAX_FINDINGS);
+        assert_eq!(report.verdict, Verdict::Match);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Match),
+            "the IOC match must survive the informational flood"
+        );
+        assert!(report.scan_limits.iter().any(|l| l.contains("findings")));
+    }
+
+    #[test]
+    fn uuidtext_only_input_is_not_a_unified_surface() {
+        // uuidtext files are support data (UUID -> path); alone they carry
+        // no process activity to check, so they must not count as a seen
+        // unified-log surface - and an archive with nothing else must read
+        // as "not a sysdiagnose", never clear.
+        // Minimal valid uuidtext: magic 0x66778899, version 2.1, one entry.
+        let mut ut: Vec<u8> = Vec::new();
+        ut.extend_from_slice(&0x66778899u32.to_le_bytes());
+        ut.extend_from_slice(&2u32.to_le_bytes());
+        ut.extend_from_slice(&1u32.to_le_bytes());
+        ut.extend_from_slice(&1u32.to_le_bytes()); // one entry
+        ut.extend_from_slice(&0u32.to_le_bytes()); // range offset
+        ut.extend_from_slice(&8u32.to_le_bytes()); // range size
+        ut.extend_from_slice(b"/bin/x\0\0");
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/AB/CDEF01234567890123456789012345",
+            &ut,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_ne!(report.verdict, Verdict::Clear);
+        assert!(
+            report
+                .missing_artifacts
+                .iter()
+                .any(|m| m.kind == "unified_log"),
+            "uuidtext alone must leave the unified surface missing"
+        );
+        assert!(!report.assurance.complete);
+    }
+
+    #[test]
+    fn header_only_ps_is_never_clear() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER   PID COMMAND\n",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "unparsed");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+    }
+
+    #[test]
+    fn semantically_empty_crash_is_never_clear() {
+        // "{}" header and body are syntactically valid JSON that name no
+        // crashing process; nothing was actually checked.
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/x.ips",
+            b"{}\n{}",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn duration_covers_finish_work() {
+        // The injected clock is read once at the first byte and once after
+        // report assembly, so the duration includes everything finish()
+        // does. A fake stepping clock makes that deterministic.
+        let ticks = std::rc::Rc::new(std::cell::Cell::new(0.0f64));
+        let t = ticks.clone();
+        let mut engine = Engine::new();
+        engine.set_clock(Box::new(move || {
+            t.set(t.get() + 100.0);
+            t.get()
+        }));
+        engine.push(&build_archive(false)).unwrap();
+        let report = engine.finish().unwrap();
+        // first read: 100 (first push); second read: 200 (end of finish)
+        assert_eq!(report.duration_ms, Some(100));
+        assert!(ticks.get() >= 200.0);
+    }
+
+    #[test]
+    fn assurance_complete_is_false_for_invalid_input() {
+        let mut engine = Engine::new();
+        engine.push(&[0x50, 0x4b, 0x03, 0x04]).unwrap(); // zip magic
+        engine.push(&[0xABu8; 2048]).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Invalid);
+        assert!(!report.assurance.complete);
+        assert!(report.scan_limits.is_empty());
     }
 
     #[test]

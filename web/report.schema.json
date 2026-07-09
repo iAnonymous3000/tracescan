@@ -398,7 +398,8 @@
       ],
       "properties": {
         "complete": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Processing completeness, not surface coverage: true when the input was recognizably a sysdiagnose, no safety limit was hit, and every parser succeeded fully. A scan can be complete while surfaces are absent - absence is reported in surfaces[] and missing_artifacts, and weighs on the verdict separately."
         },
         "surfaces": {
           "type": "array",

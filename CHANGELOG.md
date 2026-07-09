@@ -34,6 +34,40 @@ cutover makes the workflow the only production writer.
   metadata; worst case is a crafted file aborting its own scan, an
   availability nuisance rather than a result-integrity risk).
 
+## v0.7.2 - 2026-07-09
+
+Integrity fixes from the post-v0.7.1 audit: four inputs that could read
+as clear (or suppress a detection) when they must not. Report v3 shape,
+normal fixture output, and the UI are unchanged.
+
+- **uuidtext alone is no longer a unified-log surface.** uuidtext files
+  are support data (UUID to binary-path mappings); an archive carrying
+  them without any tracev3 has no process activity to check, and
+  previously counted the surface as examined and complete. It now reads
+  as missing, and uuidtext-only input is "not a sysdiagnose".
+- **Structurally empty artifacts are never clear.** A ps.txt with a
+  header but zero process rows is `unparsed` (a real listing always has
+  processes); a crash log whose JSON parses but names no process
+  (`{}` header/body) is `parsed_partial` (every real crash identifies
+  its process, or names pids in a panic string); tracev3 that parses to
+  an empty process inventory raises a scan limit. All three previously
+  produced clear verdicts with zeroed details.
+- **A real match now survives a findings flood.** Retention at the
+  5,000-finding cap is severity-aware (a Match evicts a Note, then a
+  Suspicious; a Suspicious evicts a Note), so a crafted archive raising
+  thousands of informational findings can no longer crowd out an exact
+  IOC match discovered later - the match survives and controls the
+  verdict. Previously the match was silently dropped.
+- **Unified-log degradation now marks the surface partial.** Any tracev3
+  or uuidtext parse failure, truncated file, or inventory cap downgrades
+  the surface status (and therefore `assurance.surfaces`), instead of
+  only raising a scan limit while the surface claimed `complete`.
+- **`assurance.complete` is false for unrecognizable input**, and its
+  schema description now spells out that it means processing
+  completeness, not surface coverage.
+- Deterministic fake-clock regression coverage for the engine-measured
+  duration, and stale pre-v0.7.1 timing comments cleaned up.
+
 ## v0.7.1 - 2026-07-09
 
 Two Report v3 corrections; the shape is unchanged.

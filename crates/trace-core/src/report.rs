@@ -39,12 +39,18 @@ pub struct Finding {
 /// and a DOM card, so unbounded growth is a memory exhaustion vector.
 pub const MAX_FINDINGS: usize = 5_000;
 
-/// Findings accumulator enforcing [`MAX_FINDINGS`]. Once the cap is hit,
-/// further findings are dropped and `capped` is set; the engine surfaces
-/// that as a scan limit, so the verdict can never read as clear.
+/// Findings accumulator enforcing [`MAX_FINDINGS`]. Retention is
+/// severity-aware: at the cap, a Match evicts a Note (then a Suspicious),
+/// and a Suspicious evicts a Note - a flood of informational findings from
+/// a crafted archive must never crowd out an actual indicator match, which
+/// has to survive and control the verdict. Hitting the cap in any way sets
+/// `capped`; the engine surfaces that as a scan limit, so a capped scan can
+/// never read as clear.
 #[derive(Default)]
 pub struct Findings {
-    items: Vec<Finding>,
+    matches: Vec<Finding>,
+    suspicious: Vec<Finding>,
+    notes: Vec<Finding>,
     pub capped: bool,
 }
 
@@ -53,23 +59,45 @@ impl Findings {
         Findings::default()
     }
 
+    pub fn len(&self) -> usize {
+        self.matches.len() + self.suspicious.len() + self.notes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Finding> {
+        self.matches
+            .iter()
+            .chain(self.suspicious.iter())
+            .chain(self.notes.iter())
+    }
+
     pub fn push(&mut self, f: Finding) {
-        if self.items.len() < MAX_FINDINGS {
-            self.items.push(f);
-        } else {
+        if self.len() >= MAX_FINDINGS {
             self.capped = true;
+            let evicted = match f.severity {
+                Severity::Match => self.notes.pop().or_else(|| self.suspicious.pop()).is_some(),
+                Severity::Suspicious => self.notes.pop().is_some(),
+                Severity::Note => false,
+            };
+            if !evicted {
+                return;
+            }
+        }
+        match f.severity {
+            Severity::Match => self.matches.push(f),
+            Severity::Suspicious => self.suspicious.push(f),
+            Severity::Note => self.notes.push(f),
         }
     }
 
     pub fn into_vec(self) -> Vec<Finding> {
-        self.items
-    }
-}
-
-impl std::ops::Deref for Findings {
-    type Target = [Finding];
-    fn deref(&self) -> &[Finding] {
-        &self.items
+        let mut v = self.matches;
+        v.extend(self.suspicious);
+        v.extend(self.notes);
+        v
     }
 }
 
@@ -207,8 +235,10 @@ pub struct SurfaceState {
 /// the verdict; it adds no new semantics, only structure.
 #[derive(Serialize)]
 pub struct Assurance {
-    /// True when no safety limit was hit and every parser succeeded fully:
-    /// the scan analyzed everything it recognizes.
+    /// Processing completeness, not surface coverage: true when the input
+    /// was recognizably a sysdiagnose, no safety limit was hit, and every
+    /// parser succeeded fully. A scan can be complete with absent
+    /// surfaces - those are in `surfaces` and `missing_artifacts`.
     pub complete: bool,
     pub surfaces: Vec<SurfaceState>,
     pub surfaces_examined: usize,
@@ -278,10 +308,13 @@ pub struct Report {
     pub schema_version: u32,
     pub tool: ToolInfo,
     pub verdict: Verdict,
-    /// RFC 3339 timestamp supplied by the producer's clock (the engine has
-    /// no clock on wasm32).
+    /// RFC 3339 timestamp from the host's calendar clock, stamped by the
+    /// wrapper when finalization begins.
     pub generated_at: Option<String>,
-    /// Wall-clock scan duration measured by the producer, milliseconds.
+    /// Milliseconds measured by the engine through its host-injected
+    /// clock, from the first byte received to the end of report assembly
+    /// (parsing, matching, and the verdict all happen inside finish).
+    /// Null when the host injected no clock.
     pub duration_ms: Option<u64>,
     /// 'worker' | 'inline' | 'native'.
     pub scanned_via: Option<String>,

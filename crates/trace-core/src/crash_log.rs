@@ -102,12 +102,14 @@ pub fn analyze(
     // ever compared by exact equality against the indicator set, so noisy
     // extraction cannot create false positives.
     let mut panic_staging = false;
+    let mut panic_signal = false;
     if let Some(ps) = body.as_ref().and_then(|b| str_field(b, "panicString")) {
         if ps.contains("/com.apple.xpc.roleaccountd.staging/") {
             panic_staging = true;
         }
         for cap in panic_pid_re().captures_iter(ps) {
             candidates.insert(cap[2].to_string());
+            panic_signal = true;
         }
     }
 
@@ -121,8 +123,13 @@ pub fn analyze(
     // The body is the substantive document (procPath, parentProc,
     // panicString); a crash whose body did not parse had most of its
     // signal unchecked, and must not count as a fully analyzed artifact
-    // even when the one-line header parsed.
-    let status = if body.is_some() {
+    // even when the one-line header parsed. Parsing alone is not enough:
+    // syntactically valid JSON that names no crashing process ("{}") was
+    // never really checked either - every real crash log identifies its
+    // process (procName/procPath) or, for kernel panics, names pids in
+    // the panic string.
+    let identified = proc_name.is_some() || proc_path.is_some() || panic_signal;
+    let status = if body.is_some() && identified {
         "parsed"
     } else {
         "parsed_partial"
@@ -316,8 +323,9 @@ mod tests {
             &mut findings,
         );
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Note);
-        assert!(findings[0].summary.contains("/private/var/tmp/agent"));
+        let f = findings.iter().next().unwrap();
+        assert_eq!(f.severity, Severity::Note);
+        assert!(f.summary.contains("/private/var/tmp/agent"));
     }
 
     #[test]

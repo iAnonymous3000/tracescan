@@ -70,6 +70,17 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
         }
     }
 
+    // A header with zero process rows is not a process listing that was
+    // checked - a real ps.txt always lists processes (launchd at minimum).
+    // "Parsed, 0 processes" would let an emptied file read as clear.
+    if count == 0 {
+        return ArtifactSummary::problem(
+            path,
+            "ps_listing",
+            "unparsed",
+            json!({"reason": "header present but no process rows", "processes": 0}),
+        );
+    }
     ArtifactSummary::parsed(path, "ps_listing", json!({"processes": count}))
 }
 

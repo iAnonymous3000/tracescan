@@ -113,9 +113,13 @@ impl Aggregator {
         }
     }
 
-    /// True if any unified-log content was seen at all.
+    /// True if unified-log *log data* was seen. Only tracev3 files carry
+    /// the process inventory; uuidtext files are support data (UUID to
+    /// binary-path mappings) and alone are not a detection surface - an
+    /// archive with uuidtext but no tracev3 has nothing to check, and must
+    /// not count this surface as examined.
     pub fn saw_content(&self) -> bool {
-        self.tracev3_files > 0 || self.uuidtext_files > 0
+        self.tracev3_files > 0
     }
 
     pub fn finalize(self, db: &IocDb, findings: &mut Findings) -> Option<ArtifactSummary> {
@@ -170,14 +174,19 @@ impl Aggregator {
             "processes_resolved_to_path": resolved,
             "cap_hit": self.cap_hit,
         });
-        // Wholesale parse failure must not read as a normally analyzed
-        // surface, and neither may an inventory in which no process could
-        // be resolved to a binary path: with nothing to match against,
-        // the surface was never effectively checked. Both downgrade the
-        // artifact status, which the engine turns into a scan limit.
-        let all_failed = self.tracev3_files > 0 && self.tracev3_failures == self.tracev3_files;
-        let nothing_resolved = !self.procs.is_empty() && resolved == 0;
-        Some(if all_failed || nothing_resolved {
+        // Anything less than a fully readable surface downgrades the
+        // status, which the engine turns into a scan limit and the
+        // assurance block reports as partial: parse failures (whole or
+        // partial), truncated files, a capped inventory, an inventory in
+        // which no process resolved to a binary path (nothing to match
+        // against), or tracev3 that parsed to an empty inventory (real
+        // tracev3 always carries catalog processes).
+        let degraded = self.tracev3_failures > 0
+            || self.uuidtext_failures > 0
+            || self.truncated_files > 0
+            || self.cap_hit
+            || resolved == 0;
+        Some(if degraded {
             ArtifactSummary::problem(
                 "system_logs.logarchive",
                 "unified_log",
