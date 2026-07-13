@@ -1,7 +1,9 @@
 //! ps.txt / ps_thread.txt analysis. Sysdiagnose captures a full `ps` process
 //! listing; implant process names occasionally appear here directly. The
 //! COMMAND column is located by its header offset so commands containing
-//! spaces survive, since column counts vary across iOS versions.
+//! spaces survive, since column counts vary across iOS versions. ps_thread
+//! has an abbreviated COMMAND column and a final full-path COMMAND column;
+//! only process rows from the latter are analyzed (thread rows are skipped).
 
 use crate::heuristics::path_flag_finding;
 use crate::ioc::{basename, IocDb};
@@ -20,10 +22,25 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
             json!({"reason": "no header row found"}),
         );
     };
-    let cmd_col = header.find("COMMAND").unwrap();
+    let is_thread = basename(path) == "ps_thread.txt";
+    let cmd_col = if is_thread {
+        header.rfind("COMMAND").unwrap()
+    } else {
+        header.find("COMMAND").unwrap()
+    };
     let pid_idx = header.split_whitespace().position(|t| t == "PID");
+    if is_thread && header.find("PID").filter(|pid| *pid < cmd_col).is_none() {
+        return ArtifactSummary::problem(
+            path,
+            "ps_listing",
+            "unparsed",
+            json!({"reason": "ps_thread header columns were not recognized"}),
+        );
+    }
 
     let mut count = 0usize;
+    let mut skipped_rows = 0usize;
+    let mut last_thread_pid: Option<String> = None;
     let mut past_header = false;
     for line in content.lines() {
         if !past_header {
@@ -33,14 +50,48 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
         if line.trim().is_empty() {
             continue;
         }
-        let Some(cmd) = line.get(cmd_col..).map(str::trim).filter(|c| !c.is_empty()) else {
-            continue;
+        let (cmd, pid) = if is_thread {
+            // Numeric columns right-align and outgrow their headers (PID is
+            // 3 chars; real pids reach 5), so byte offsets cannot locate the
+            // pid. Row shape is positional instead: USER is left-aligned at
+            // column 0, so a process row starts flush and its pid is the
+            // second token; a thread-continuation row is indented (no USER)
+            // and leads with the repeated pid of its process.
+            let indented = line.starts_with([' ', '\t']);
+            let mut tokens = line.split_whitespace();
+            let Some(pid) = (if indented {
+                tokens.next()
+            } else {
+                tokens.nth(1)
+            }) else {
+                skipped_rows += 1;
+                continue;
+            };
+            let cmd = line.get(cmd_col..).map(str::trim).unwrap_or("");
+            let pid_valid = pid.parse::<u32>().is_ok();
+            let continuation =
+                indented && pid_valid && cmd.is_empty() && last_thread_pid.as_deref() == Some(pid);
+            if continuation {
+                continue;
+            }
+            if indented || !pid_valid || cmd.is_empty() {
+                skipped_rows += 1;
+                continue;
+            }
+            last_thread_pid = Some(pid.to_string());
+            (cmd, pid)
+        } else {
+            let Some(cmd) = line.get(cmd_col..).map(str::trim).filter(|c| !c.is_empty()) else {
+                skipped_rows += 1;
+                continue;
+            };
+            let pid = pid_idx
+                .and_then(|i| line.split_whitespace().nth(i))
+                .unwrap_or("?");
+            (cmd, pid)
         };
         count += 1;
         let argv0 = cmd.split_whitespace().next().unwrap_or(cmd);
-        let pid = pid_idx
-            .and_then(|i| line.split_whitespace().nth(i))
-            .unwrap_or("?");
         let evidence = json!({"pid": pid, "command": cmd});
 
         // argv0 cannot be told apart from a binary path containing spaces
@@ -78,7 +129,23 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
             path,
             "ps_listing",
             "unparsed",
-            json!({"reason": "header present but no process rows", "processes": 0}),
+            json!({
+                "reason": "header present but no readable process rows",
+                "processes": 0,
+                "skipped_rows": skipped_rows,
+            }),
+        );
+    }
+    if skipped_rows > 0 {
+        return ArtifactSummary::problem(
+            path,
+            "ps_listing",
+            "parsed_partial",
+            json!({
+                "reason": "one or more process rows could not be parsed",
+                "processes": count,
+                "skipped_rows": skipped_rows,
+            }),
         );
     }
     ArtifactSummary::parsed(path, "ps_listing", json!({"processes": count}))
@@ -170,5 +237,58 @@ mobile           501   777     1   0.0  0.3 Tue07PM  0:00.55 /private/var/app/My
             .collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].indicator.as_ref().unwrap().kind, "file_path");
+    }
+
+    #[test]
+    fn skipped_process_rows_mark_listing_partial() {
+        // Rows that cannot reach the header's COMMAND byte offset, or whose
+        // offset lands inside a UTF-8 code point, were previously discarded
+        // while the artifact still claimed to be fully parsed.
+        const PARTIAL: &str = "\
+USER PID COMMAND
+root   1 /sbin/launchd
+short
+root 1 💥/bin/example
+";
+        let mut findings = Findings::new();
+        let summary = analyze("root/ps.txt", PARTIAL, &IocDb::new(), &mut findings);
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 1);
+        assert_eq!(summary.details["skipped_rows"], 2);
+    }
+
+    #[test]
+    fn ps_thread_uses_full_command_and_ignores_continuations() {
+        // Real ps_thread.txt has an abbreviated COMMAND column followed by
+        // a second, full COMMAND column. Indented rows are threads belonging
+        // to the preceding process, not separate processes. TTY values can
+        // also exceed the header width (`s000`), so PID parsing is token-based.
+        const PS_THREAD: &str = "\
+USER             PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND  PPID        F %MEM PRI NI      VSZ    RSS WCHAN  STARTED      TIME COMMAND
+root           10001   ??    0.0 S    31T   0:00.00   0:00.00 /sbin/l     0   104004  0.7 31T  0 407931472  13728 -       1:25PM   0:02.37 /sbin/launchd
+               10001         0.0 S    37T   0:00.00   0:00.08             0   104004  0.7 37T  0 407931472  13728 -       1:25PM   0:02.37
+root              30   ??    0.0 S    31T   0:00.00   0:00.17 /usr/li     1  4004004  0.9 31T  0 407965120  18224 -       1:25PM   0:02.38 /usr/libexec/UserEventAgent (System)
+root             300 s000    0.0 S    31T   0:00.00   0:00.08 -zsh      298  4004006  0.1 31T  0 407919648   2640 -       1:27PM   0:00.08 -zsh
+";
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"indicator","pattern":"[file:path='/sbin/launchd']"}]}"#,
+        )
+        .unwrap();
+        let mut findings = Findings::new();
+        let summary = analyze("root/ps_thread.txt", PS_THREAD, &db, &mut findings);
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["processes"], 3);
+        let matches: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Match)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        // The PID column right-aligns and outgrows its 3-char header for
+        // real pids; evidence must carry the whole number, not a byte-slice
+        // suffix of it.
+        assert_eq!(matches[0].evidence["pid"], "10001");
+        assert_eq!(matches[0].evidence["command"], "/sbin/launchd");
     }
 }

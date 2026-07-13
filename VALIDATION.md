@@ -5,6 +5,10 @@ plainly what each detection surface has been validated against, and what has
 not been validated because the necessary data is not public. "Tested" below
 always means an automated test that runs in CI.
 
+The real iOS 26.5.2 measurements below were recorded with Trace v0.5.0.
+They remain historical evidence until the current ignored real-capture harness
+is rerun against that private capture before the next release.
+
 ## What the pipeline is validated against
 
 | Surface | Evidence |
@@ -16,6 +20,23 @@ always means an automated test that runs in CI.
 | Crash log and ps.txt parsing | Unit tests over real-format samples, including kernel panics (`panicString`), hyphenated process names, and commands containing spaces |
 | STIX2 extraction | Validated against all eight bundled real indicator files (2,887 indicators); AND/FOLLOWEDBY patterns are skipped, never half-matched; property tests over hostile JSON |
 | End-to-end, real browser | Playwright suite on Chromium, Firefox, and WebKit, including offline operation and report export |
+
+## Manual public-capture compatibility probe (2026-07-13)
+
+The current working tree was also run against EC-DIGIT-CSIRC's
+[public iOS 15 sysdiagnose capture](https://github.com/EC-DIGIT-CSIRC/sysdiagnose-testdata/blob/main/iOS15/sysdiagnose_2023.05.24_13-29-15-0700_iPhone-OS_iPhone_19H349.tar.gz)
+(`sysdiagnose_2023.05.24_13-29-15-0700_iPhone-OS_iPhone_19H349.tar.gz`,
+SHA-256 `4491d5e4b6f4349311df3b3fc671f1dd040c8ccda9f97e3a0debef151e613114`).
+This is a manual compatibility probe, not an automated CI result or a
+substitute for rerunning the private iOS 26 validation capture.
+
+- `ps.txt` and `ps_thread.txt` both parsed completely, with 244 process rows
+  each and no indicator or suspicious findings.
+- The overall verdict was `inconclusive`: 11 nonstandard `.ips` diagnostics
+  (`SiriSearchFeedback`, `forceReset`, `ResetCounter`, and `stacks`) contain
+  formats or process inventories the crash-log parser does not fully analyze.
+  Trace correctly reports those artifacts as partial instead of claiming a
+  clear result.
 
 ## What "149 checkable indicators" means precisely
 
@@ -32,17 +53,19 @@ examined.
 
 - **No false-positive study across devices and OS versions.** The clean
   validation corpus is one real iOS 26.5.2 capture (plus synthetic
-  fixtures). Wider privacy-reviewed clean captures are the highest-value
-  contribution a tester can make.
+  fixtures). The public iOS 15 probe above adds compatibility evidence but
+  is not part of the clear-result corpus because unsupported `.ips` formats
+  make its verdict inconclusive. Wider privacy-reviewed clean captures are
+  the highest-value contribution a tester can make.
 
 - **No scan of a real infected device.** No real spyware-infected sysdiagnose
   (or shutdown.log) is public anywhere we could find: Kaspersky published
   tooling and excerpt patterns, not raw logs; MVT's test artifacts are a
-  clean iOS backup; EC-DIGIT-CSIRC's sysdiagnose test data is private. The
-  infected demo fixture is synthetic, built to the published patterns and
-  seeded with a real published indicator. If you are a researcher holding
-  real infected artifacts and can share them (even hashed or redacted),
-  please open contact via SECURITY.md.
+  clean iOS backup; EC-DIGIT-CSIRC's public sysdiagnose test capture has no
+  infected-device ground truth. The infected demo fixture is synthetic,
+  built to the published patterns and seeded with a real published indicator.
+  If you are a researcher holding real infected artifacts and can share them
+  (even hashed or redacted), please open contact via SECURITY.md.
 
 ## Differential comparison against MVT (2026-07-08)
 

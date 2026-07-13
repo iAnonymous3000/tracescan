@@ -6,6 +6,10 @@
 import init, { Scanner } from './pkg/trace_core.js';
 
 const ready = init();
+ready.then(
+  () => self.postMessage({ type: 'ready' }),
+  (err) => self.postMessage({ type: 'init-error', message: err?.message || String(err) })
+);
 
 self.onmessage = async (e) => {
   const msg = e.data;

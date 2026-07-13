@@ -20,6 +20,7 @@ function esc(s) {
 }
 
 function fmtBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return 'size unavailable';
   if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB';
   if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB';
   if (n >= 1 << 10) return (n / (1 << 10)).toFixed(0) + ' KB';
@@ -151,12 +152,51 @@ function renderIocPanel() {
 /* ---------- scanning ---------- */
 
 let worker = null;
+let workerState = 'unavailable'; // unavailable | starting | ready | scanning | failed
+let workerReady = Promise.resolve(false);
+const WORKER_STARTUP_TIMEOUT_MS = 8_000;
+const WORKER_SCAN_FAILURE =
+  'The background scanner stopped while reading this file. Trace did not retry it on the main page because doing so could freeze or crash the tab. Keep the original file, reload this page, and contact a digital security helpline if the problem repeats.';
 
 function initWorker() {
   try {
-    worker = new Worker('./worker.js', { type: 'module' });
+    const w = new Worker('./worker.js', { type: 'module' });
+    worker = w;
+    workerState = 'starting';
+    workerReady = new Promise((resolve) => {
+      let settled = false;
+      let timeout;
+      const cleanup = () => {
+        w.removeEventListener('message', onMsg);
+        w.removeEventListener('error', onErr);
+        clearTimeout(timeout);
+      };
+      const finish = (available) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (available && worker === w) {
+          workerState = 'ready';
+        } else {
+          if (worker === w) worker = null;
+          workerState = 'unavailable';
+          w.terminate();
+        }
+        resolve(available);
+      };
+      const onMsg = (e) => {
+        if (e.data?.type === 'ready') finish(true);
+        if (e.data?.type === 'init-error') finish(false);
+      };
+      const onErr = () => finish(false);
+      w.addEventListener('message', onMsg);
+      w.addEventListener('error', onErr);
+      timeout = setTimeout(() => finish(false), WORKER_STARTUP_TIMEOUT_MS);
+    });
   } catch {
     worker = null; // very old browser: fall back to inline scanning
+    workerState = 'unavailable';
+    workerReady = Promise.resolve(false);
   }
 }
 
@@ -174,7 +214,14 @@ let scanSeq = 0;
 function scanWithWorker(file) {
   return new Promise((resolve, reject) => {
     const w = worker;
+    if (!w || workerState !== 'ready') {
+      reject(new Error('The background scanner is not ready.'));
+      return;
+    }
     const id = ++scanSeq;
+    const restoreReady = () => {
+      if (worker === w && workerState === 'scanning') workerState = 'ready';
+    };
     const onMsg = (e) => {
       const m = e.data;
       if (m.id !== id) return; // not this scan's message
@@ -182,16 +229,20 @@ function scanWithWorker(file) {
         updateProgress(m.processed, file.size);
       } else if (m.type === 'report') {
         cleanup();
+        restoreReady();
         resolve(m.report);
       } else if (m.type === 'error') {
         cleanup();
+        restoreReady();
         reject(new Error(m.message));
       }
     };
     const onErr = () => {
       cleanup();
-      worker = null; // future scans use the inline path
-      reject(new Error('The background scanner failed. Reload the page and try again.'));
+      if (worker === w) worker = null;
+      workerState = 'failed';
+      w.terminate();
+      reject(new Error(WORKER_SCAN_FAILURE));
     };
     const cleanup = () => {
       w.removeEventListener('message', onMsg);
@@ -199,12 +250,19 @@ function scanWithWorker(file) {
     };
     w.addEventListener('message', onMsg);
     w.addEventListener('error', onErr);
-    w.postMessage({
-      type: 'scan',
-      id,
-      file,
-      sets: state.stix.map((s) => ({ name: s.name, text: s.text, meta: s.meta })),
-    });
+    workerState = 'scanning';
+    try {
+      w.postMessage({
+        type: 'scan',
+        id,
+        file,
+        sets: state.stix.map((s) => ({ name: s.name, text: s.text, meta: s.meta })),
+      });
+    } catch (err) {
+      cleanup();
+      restoreReady();
+      reject(err);
+    }
   });
 }
 
@@ -249,19 +307,12 @@ async function handleFile(file) {
     // A file dropped before the indicator sets finish loading must wait:
     // scanning with an empty set would produce a hollow "clear".
     await state.ready;
+    if (workerState === 'starting') await workerReady;
+    if (workerState === 'failed') throw new Error(WORKER_SCAN_FAILURE);
     let report;
-    if (worker) {
+    if (worker && workerState === 'ready') {
       state.lastScanVia = 'worker';
-      try {
-        report = await scanWithWorker(file);
-      } catch (err) {
-        // A crashed worker (worker is now null) is an environment problem,
-        // not a verdict about the file: retry the same scan inline rather
-        // than asking the user to reload. Scan errors keep the worker and
-        // are rethrown - retrying those would just fail the same way.
-        if (worker) throw err;
-        report = null;
-      }
+      report = await scanWithWorker(file);
     }
     if (!report) {
       state.lastScanVia = 'inline';
@@ -445,9 +496,14 @@ function provenanceHtml(report) {
 }
 
 function renderReport(report) {
+  const source = report.source_file || {};
+  const sourceName = source.name == null || source.name === ''
+    ? 'Unknown source file'
+    : source.name;
+  const sourceLabel = `${esc(sourceName)} (${fmtBytes(source.size)})`;
   const device = report.device
-    ? `<p class="fine">Device: ${esc(report.device.os_version)} (from ${esc(report.device.source)}) · file: ${esc(report.source_file.name)} (${fmtBytes(report.source_file.size)})</p>`
-    : `<p class="fine">File: ${esc(report.source_file.name)} (${fmtBytes(report.source_file.size)})</p>`;
+    ? `<p class="fine">Device: ${esc(report.device.os_version)} (from ${esc(report.device.source)}) · file: ${sourceLabel}</p>`
+    : `<p class="fine">File: ${sourceLabel}</p>`;
   $('#results').innerHTML =
     verdictHtml(report) +
     device +
@@ -591,9 +647,15 @@ window.__trace = {
   get lastReport() { return state.lastReport; },
   get lastScanVia() { return state.lastScanVia; },
   get ready() { return state.scanner !== null; },
+  renderReport,
   // For producer-parity tests: forces the inline path, exactly what a
   // browser without worker support gets.
-  disableWorker() { worker = null; },
+  disableWorker() {
+    worker?.terminate();
+    worker = null;
+    workerState = 'unavailable';
+    workerReady = Promise.resolve(false);
+  },
 };
 
 boot();

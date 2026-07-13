@@ -12,6 +12,7 @@ const SHELL = [
   './style.css',
   './main.js',
   './worker.js',
+  './report.schema.json',
   './pkg/trace_core.js',
   './pkg/trace_core_bg.wasm',
   './iocs/manifest.json',

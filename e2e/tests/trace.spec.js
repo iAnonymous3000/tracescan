@@ -218,6 +218,154 @@ test('a second file arriving mid-scan is ignored, not interleaved', async ({ pag
   expect(name).toBe('sysdiagnose_demo_clean.tar.gz');
 });
 
+test.describe('worker failure boundaries', () => {
+  test.use({ serviceWorkers: 'block' });
+  test.beforeEach(async ({ page }) => {
+    // Keep lifecycle tests independent of the eight optional upstream
+    // freshness checks, each of which deliberately permits a 6s timeout.
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+  });
+
+  test('a synchronous worker startup failure falls back inline', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.Worker = class {
+        constructor() { throw new Error('worker unavailable'); }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+    expect(await page.evaluate(() => window.__trace.lastReport.scanned_via)).toBe('inline');
+  });
+
+  test('an asynchronous worker startup failure falls back inline', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          setTimeout(() => this.dispatchEvent(new ErrorEvent('error')), 0);
+        }
+        postMessage() {}
+        terminate() {}
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 5_000 });
+    expect(await page.evaluate(() => window.__trace.lastReport.scanned_via)).toBe('inline');
+  });
+
+  test('a silent worker startup times out and falls back inline', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for the startup deadline');
+    await page.addInitScript(() => {
+      window.Worker = class extends EventTarget {
+        postMessage() {}
+        terminate() {}
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 12_000 });
+    expect(await page.evaluate(() => window.__trace.lastReport.scanned_via)).toBe('inline');
+  });
+
+  test('a structured scan error keeps the worker usable without inline reads', async ({ page }) => {
+    await page.addInitScript(() => {
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      window.__traceWorkerPosts = 0;
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type !== 'scan') return;
+          window.__traceWorkerPosts += 1;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'error', id: message.id, message: 'scan rejected' },
+          })), 0);
+        }
+        terminate() {}
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText('scan rejected');
+    await page.click('#rescan-btn');
+    // Returning to the landing page hides #results but leaves the first
+    // error box in its DOM; waiting on visibility (not text presence) keys
+    // the assertion to the second scan's render, not the stale markup.
+    await expect(page.locator('#results')).toBeHidden();
+    await page.click('#demo-clean');
+    await expect(page.locator('#results')).toBeVisible();
+    await expect(page.locator('.error-box')).toContainText('scan rejected');
+    const counts = await page.evaluate(() => ({
+      posts: window.__traceWorkerPosts,
+      streams: window.__traceFileStreamCalls,
+    }));
+    expect(counts.posts).toBe(2);
+    expect(counts.streams).toBe(0);
+  });
+
+  test('a worker crash during a scan never replays the file inline', async ({ page }) => {
+    await page.addInitScript(() => {
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type === 'scan') {
+            setTimeout(() => this.dispatchEvent(new ErrorEvent('error')), 0);
+          }
+        }
+        terminate() {}
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it on the main page',
+      { timeout: 5_000 }
+    );
+    const state = await page.evaluate(() => ({
+      streamCalls: window.__traceFileStreamCalls,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.streamCalls).toBe(0);
+    expect(state.report).toBeNull();
+    expect(state.via).toBe('worker');
+
+    // The failed state is terminal for this page: another user action must
+    // not dispatch to the dead worker or silently switch to inline scanning.
+    // Same stale-DOM discipline as above: key on #results re-rendering.
+    await page.click('#rescan-btn');
+    await expect(page.locator('#results')).toBeHidden();
+    await page.click('#demo-clean');
+    await expect(page.locator('#results')).toBeVisible();
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it on the main page'
+    );
+    expect(await page.evaluate(() => window.__traceFileStreamCalls)).toBe(0);
+  });
+});
+
 test('scanning still works fully offline once the app is cached', async ({ page, context, browserName }) => {
   test.skip(
     browserName === 'webkit',
@@ -229,6 +377,9 @@ test('scanning still works fully offline once the app is cached', async ({ page,
   await page.reload();
   await page.click('#demo-clean');
   await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  const schema = await page.evaluate(async () =>
+    (await fetch('./report.schema.json')).json());
+  expect(schema.properties.schema_version.const).toBe(3);
   // offline means the live refresh failed and bundled snapshots were used
   await expect(page.locator('#ioc-list')).toContainText('snapshot');
   await context.setOffline(false);
@@ -300,4 +451,19 @@ test('the report schema is served at its declared $id path', async ({ page }) =>
     (await fetch('./report.schema.json')).json());
   expect(schema.$id).toBe('https://tracescan.pages.dev/report.schema.json');
   expect(schema.properties.schema_version.const).toBe(3);
+});
+
+test('nullable source metadata renders as unavailable, never as null', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  await page.evaluate(() => {
+    const report = structuredClone(window.__trace.lastReport);
+    report.source_file.name = null;
+    report.source_file.size = null;
+    window.__trace.renderReport(report);
+  });
+  const source = page.locator('#results > p.fine').first();
+  await expect(source).toContainText('Unknown source file (size unavailable)');
+  await expect(source).not.toContainText('null');
 });

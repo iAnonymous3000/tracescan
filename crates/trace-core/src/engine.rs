@@ -10,6 +10,27 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
+fn crash_timestamp(value: Option<&str>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let value = value?;
+    chrono::DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f %z")
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(value))
+        .ok()
+}
+
+fn device_timestamp_is_newer(candidate: &DeviceInfo, current: &DeviceInfo) -> bool {
+    match (
+        crash_timestamp(candidate.timestamp.as_deref()),
+        crash_timestamp(current.timestamp.as_deref()),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        // A timestamp that can be placed on a timeline is stronger than
+        // missing or malformed metadata. If neither parses, keep the first
+        // OS-bearing crash rather than inventing an ordering.
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn hex(digest: &[u8]) -> String {
     let mut out = String::with_capacity(digest.len() * 2);
     for b in digest {
@@ -209,7 +230,7 @@ impl Engine {
                     if let Some(d) = d {
                         if device
                             .as_ref()
-                            .is_none_or(|cur| d.timestamp > cur.timestamp)
+                            .is_none_or(|cur| device_timestamp_is_newer(&d, cur))
                         {
                             device = Some(d);
                         }
@@ -324,6 +345,15 @@ impl Engine {
         if unparsed_ps > 0 {
             scan_limits.push(format!(
                 "{unparsed_ps} process listing file(s) could not be parsed; the processes they list were not checked."
+            ));
+        }
+        let partial_ps = artifacts
+            .iter()
+            .filter(|a| a.kind == "ps_listing" && a.status == "parsed_partial")
+            .count();
+        if partial_ps > 0 {
+            scan_limits.push(format!(
+                "{partial_ps} process listing file(s) contained rows that could not be parsed; those processes were not checked."
             ));
         }
         let unparsed_shutdown = artifacts
@@ -795,6 +825,73 @@ mod tests {
         let device = report.device.unwrap();
         assert_eq!(device.os_version, "iPhone OS 18.5 (22F76)");
         assert!(device.source.contains("b-2026-06-30"));
+    }
+
+    #[test]
+    fn newest_crash_log_compares_offset_aware_instants() {
+        // The first timestamp looks later as a string, but is 09:30 UTC;
+        // the second is 10:00 UTC and must provide the capture-nearest OS.
+        let older = br#"{"name":"a","timestamp":"2026-07-01 23:30:00.00 +1400","bug_type":"309","os_version":"iPhone OS 17.0 (21A1)"}
+{"procName":"a"}"#;
+        let newer = br#"{"name":"b","timestamp":"2026-07-01 10:00:00.00 +0000","bug_type":"309","os_version":"iPhone OS 18.5 (22F76)"}
+{"procName":"b"}"#;
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/a-2026-07-01-233000.ips",
+            older,
+        ));
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/b-2026-07-01-100000.ips",
+            newer,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.push(&tar).unwrap();
+        let device = engine.finish().unwrap().device.unwrap();
+        assert_eq!(device.os_version, "iPhone OS 18.5 (22F76)");
+        assert!(device.source.contains("b-2026-07-01"));
+    }
+
+    #[test]
+    fn partially_parsed_ps_listing_is_never_clear() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER PID COMMAND\nroot   1 /sbin/launchd\nshort\n",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("process listing")));
+    }
+
+    #[test]
+    fn ps_thread_full_path_indicator_controls_verdict() {
+        let ps_thread = b"USER             PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND  PPID        F %MEM PRI NI      VSZ    RSS WCHAN  STARTED      TIME COMMAND\nroot               1   ??    0.0 S    31T   0:00.00   0:00.00 /sbin/l     0   104004  0.7 31T  0 407931472  13728 -       1:25PM   0:02.37 /sbin/launchd\n                   1         0.0 S    37T   0:00.00   0:00.08             0   104004  0.7 37T  0 407931472  13728 -       1:25PM   0:02.37 \n";
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry("sysdiagnose_t/ps_thread.txt", ps_thread));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine
+            .load_stix(
+                "path-mini",
+                r#"{"objects":[{"type":"indicator","pattern":"[file:path='/sbin/launchd']"}]}"#,
+            )
+            .unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Match);
+        assert_eq!(report.artifacts[0].status, "parsed");
+        assert_eq!(report.artifacts[0].details["processes"], 1);
+        assert!(report.scan_limits.is_empty());
     }
 
     #[test]
