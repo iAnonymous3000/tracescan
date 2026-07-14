@@ -1890,7 +1890,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "chrono",
  "console_error_panic_hook",

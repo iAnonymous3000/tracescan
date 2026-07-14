@@ -5,38 +5,42 @@ plainly what each detection surface has been validated against, and what has
 not been validated because the necessary data is not public. "Tested" below
 always means an automated test that runs in CI.
 
-The real iOS 26.5.2 measurements below were recorded with Trace v0.5.0.
-They remain historical evidence until the current ignored real-capture harness
-is rerun against that private capture before the next release.
+The real-capture measurements below were reproduced with the Trace v0.7.3 tree
+on 2026-07-13: two private iOS 26.5.2 captures and EC-DIGIT-CSIRC's public
+iOS 15 capture. The private archives never enter the repository; the ignored
+release harness reads them only from an explicit local path.
 
 ## What the pipeline is validated against
 
 | Surface | Evidence |
 |---|---|
-| Archive streaming (gzip/tar, PAX, GNU long names, caps) | Property tests over arbitrary bytes and chunkings; unit tests for PAX paths, caps, truncation, end-of-archive handling; a real iOS 26.5.2 sysdiagnose parsed end to end |
-| Unified logs (tracev3 catalog inventory) | Validated against a real iOS 26.5.2 capture: 64 tracev3 files (2,656 catalogs) and 689 uuidtext files parsed with zero failures; 617 of 617 processes resolved to binary paths; zero false positives from indicators or path heuristics across the full log window. Format parsing is delegated to Mandiant's upstream-tested `macos-unifiedlogs`. Repeatable locally, with all eight bundled indicator sets loaded so the zero-false-positive claim is what the test actually reproduces: `TRACE_REAL_SYSDIAGNOSE=… cargo test --release --test real_capture -- --ignored` |
+| Archive streaming (gzip/tar, PAX, GNU long names, caps) | Property tests over arbitrary bytes and chunkings; unit tests for PAX paths, caps, truncation, end-of-archive handling; two private iOS 26.5.2 sysdiagnoses and one public iOS 15 sysdiagnose parsed end to end |
+| Unified logs (tracev3 catalog inventory) | On the two iOS 26.5.2 captures: 64 tracev3 files / 2,656 catalogs / 689 uuidtext files / 617 processes, and 62 / 4,402 / 754 / 623 respectively; every file parsed, every process resolved to a binary path, and no indicator or suspicious heuristic fired. The public iOS 15 capture likewise parsed 27 tracev3 files with 341 of 341 paths resolved. Format parsing is delegated to Mandiant's upstream-tested `macos-unifiedlogs`. Repeatable locally with all eight bundled indicator sets loaded: `TRACE_REAL_SYSDIAGNOSE=… cargo test --release --test real_capture -- --ignored` |
 | shutdown.log format handling | Both real-world formats verified against a real iOS 26.5.2 capture (rotated `shutdown.N.log`, header plus indented clients, trailing binary-UUID path component) and the classic one-line format from published research |
-| Pegasus shutdown.log technique | Pattern published by Kaspersky (iShutdown, Jan 2024): processes running from `/private/var/db/com.apple.xpc.roleaccountd.staging/`. Unit tests and the demo fixture seed a real published Pegasus process-name indicator through this path |
-| Crash log and ps.txt parsing | Unit tests over real-format samples, including kernel panics (`panicString`), hyphenated process names, and commands containing spaces |
+| Pegasus shutdown.log technique | [Kaspersky's iShutdown research](https://securelist.com/shutdown-log-lightweight-ios-malware-detection-method/111734/) published direct-child processes under `/private/var/db/com.apple.xpc.roleaccountd.staging/`. Unit tests and the demo fixture seed a published Pegasus process-name indicator through that shape; a legitimate nested iOS `exec/<id>.xpc/…` workspace is explicitly not elevated to suspicious |
+| Crash and diagnostic `.ips` parsing | Unit tests cover ordinary crashes, kernel panics, disk-write reports, Jetsam, stacks, forceReset, Siri feedback, and ResetCounter, including malformed-row and schema-drift failures. All `.ips` files in the three real captures parse completely; process-bearing formats contribute every validated identity, while metadata-only formats contribute none |
+| Process listings | Real-format `ps.txt`/`ps_thread.txt` tests cover commands containing spaces, wide PIDs, thread-continuation rows, the final full-path command column, malformed rows, and iOS 26's valid header-only auxiliary listing |
 | STIX2 extraction | Validated against all eight bundled real indicator files (2,887 indicators); AND/FOLLOWEDBY patterns are skipped, never half-matched; property tests over hostile JSON |
 | End-to-end, real browser | Playwright suite on Chromium, Firefox, and WebKit, including offline operation and report export |
 
-## Manual public-capture compatibility probe (2026-07-13)
+## Public-capture compatibility validation (2026-07-13)
 
-The current working tree was also run against EC-DIGIT-CSIRC's
+The v0.7.3 tree was also run against EC-DIGIT-CSIRC's
 [public iOS 15 sysdiagnose capture](https://github.com/EC-DIGIT-CSIRC/sysdiagnose-testdata/blob/main/iOS15/sysdiagnose_2023.05.24_13-29-15-0700_iPhone-OS_iPhone_19H349.tar.gz)
 (`sysdiagnose_2023.05.24_13-29-15-0700_iPhone-OS_iPhone_19H349.tar.gz`,
 SHA-256 `4491d5e4b6f4349311df3b3fc671f1dd040c8ccda9f97e3a0debef151e613114`).
-This is a manual compatibility probe, not an automated CI result or a
-substitute for rerunning the private iOS 26 validation capture.
+This is a repeatable manual compatibility test rather than a CI fixture because
+the 94 MB archive is externally hosted.
 
 - `ps.txt` and `ps_thread.txt` both parsed completely, with 244 process rows
   each and no indicator or suspicious findings.
-- The overall verdict was `inconclusive`: 11 nonstandard `.ips` diagnostics
-  (`SiriSearchFeedback`, `forceReset`, `ResetCounter`, and `stacks`) contain
-  formats or process inventories the crash-log parser does not fully analyze.
-  Trace correctly reports those artifacts as partial instead of claiming a
-  clear result.
+- All 11 ancillary `.ips` diagnostics parsed completely. `stacks` and
+  `forceReset` process inventories were checked; `SiriSearchFeedback` and
+  `ResetCounter` were recognized as metadata-only without treating their
+  labels as process identities.
+- All 27 tracev3 files parsed with zero failures, and 341 of 341 processes
+  resolved to paths. With all eight bundled indicator sets loaded, the overall
+  verdict was `clear` with zero match or suspicious findings.
 
 ## What "149 checkable indicators" means precisely
 
@@ -51,12 +55,12 @@ examined.
 
 ## What has NOT been validated, and why
 
-- **No false-positive study across devices and OS versions.** The clean
-  validation corpus is one real iOS 26.5.2 capture (plus synthetic
-  fixtures). The public iOS 15 probe above adds compatibility evidence but
-  is not part of the clear-result corpus because unsupported `.ips` formats
-  make its verdict inconclusive. Wider privacy-reviewed clean captures are
-  the highest-value contribution a tester can make.
+- **No broad false-positive study across devices and OS versions.** The clean
+  validation corpus is two private iOS 26.5.2 captures and one public iOS 15
+  capture, plus synthetic fixtures. That is enough to reproduce these parser
+  and heuristic results, not to estimate false-positive rates across the iOS
+  population. Wider privacy-reviewed clean captures remain the highest-value
+  contribution a tester can make.
 
 - **No scan of a real infected device.** No real spyware-infected sysdiagnose
   (or shutdown.log) is public anywhere we could find: Kaspersky published

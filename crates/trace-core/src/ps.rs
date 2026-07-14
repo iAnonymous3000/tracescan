@@ -23,13 +23,18 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
         );
     };
     let is_thread = basename(path) == "ps_thread.txt";
+    let first_cmd_col = header.find("COMMAND").unwrap();
+    let last_cmd_col = header.rfind("COMMAND").unwrap();
     let cmd_col = if is_thread {
-        header.rfind("COMMAND").unwrap()
+        last_cmd_col
     } else {
-        header.find("COMMAND").unwrap()
+        first_cmd_col
     };
     let pid_idx = header.split_whitespace().position(|t| t == "PID");
-    if is_thread && header.find("PID").filter(|pid| *pid < cmd_col).is_none() {
+    if is_thread
+        && (first_cmd_col == last_cmd_col
+            || header.find("PID").filter(|pid| *pid < cmd_col).is_none())
+    {
         return ArtifactSummary::problem(
             path,
             "ps_listing",
@@ -121,10 +126,24 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
         }
     }
 
-    // A header with zero process rows is not a process listing that was
-    // checked - a real ps.txt always lists processes (launchd at minimum).
-    // "Parsed, 0 processes" would let an emptied file read as clear.
+    // Current iOS 26 captures can contain a header-only ps_thread.txt beside
+    // a complete ps.txt. The file itself was parsed, but contributes no
+    // inventory; the engine requires at least one process row across the
+    // combined ps surface before a scan can be clear.
     if count == 0 {
+        if is_thread && skipped_rows == 0 {
+            return ArtifactSummary::parsed(
+                path,
+                "ps_listing",
+                json!({
+                    "processes": 0,
+                    "empty": true,
+                    "note": "ps_thread contained a header but no rows",
+                }),
+            );
+        }
+        // A real ps.txt always lists processes (launchd at minimum).
+        // "Parsed, 0 processes" would let an emptied file read as clear.
         return ArtifactSummary::problem(
             path,
             "ps_listing",
@@ -290,5 +309,48 @@ root             300 s000    0.0 S    31T   0:00.00   0:00.08 -zsh      298  400
         // suffix of it.
         assert_eq!(matches[0].evidence["pid"], "10001");
         assert_eq!(matches[0].evidence["command"], "/sbin/launchd");
+    }
+
+    #[test]
+    fn ps_thread_without_full_command_column_is_unparsed() {
+        // ps_thread's first COMMAND column is abbreviated. Without the
+        // second, full-path COMMAND column, treating the listing as complete
+        // could miss an IOC that was truncated out of the abbreviated value.
+        const SINGLE_COMMAND: &str = "\
+USER   PID COMMAND
+root     1 /sbin/launchd
+";
+        let mut findings = Findings::new();
+        let summary = analyze(
+            "root/ps_thread.txt",
+            SINGLE_COMMAND,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "unparsed");
+        assert_eq!(
+            summary.details["reason"],
+            "ps_thread header columns were not recognized"
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ps_thread_header_only_is_a_recognized_empty_listing() {
+        // Current iOS 26 sysdiagnoses can carry a valid ps_thread header but
+        // no rows while ps.txt still contains the complete process snapshot.
+        const HEADER_ONLY: &str = "\
+USER               PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND  PPID        F %MEM PRI NI      VSZ    RSS WCHAN  STARTED      TIME COMMAND
+";
+        let mut findings = Findings::new();
+        let summary = analyze(
+            "root/ps_thread.txt",
+            HEADER_ONLY,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["processes"], 0);
+        assert!(findings.is_empty());
     }
 }

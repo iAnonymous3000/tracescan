@@ -390,7 +390,7 @@ function verdictHtml(report) {
   if (v === 'invalid') {
     return `<div class="verdict invalid">
       <h2>This doesn't look like a sysdiagnose archive</h2>
-      <p>None of the expected artifacts (shutdown.log, crash logs, ps.txt, unified system logs) were found inside. Make sure you're scanning a file named like <code>sysdiagnose_….tar.gz</code>, captured following the guide on the start page.</p>
+      <p>None of the expected artifacts (shutdown.log, crash or diagnostic .ips reports, ps.txt, unified system logs) were found inside. Make sure you're scanning a file named like <code>sysdiagnose_….tar.gz</code>, captured following the guide on the start page.</p>
     </div>`;
   }
   const missing = report.missing_artifacts || [];

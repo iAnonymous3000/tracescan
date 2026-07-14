@@ -92,7 +92,7 @@ pub struct CollectedFile {
 }
 
 /// Guardrails against a hostile archive. Real sysdiagnose artifacts are tiny
-/// (shutdown.log and .ips crash logs are kilobytes, a few hundred crash logs
+/// (shutdown.log and .ips diagnostics are kilobytes, a few hundred .ips files
 /// at most), so a scan that hits any of these caps is by definition not a
 /// normal sysdiagnose - the caps exist so a crafted archive cannot exhaust
 /// browser memory, and hitting one must surface as an incomplete scan.

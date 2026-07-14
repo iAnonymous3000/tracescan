@@ -1,6 +1,6 @@
 [package]
 name = "trace-core"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
 license = "MIT"

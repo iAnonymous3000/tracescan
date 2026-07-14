@@ -4,6 +4,41 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## v0.7.3 - 2026-07-13
+
+Fail-closed worker handling and real-capture parser coverage. Report schema v3
+is unchanged; known iOS diagnostic formats that are fully understood no longer
+force an inconclusive verdict.
+
+- **A worker crash can never replay a partially read archive inline.** Worker
+  startup failures still fall back before scanning begins, but a crash after
+  dispatch is terminal for the page and shows a reload/help message. Structured
+  per-scan errors leave a healthy worker reusable. Startup readiness, timeout,
+  scan ownership, and stale-message boundaries are covered end to end.
+- **`ps_thread.txt` uses the final full-path `COMMAND` column.** Thread rows are
+  skipped, wide PIDs are parsed by row shape rather than header byte width, and
+  unreadable rows make the listing partial. A one-`COMMAND` header is rejected
+  instead of treating its abbreviated value as a full path. Current iOS 26's
+  valid header-only `ps_thread.txt` is recognized as empty only when another
+  parsed process listing supplies a nonempty inventory; it cannot clear alone.
+- **Six ancillary `.ips` families now have strict parsers.** `stacks` and
+  `forceReset` process maps, Jetsam process arrays, and disk-write command/path
+  reports feed indicator matching. Siri feedback and ResetCounter are
+  recognized as metadata-only diagnostics without inventing process identities.
+  Empty inventories, malformed rows, PID mismatches, or schema drift remain
+  partial and therefore inconclusive.
+- **The Pegasus staging heuristic no longer flags Apple's nested execution
+  workspace.** Published direct-child `roleaccountd.staging/<process>` shapes
+  remain suspicious and exact STIX indicators are unchanged; nested
+  `exec/<id>.xpc/...` system paths receive only the ordinary unusual-location
+  note. This removes a false positive reproduced on a clean iOS 26.5.2 capture.
+- Crash timestamps are compared as offset-aware instants when choosing report
+  device metadata; nullable source metadata renders as unavailable instead of
+  `null`; and the report schema is included in the offline service-worker shell.
+- The release harness passes on two private iOS 26.5.2 captures and EC-DIGIT-
+  CSIRC's public iOS 15 capture with all artifacts parsed, all bundled indicator
+  sets loaded, and zero match or suspicious findings.
+
 ## v0.7.2 - 2026-07-09
 
 Integrity fixes from the post-v0.7.1 audit: four inputs that could read

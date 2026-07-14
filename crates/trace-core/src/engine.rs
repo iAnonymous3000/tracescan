@@ -225,7 +225,7 @@ impl Engine {
                 ArtifactKind::CrashLog => {
                     let (a, d) = crash_log::analyze(&f.path, &text, &self.db, &mut findings);
                     artifacts.push(a);
-                    // Prefer the newest crash: an old crash log can predate
+                    // Prefer the newest .ips report: an old report can predate
                     // an OS upgrade and misstate the capture-time OS.
                     if let Some(d) = d {
                         if device
@@ -294,7 +294,7 @@ impl Engine {
         if !found.contains(&ArtifactKind::CrashLog) {
             missing_artifacts.push(MissingArtifact {
                 kind: "crash_log".into(),
-                note: "No crash logs were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into(),
+                note: "No crash or diagnostic .ips reports were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into(),
             });
         }
         if !found.contains(&ArtifactKind::PsListing) {
@@ -356,6 +356,21 @@ impl Engine {
                 "{partial_ps} process listing file(s) contained rows that could not be parsed; those processes were not checked."
             ));
         }
+        if found.contains(&ArtifactKind::PsListing)
+            && unparsed_ps == 0
+            && partial_ps == 0
+            && artifacts
+                .iter()
+                .filter(|a| a.kind == "ps_listing" && a.status == "parsed")
+                .map(|a| a.details["processes"].as_u64().unwrap_or(0))
+                .sum::<u64>()
+                == 0
+        {
+            scan_limits.push(
+                "The process listings parsed but contained no process rows, so running processes could not be checked."
+                    .into(),
+            );
+        }
         let unparsed_shutdown = artifacts
             .iter()
             .filter(|a| a.kind == "shutdown_log" && a.status == "unparsed")
@@ -371,7 +386,7 @@ impl Engine {
             .count();
         if partial_crashes > 0 {
             scan_limits.push(format!(
-                "{partial_crashes} crash log file(s) could not be fully parsed; parts of their contents were not checked against indicators."
+                "{partial_crashes} crash or diagnostic .ips file(s) could not be fully parsed; parts of their contents were not checked against indicators."
             ));
         }
         if let Some(seen) = unified_unresolved {
@@ -498,8 +513,7 @@ impl Engine {
             examined.push("shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots");
         }
         if found.contains(&ArtifactKind::CrashLog) {
-            examined
-                .push("Crash logs (crashes_and_spins/*.ips) - crashing process names and paths");
+            examined.push("iOS crash and diagnostic reports (crashes_and_spins/*.ips) - target process names/paths and process inventories where the format contains them");
         }
         if found.contains(&ArtifactKind::PsListing) {
             examined.push(
@@ -729,7 +743,10 @@ mod tests {
         engine.push(&tar).unwrap();
         let report = engine.finish().unwrap();
         assert_eq!(report.verdict, Verdict::Inconclusive);
-        assert!(report.scan_limits.iter().any(|l| l.contains("crash log")));
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|l| l.contains("diagnostic .ips")));
     }
 
     #[test]
@@ -895,6 +912,68 @@ mod tests {
     }
 
     #[test]
+    fn ps_thread_without_full_command_column_is_never_clear() {
+        let ps_thread = b"USER   PID COMMAND\nroot     1 /sbin/launchd\n";
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry("sysdiagnose_t/ps_thread.txt", ps_thread));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "unparsed");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("process listing")));
+    }
+
+    #[test]
+    fn parsed_ps_txt_covers_header_only_ps_thread() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER PID COMMAND\nroot   1 /sbin/launchd\n",
+        ));
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps_thread.txt",
+            b"USER PID COMMAND PPID TIME COMMAND\n",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Clear);
+        assert!(report.scan_limits.is_empty());
+        assert_eq!(report.artifacts[0].status, "parsed");
+        assert_eq!(report.artifacts[1].status, "parsed");
+        assert_eq!(report.artifacts[1].details["processes"], 0);
+    }
+
+    #[test]
+    fn header_only_ps_thread_cannot_be_the_only_process_inventory() {
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/ps_thread.txt",
+            b"USER PID COMMAND PPID TIME COMMAND\n",
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("no process rows")));
+    }
+
+    #[test]
     fn artifacts_with_no_loaded_indicators_are_never_clear() {
         // "No known spyware traces found" with zero indicators loaded would
         // be vacuously true. The browser always loads the bundled sets;
@@ -954,7 +1033,102 @@ this body is not json"#,
         let report = engine.finish().unwrap();
         assert_eq!(report.artifacts[0].status, "parsed_partial");
         assert_eq!(report.verdict, Verdict::Inconclusive);
-        assert!(report.scan_limits.iter().any(|l| l.contains("crash log")));
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|l| l.contains("diagnostic .ips")));
+    }
+
+    #[test]
+    fn ips_inventory_reaches_the_engine_verdict() {
+        let jetsam = br#"{"bug_type":"298"}
+{"processes":[{"name":"launchd","pid":1},{"name":"bh","pid":2143}]}"#;
+        let siri = br#"{"bug_type":"313"}
+{"agent":"opaque","country_code":"US","session_start":123,"user_guid":"opaque"}"#;
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/JetsamEvent-2026.ips",
+            jetsam,
+        ));
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/SiriSearchFeedback-2026.ips",
+            siri,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Match);
+        assert!(report
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.status == "parsed"));
+        assert!(report.scan_limits.is_empty());
+        assert!(report.findings.iter().any(|finding| {
+            finding.severity == Severity::Match && finding.evidence["pid"] == 2143
+        }));
+    }
+
+    #[test]
+    fn malformed_ips_inventory_is_never_clear() {
+        let jetsam = br#"{"bug_type":"298"}
+{"processes":[{"name":"launchd","pid":1},{"pid":2143}]}"#;
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/JetsamEvent-2026.ips",
+            jetsam,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("diagnostic .ips")));
+    }
+
+    #[test]
+    fn partial_disk_writes_report_keeps_match_and_scan_limit() {
+        let report = br#"{"app_name":"bh","name":"bh","bug_type":"145"}
+Report Version: malformed
+Command: bh
+Path: /private/var/db/com.apple.xpc.roleaccountd.staging/bh
+PID: 2143
+Event: disk writes
+Steps: 20
+"#;
+        let mut a = Vec::new();
+        a.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/bh.diskwrites_resource-2026.ips",
+            report,
+        ));
+        let tar = test_util::finish(a);
+        let mut engine = Engine::new();
+        engine
+            .load_stix(
+                "path-ioc",
+                r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/db/com.apple.xpc.roleaccountd.staging/bh']"}]}"#,
+            )
+            .unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.verdict, Verdict::Match);
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("diagnostic .ips")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Match));
     }
 
     #[test]

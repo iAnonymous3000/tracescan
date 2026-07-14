@@ -172,7 +172,7 @@ impl ArtifactSummary {
 pub struct DeviceInfo {
     pub os_version: String,
     pub source: String,
-    /// Timestamp of the crash log the OS version came from. A crash can
+    /// Timestamp of the .ips report the OS version came from. A report can
     /// predate an OS upgrade, so the engine prefers the newest one; keeping
     /// the timestamp in the report makes that provenance checkable.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -17,8 +17,26 @@ pub enum PathFlag {
 }
 
 pub fn path_flag(path: &str) -> Option<PathFlag> {
-    if path.contains("/com.apple.xpc.roleaccountd.staging/") {
-        return Some(PathFlag::Staging);
+    const ROLEACCOUNT_STAGING: &str = "/private/var/db/com.apple.xpc.roleaccountd.staging/";
+    if let Some(relative) = path.strip_prefix(ROLEACCOUNT_STAGING) {
+        let relative = relative.trim_end_matches('/');
+        // Published Pegasus/KingSpawn examples execute as a direct child of
+        // roleaccountd.staging (for example `rolexd`, `bh`, `subridged`).
+        // iOS itself legitimately uses the specifically observed
+        // exec/<id>.xpc/... workspace shape here. Keep every other descendant
+        // suspicious; exempting arbitrary nested paths would create a bypass.
+        let is_apple_exec_workspace = relative
+            .strip_prefix("exec/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(workspace, executable)| {
+                workspace
+                    .strip_suffix(".xpc")
+                    .is_some_and(|id| !id.is_empty())
+                    && !executable.is_empty()
+            });
+        if !relative.is_empty() && !is_apple_exec_workspace {
+            return Some(PathFlag::Staging);
+        }
     }
     if path.starts_with("/private/var/db/")
         || path.starts_with("/private/var/tmp/")
@@ -67,6 +85,18 @@ mod tests {
         assert_eq!(
             path_flag("/private/var/db/com.apple.xpc.roleaccountd.staging/bh"),
             Some(PathFlag::Staging)
+        );
+        assert_eq!(
+            path_flag(
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/com.apple.NRD.UpdateBrainService"
+            ),
+            Some(PathFlag::UnusualLocation),
+            "Apple's nested role-account execution workspace is not the published direct-child Pegasus shape"
+        );
+        assert_eq!(
+            path_flag("/private/var/db/com.apple.xpc.roleaccountd.staging/drop/bh"),
+            Some(PathFlag::Staging),
+            "arbitrary nested staging paths must remain suspicious"
         );
         assert_eq!(
             path_flag("/private/var/tmp/agent"),

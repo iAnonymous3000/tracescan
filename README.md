@@ -19,7 +19,7 @@ The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar →
 | Artifact | Signal |
 |---|---|
 | `system_logs.logarchive/Extra/shutdown.log` (rotated `shutdown.0.log` on iOS 26) | Processes that delayed shutdown, per reboot - the [iShutdown](https://github.com/KasperskyLab/iShutdown) technique; Pegasus artifacts run from `roleaccountd.staging` |
-| `crashes_and_spins/*.ips` | Crashing process names/paths vs. process indicators |
+| `crashes_and_spins/*.ips` | Crash and diagnostic reports: target process names/paths and complete process inventories where the format contains them |
 | `ps.txt`, `ps_thread.txt` | Processes running at capture time vs. process indicators |
 | `system_logs.logarchive` tracev3 + uuidtext | Every process that wrote a unified-log entry during the archive window (typically days of history), via [Mandiant's parser](https://github.com/mandiant/macos-UnifiedLogs) at catalog level - process inventory only, log messages are never rendered, and each file is reduced and dropped so memory stays flat |
 
