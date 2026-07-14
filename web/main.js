@@ -1,4 +1,5 @@
 import init, { Scanner } from './pkg/trace_core.js';
+import { readableReportDocument, readableReportFragment } from './readable-report.js';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -7,6 +8,7 @@ const state = {
   scanner: null,     // pre-warmed Scanner with indicators loaded
   ready: null,       // resolves once WASM + indicators are loaded
   lastReport: null,
+  readableReport: null, // report snapshot currently owned by the readable-export dialog
   lastScanVia: null, // 'worker' | 'inline'
   scanning: false,   // a scan is in flight; new files are ignored until done
 };
@@ -61,6 +63,10 @@ function showSection(name) {
 // Returning from results, keyboard focus lands on the next action instead
 // of being lost on the removed button.
 function backToLanding() {
+  // Results can contain sensitive case metadata. Once the person leaves the
+  // result view, do not retain an exportable report behind the landing page.
+  state.lastReport = null;
+  $('#results').replaceChildren();
   showSection('landing');
   $('#dropzone').focus();
 }
@@ -301,6 +307,18 @@ async function handleFile(file) {
   // demo button, scripted calls) must not interleave results.
   if (state.scanning) return;
   state.scanning = true;
+  // A modal preview must never remain visible over a different scan. Its
+  // close handler also releases the report snapshot owned by that dialog.
+  const readableDialog = $('#readable-dialog');
+  if (readableDialog?.open) readableDialog.close();
+  // The previous report no longer owns the results screen once a new scan
+  // starts. Clearing it prevents an error from leaving stale provenance in
+  // state even though no report is being shown.
+  state.lastReport = null;
+  // Results may contain sensitive case data and event listeners that close
+  // over it. Remove the old tree immediately rather than retaining it, hidden,
+  // for the duration of a new scan.
+  $('#results').replaceChildren();
   showSection('scanning');
   updateProgress(0, file.size);
   try {
@@ -320,7 +338,6 @@ async function handleFile(file) {
     }
     // Schema v3: the report arrives complete from Rust - no fields are
     // appended here. What the UI renders is exactly what exports.
-    state.lastReport = report;
     renderReport(report);
   } catch (err) {
     renderError(err);
@@ -361,7 +378,7 @@ function verdictHtml(report) {
   const noteCount = report.findings.filter((f) => f.severity === 'note').length;
   const limits = report.scan_limits || [];
   const limitNote = limits.length
-    ? `<p><strong>Note: this scan was incomplete.</strong> The archive hit safety limits and parts of it were not analyzed (details under "Scan limits reached" below).</p>`
+    ? `<p><strong>Note: processing or reporting was incomplete.</strong> Read each item under "Scan limits reached" below: some evidence may not have been analyzed, or some findings may not have been retained.</p>`
     : '';
   if (v === 'match') {
     return `<div class="verdict match">
@@ -382,7 +399,7 @@ function verdictHtml(report) {
   if (v === 'inconclusive') {
     return `<div class="verdict inconclusive">
       <h2>Scan incomplete - result inconclusive</h2>
-      <p>This archive could not be fully analyzed, so <strong>no verdict can be given</strong>. Nothing matched in the parts that were read, but a partial scan must not be presented as "no traces found".</p>
+      <p>This scan did not complete without processing or reporting limits, so <strong>no conclusive negative result can be given</strong>. Nothing matched in the retained result, but a limited scan must not be presented as "no traces found".</p>
       <ul>${limits.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>
       <p>This is unusual: a real sysdiagnose never comes close to these limits. Try capturing and scanning a fresh sysdiagnose. If this happens again, contact <a href="https://www.accessnow.org/help/" target="_blank" rel="noopener noreferrer">Access Now's helpline</a> (free, confidential) and mention the file could not be scanned.</p>
     </div>`;
@@ -458,7 +475,7 @@ function artifactsHtml(report) {
       <td>${esc(m.note)}</td>
     </tr>`).join('');
   return `<div class="panel"><h2>What was examined (${report.artifacts.length} artifacts, ${report.stats.archive_entries} files in archive)</h2>
-    <div class="table-scroll"><table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
+    <div class="table-scroll" role="region" aria-label="Examined artifacts" tabindex="0"><table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
     <tbody>${rows}${missingRows}</tbody></table></div></div>`;
 }
 
@@ -468,7 +485,7 @@ function limitsHtml(report) {
   if (!limits.length || verdictOf(report) === 'inconclusive') return '';
   return `<div class="panel"><h2>Scan limits reached</h2>
     <ul>${limits.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>
-    <p class="fine">Parts of the archive were not analyzed. A real sysdiagnose never comes close to these limits; findings above are unaffected, but absence of further findings is not meaningful for the unanalyzed parts.</p>
+    <p class="fine">Processing or reporting was limited. Depending on the item, some archive evidence may not have been analyzed or some findings may not have been retained. Do not infer absence from material that was not processed or retained.</p>
   </div>`;
 }
 
@@ -495,7 +512,32 @@ function provenanceHtml(report) {
     <p class="fine">Scans use only reviewed snapshot indicators; the hash identifies the exact revision this scan used and is recorded in the exported report. Public indicators inherit a time lag: new campaigns appear here only after researchers publish them and the snapshots are reviewed. A scan can only be as current as the open ecosystem.</p></div>`;
 }
 
+// Add safe line-break opportunities without changing the text a user copies.
+// The report schema constrains this to 64 lowercase hex characters, but each
+// chunk is still escaped because renderReport is also a browser-test seam.
+function breakableHashHtml(hash) {
+  const chunks = [];
+  for (let i = 0; i < hash.length; i += 8) {
+    chunks.push(esc(hash.slice(i, i + 8)));
+  }
+  return chunks.join('<wbr>');
+}
+
+function sourceHashHtml(source) {
+  if (typeof source.sha256 !== 'string' || !source.sha256) return '';
+  return `<p class="fine" id="source-sha256-row">
+    <strong>Archive SHA-256:</strong>
+    <code id="source-sha256">${breakableHashHtml(source.sha256)}</code>
+    <button type="button" class="linklike" id="copy-source-sha256">Copy hash</button>
+    <span id="copy-source-sha256-status" role="status" aria-live="polite"></span><br>
+    This identifies the exact archive bytes Trace analyzed.
+  </p>`;
+}
+
 function renderReport(report) {
+  // The report displayed on screen is the report the export controls own.
+  // Keep this binding here so no caller can render A while exporting B.
+  state.lastReport = report;
   const source = report.source_file || {};
   const sourceName = source.name == null || source.name === ''
     ? 'Unknown source file'
@@ -504,19 +546,35 @@ function renderReport(report) {
   const device = report.device
     ? `<p class="fine">Device: ${esc(report.device.os_version)} (from ${esc(report.device.source)}) · file: ${sourceLabel}</p>`
     : `<p class="fine">File: ${sourceLabel}</p>`;
+  const sourceHash = sourceHashHtml(source);
   $('#results').innerHTML =
     verdictHtml(report) +
     device +
+    sourceHash +
     findingsHtml(report) +
     limitsHtml(report) +
     artifactsHtml(report) +
     coverageHtml(report) +
     provenanceHtml(report) +
     `<div class="actions">
-      <button class="btn" id="export-btn">Export report (JSON)</button>
+      <button class="btn" id="readable-btn">Prepare readable report</button>
+      <button class="btn secondary" id="export-btn">Export technical report (JSON)</button>
       <button class="btn secondary" id="rescan-btn">Scan another file</button>
     </div>
-    <p class="fine">The exported report contains scan results and device metadata only - never the archive itself. Share it with a helpline to speed up triage.</p>`;
+    <p class="fine">The readable HTML export previews privacy redactions before download. The JSON report preserves the complete technical record. Neither contains the archive itself.</p>`;
+  const copyHash = $('#copy-source-sha256');
+  if (copyHash) {
+    copyHash.addEventListener('click', async () => {
+      const status = $('#copy-source-sha256-status');
+      try {
+        await navigator.clipboard.writeText(source.sha256);
+        status.textContent = ' Hash copied.';
+      } catch {
+        status.textContent = ' Could not copy; select the hash above.';
+      }
+    });
+  }
+  $('#readable-btn').addEventListener('click', openReadableDialog);
   $('#export-btn').addEventListener('click', exportReport);
   $('#rescan-btn').addEventListener('click', backToLanding);
   showSection('results');
@@ -525,6 +583,7 @@ function renderReport(report) {
 }
 
 function renderError(err) {
+  state.lastReport = null;
   $('#results').innerHTML = `<div class="error-box" role="alert">
     <h2>Couldn't scan that file</h2>
     <p>${esc(err?.message || err)}</p>
@@ -547,6 +606,48 @@ function exportReport() {
   a.download = `trace-report-${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   // Revoking synchronously can cancel the download in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+function readableOptions() {
+  return {
+    includeSourceName: $('#readable-source-name').checked,
+    includeDevice: $('#readable-device').checked,
+    includeTechnical: $('#readable-technical').checked,
+  };
+}
+
+function updateReadablePreview() {
+  if (!state.readableReport) return;
+  $('#readable-preview').innerHTML = readableReportFragment(
+    state.readableReport,
+    readableOptions()
+  );
+}
+
+function openReadableDialog() {
+  if (!state.lastReport) return;
+  // Bind the preview and every later download action to this exact report.
+  // A new scan replaces state.lastReport; it must never change what an open
+  // handoff dialog exports underneath the person reviewing it.
+  state.readableReport = state.lastReport;
+  for (const id of ['readable-source-name', 'readable-device', 'readable-technical']) {
+    $('#' + id).checked = false;
+  }
+  updateReadablePreview();
+  const dialog = $('#readable-dialog');
+  if (!dialog.open) dialog.showModal();
+}
+
+function downloadReadableReport() {
+  if (!state.readableReport) return;
+  const documentText = readableReportDocument(state.readableReport, readableOptions());
+  const blob = new Blob([documentText], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `trace-readable-report-${new Date().toISOString().slice(0, 10)}.html`;
+  a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
@@ -579,13 +680,27 @@ function wireUi() {
   document.addEventListener('drop', (e) => {
     e.preventDefault();
     const file = e.dataTransfer?.files?.[0];
-    if (file && $('#scanning').hidden) handleFile(file);
+    // Native dialogs make the page inert, but a bubbled drop still reaches
+    // this document listener. Ignore it: starting a hidden background scan
+    // beneath a report preview can bind the person's handoff to the wrong file.
+    if (file && $('#scanning').hidden && !$('dialog[open]')) handleFile(file);
   });
 
   const dialog = $('#prove-dialog');
   $('#prove-it').addEventListener('click', () => dialog.showModal());
   dialog.addEventListener('click', (e) => {
     if (e.target === dialog) dialog.close();
+  });
+
+  const readableDialog = $('#readable-dialog');
+  $('#readable-options').addEventListener('change', updateReadablePreview);
+  $('#download-readable').addEventListener('click', downloadReadableReport);
+  $('#close-readable').addEventListener('click', () => readableDialog.close());
+  // Close only through Cancel or Escape. Treating any click on dialog padding
+  // as a backdrop click loses redaction choices and preview position.
+  readableDialog.addEventListener('close', () => {
+    state.readableReport = null;
+    $('#readable-preview').replaceChildren();
   });
 
   // A failed fixture fetch must surface, not die as a silent rejection
@@ -608,8 +723,8 @@ function wireUi() {
     const off = !navigator.onLine;
     $('#offline-dot').classList.toggle('offline', off);
     $('#privacy-text').textContent = off
-      ? 'You are offline - and scanning still works. That is the proof: nothing here depends on a server.'
-      : 'Analysis runs entirely in this browser tab. There is no upload - no server ever sees your file.';
+      ? 'You are offline, and scanning still works. This demonstrates that the loaded app has no scan-time server dependency; it does not authenticate code already loaded.'
+      : 'Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes.';
   };
   window.addEventListener('online', setOnlineState);
   window.addEventListener('offline', setOnlineState);

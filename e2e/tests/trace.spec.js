@@ -38,6 +38,16 @@ const buildTarInPage = ([entryCount]) => {
   window.__trace.handleFile(new File(parts, 'sysdiagnose_hostile.tar'));
 };
 
+test('pre-scan safety guidance discloses observable use and the iCloud trade-off', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.safety-note')).toContainText('browser, router, or DNS records');
+  await expect(page.locator('.safety-note')).toContainText('Private browsing does not hide network traffic');
+  await expect(page.locator('.safety-note')).toContainText("Access Now's Digital Security Helpline");
+  await page.locator('#capture-guide').evaluate((guide) => { guide.open = true; });
+  await expect(page.locator('#capture-guide')).toContainText('uploads the archive to your iCloud account');
+  await expect(page.locator('#capture-guide')).toContainText('phone-only scan');
+});
+
 test('clean demo produces the clear verdict', async ({ page }) => {
   await page.goto('/');
   await page.click('#demo-clean');
@@ -58,6 +68,265 @@ test('infected demo produces the match verdict with helplines', async ({ page })
   await expect(artifacts.filter({ hasText: '.ips' })).toHaveCount(1);
   await expect(artifacts.filter({ hasText: 'ps.txt' })).toHaveCount(1);
   await expect(artifacts.filter({ hasText: 'shutdown.0.log' })).toHaveCount(1);
+});
+
+test('results show and copy the engine-owned archive SHA-256', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (value) => { window.__traceCopiedText = value; },
+      },
+    });
+  });
+  await page.goto('/');
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+
+  const reportHash = await page.evaluate(() => window.__trace.lastReport.source_file.sha256);
+  expect(reportHash).toMatch(/^[0-9a-f]{64}$/);
+  await expect(page.locator('#source-sha256')).toBeVisible();
+  await expect(page.locator('#source-sha256')).toHaveText(reportHash);
+  await expect(page.locator('#source-sha256-row')).toContainText(
+    'exact archive bytes Trace analyzed'
+  );
+
+  await page.click('#copy-source-sha256');
+  await expect.poll(() => page.evaluate(() => window.__traceCopiedText)).toBe(reportHash);
+  await expect(page.locator('#copy-source-sha256-status')).toHaveText('Hash copied.');
+});
+
+test('archive SHA-256 is absent without a current report and after a later error', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#source-sha256')).toHaveCount(0);
+
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('#source-sha256')).toBeVisible();
+
+  await page.click('#rescan-btn');
+  await expect(page.locator('#source-sha256')).toBeHidden();
+  await page.evaluate(() => {
+    window.__trace.disableWorker();
+    const broken = new File(['not read'], 'sysdiagnose_unreadable.tar');
+    Object.defineProperty(broken, 'stream', {
+      value: () => { throw new Error('forced read failure'); },
+    });
+    window.__trace.handleFile(broken);
+  });
+  await expect(page.locator('.error-box')).toContainText('forced read failure');
+  await expect(page.locator('#source-sha256')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
+});
+
+test('starting a new scan immediately removes the previous case-data DOM', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  expect(await page.locator('#results').evaluate((node) => node.childElementCount)).toBeGreaterThan(0);
+
+  const state = await page.evaluate(() => {
+    // Do not await: inspect the synchronous privacy cleanup before the scan's
+    // first awaited operation resumes.
+    window.__trace.handleFile(new File(['not an archive'], 'next-case.tar'));
+    return {
+      resultChildren: document.querySelector('#results').childElementCount,
+      resultsHidden: document.querySelector('#results').hidden,
+      scanningVisible: !document.querySelector('#scanning').hidden,
+      report: window.__trace.lastReport,
+    };
+  });
+  expect(state).toEqual({
+    resultChildren: 0,
+    resultsHidden: true,
+    scanningVisible: true,
+    report: null,
+  });
+});
+
+test('readable report previews redactions and downloads self-contained HTML', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  const identity = await page.evaluate(() => ({
+    hash: window.__trace.lastReport.source_file.sha256,
+    name: window.__trace.lastReport.source_file.name,
+    artifact: window.__trace.lastReport.findings[0].artifact,
+  }));
+
+  await page.click('#readable-btn');
+  await expect(page.locator('#readable-dialog')).toBeVisible();
+  await expect(page.locator('#readable-dialog')).toHaveAttribute(
+    'aria-describedby',
+    'readable-dialog-description'
+  );
+  const preview = page.locator('#readable-preview');
+  await expect(preview).toContainText(identity.hash);
+  await expect(preview).toContainText('redacted from this readable copy');
+  await expect(preview).not.toContainText(identity.name);
+  await expect(preview).not.toContainText(identity.artifact);
+  await expect(preview.locator('summary', { hasText: 'Technical evidence' })).toHaveCount(0);
+
+  await page.check('#readable-source-name');
+  await page.check('#readable-technical');
+  await expect(preview).toContainText(identity.name);
+  await expect(preview).toContainText(identity.artifact);
+  await expect(preview.locator('summary', { hasText: 'Technical evidence' }).first()).toBeVisible();
+  await expect(preview.locator('.finding h3').first()).toHaveText('Finding 1: match');
+  await expect(preview.locator('.finding').first()).toHaveAttribute(
+    'aria-labelledby',
+    'readable-finding-1'
+  );
+  await expect(preview.locator('summary').first()).toHaveText('Technical evidence for finding 1');
+  await page.setViewportSize({ width: 320, height: 568 });
+  const evidenceWidth = await preview.locator('pre').first().evaluate((node) => ({
+    client: node.clientWidth,
+    scroll: node.scrollWidth,
+  }));
+  expect(evidenceWidth.scroll).toBeLessThanOrEqual(evidenceWidth.client + 1);
+
+  // Return to privacy-preserving defaults before creating the handoff copy.
+  await page.uncheck('#readable-source-name');
+  await page.uncheck('#readable-technical');
+  const downloadPromise = page.waitForEvent('download');
+  await page.click('#download-readable');
+  const download = await downloadPromise;
+  const html = fs.readFileSync(await download.path(), 'utf8');
+  expect(html).toContain('<!doctype html>');
+  expect(html).toContain(identity.hash);
+  expect(html).not.toContain(identity.name);
+  expect(html).not.toContain(identity.artifact);
+  expect(html).not.toContain('<script');
+  expect(html).toContain('not digitally signed');
+  expect(html).toContain('redacted from this readable copy');
+  expect(html).toContain('This readable HTML is a reduced convenience copy');
+  expect(html).toContain('.verification a::after');
+  expect(html).toContain('attr(href)');
+});
+
+test('readable report labels unpinned references and surfaces result limits early', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  const result = await page.evaluate(async () => {
+    const report = structuredClone(window.__trace.lastReport);
+    report.tool.build_commit = null;
+    report.tool.version = '0.7.3';
+    report.scan_limits = ['finding retention cap reached'];
+    report.missing_artifacts = [
+      { kind: 'shutdown_logs' },
+      { kind: 'crash_reports' },
+      { kind: 'unified_logs' },
+    ];
+    const { readableReportDocument } = await import('./readable-report.js');
+    const parsed = new DOMParser().parseFromString(
+      readableReportDocument(report),
+      'text/html'
+    );
+    const links = [...parsed.querySelectorAll('.verification a')].map((link) => ({
+      text: link.textContent,
+      href: link.getAttribute('href'),
+    }));
+    const pinnedReport = structuredClone(report);
+    pinnedReport.tool.build_commit = 'a'.repeat(40);
+    const pinned = new DOMParser().parseFromString(
+      readableReportDocument(pinnedReport),
+      'text/html'
+    );
+    return {
+      header: parsed.querySelector('header').textContent,
+      verification: parsed.querySelector('.verification').textContent,
+      links,
+      pinnedVerification: pinned.querySelector('.verification').textContent,
+    };
+  });
+  expect(result.header).toContain('Processing or reporting was incomplete');
+  expect(result.header).toContain('3 of Trace\'s 4 supported artifact families were absent');
+  expect(result.verification).toContain('exact reproduction is impossible');
+  expect(result.pinnedVerification).toContain(
+    "compare the two JSON technical reports' source hash and size"
+  );
+  expect(result.links[0]).toEqual({
+    text: 'Current responder guide (not revision-pinned)',
+    href: 'https://github.com/iAnonymous3000/tracescan/blob/main/HELPLINE.md',
+  });
+  expect(result.links[1]).toEqual({
+    text: 'Version-tag machine-readable contract (v0.7.3)',
+    href: 'https://github.com/iAnonymous3000/tracescan/blob/v0.7.3/web/report.schema.json',
+  });
+});
+
+test('readable report choices survive a click on dialog padding', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  await page.click('#readable-btn');
+  await page.check('#readable-source-name');
+  await page.evaluate(() => {
+    const dialog = document.querySelector('#readable-dialog');
+    dialog.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+  await expect(page.locator('#readable-dialog')).toBeVisible();
+  await expect(page.locator('#readable-source-name')).toBeChecked();
+});
+
+test('readable report escapes report-controlled text', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  const result = await page.evaluate(async () => {
+    const report = structuredClone(window.__trace.lastReport);
+    const payload = '<img src=x onerror="window.__traceReadableXss = true">';
+    report.source_file.name = payload;
+    report.findings[0].summary = payload;
+    report.findings[0].artifact = payload;
+    report.findings[0].evidence = { payload };
+    const { readableReportDocument } = await import('./readable-report.js');
+    const html = readableReportDocument(report, {
+      includeSourceName: true,
+      includeDevice: true,
+      includeTechnical: true,
+    });
+    const parsed = new DOMParser().parseFromString(html, 'text/html');
+    return {
+      images: parsed.querySelectorAll('img').length,
+      scripts: parsed.querySelectorAll('script').length,
+      literalPayloads: (parsed.body.textContent.match(/<img src=x/g) || []).length,
+      hasRestrictiveCsp: html.includes("default-src 'none'"),
+    };
+  });
+  expect(result.images).toBe(0);
+  expect(result.scripts).toBe(0);
+  expect(result.literalPayloads).toBeGreaterThanOrEqual(4);
+  expect(result.hasRestrictiveCsp).toBe(true);
+  expect(await page.evaluate(() => window.__traceReadableXss)).toBeUndefined();
+});
+
+test('a drop over the readable preview cannot replace the report being handed off', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-infected');
+  await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+  const infectedHash = await page.evaluate(() => window.__trace.lastReport.source_file.sha256);
+  await page.click('#readable-btn');
+  await expect(page.locator('#readable-preview')).toContainText(infectedHash);
+
+  await page.evaluate(async () => {
+    const clean = await (await fetch('./fixtures/sysdiagnose_demo_clean.tar.gz')).blob();
+    const dt = new DataTransfer();
+    dt.items.add(new File([clean], 'sysdiagnose_demo_clean.tar.gz'));
+    document.querySelector('#readable-dialog').dispatchEvent(
+      new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt })
+    );
+  });
+
+  await expect(page.locator('#readable-dialog')).toBeVisible();
+  expect(await page.evaluate(() => window.__trace.lastReport.source_file.sha256)).toBe(infectedHash);
+  const downloadPromise = page.waitForEvent('download');
+  await page.click('#download-readable');
+  const download = await downloadPromise;
+  const html = fs.readFileSync(await download.path(), 'utf8');
+  expect(html).toContain(infectedHash);
+  expect(html).toContain('Traces matching known spyware were found');
 });
 
 test('exported report records indicator provenance', async ({ page }) => {
@@ -82,7 +351,7 @@ test('an archive that trips scan limits is reported as inconclusive', async ({ p
   await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
   await page.evaluate(buildTarInPage, [4100]);
   await expect(page.locator('.verdict.inconclusive')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('.verdict.inconclusive')).toContainText('no verdict can be given');
+  await expect(page.locator('.verdict.inconclusive')).toContainText('no conclusive negative result can be given');
 });
 
 test('dropping a file anywhere on the page scans it instead of navigating away', async ({ page }) => {
@@ -133,7 +402,7 @@ test('an archive whose ps.txt cannot be parsed is inconclusive, never clear', as
     ));
   });
   await expect(page.locator('.verdict.inconclusive')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('.verdict.inconclusive')).toContainText('no verdict can be given');
+  await expect(page.locator('.verdict.inconclusive')).toContainText('no conclusive negative result can be given');
   await expect(page.locator('.verdict.inconclusive')).toContainText('process listing');
 });
 
@@ -299,9 +568,7 @@ test.describe('worker failure boundaries', () => {
     await page.click('#demo-clean');
     await expect(page.locator('.error-box')).toContainText('scan rejected');
     await page.click('#rescan-btn');
-    // Returning to the landing page hides #results but leaves the first
-    // error box in its DOM; waiting on visibility (not text presence) keys
-    // the assertion to the second scan's render, not the stale markup.
+    // Returning to the landing page clears the prior case-data DOM.
     await expect(page.locator('#results')).toBeHidden();
     await page.click('#demo-clean');
     await expect(page.locator('#results')).toBeVisible();
@@ -354,7 +621,7 @@ test.describe('worker failure boundaries', () => {
 
     // The failed state is terminal for this page: another user action must
     // not dispatch to the dead worker or silently switch to inline scanning.
-    // Same stale-DOM discipline as above: key on #results re-rendering.
+    // The previous error DOM is cleared before the next scan begins.
     await page.click('#rescan-btn');
     await expect(page.locator('#results')).toBeHidden();
     await page.click('#demo-clean');

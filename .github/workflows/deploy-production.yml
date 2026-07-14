@@ -2,27 +2,16 @@ name: Deploy production
 
 # CI-gated production deploys: builds the exact commit CI validated and
 # uploads it to Cloudflare Pages as one immutable artifact, then verifies
-# what production actually serves. This closes the race where the Pages
-# git integration builds a push to main before (or despite) CI.
+# selected invariants of what production serves. This closes the race where
+# the Pages git integration builds a push to main before (or despite) CI.
 #
-# Inert until the repository has the CLOUDFLARE_API_TOKEN and
-# CLOUDFLARE_ACCOUNT_ID secrets. Cutover:
-#   1. Create a Pages API token (Cloudflare dashboard -> My Profile ->
-#      API Tokens -> "Cloudflare Pages: Edit") and add both secrets
-#      (Settings -> Secrets and variables -> Actions).
-#   2. Confirm one green run of this workflow deploys successfully
-#      (rerun the latest run from the Actions tab; every step after
-#      preflight must execute, not skip).
-#   3. Stop Cloudflare's own builds so this workflow is the only
-#      production writer: Pages project -> Settings -> Builds ->
-#      Branch control -> disable automatic production deployments,
-#      and set preview branches to None. (Cloudflare's documented
-#      path for deploying via wrangler while keeping the repo linked.)
-#   4. Set the repository variable PRODUCTION_DEPLOY_REQUIRED to true
-#      (Settings -> Secrets and variables -> Actions -> Variables).
-#      From then on a missing or deleted secret fails this workflow
-#      loudly instead of green-skipping while production silently
-#      stops updating.
+# This is the active production path. Its external configuration invariants:
+#   1. CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets exist.
+#   2. PRODUCTION_DEPLOY_REQUIRED is true, so either secret disappearing fails.
+#   3. Cloudflare Pages automatic deployments are disabled while the repository
+#      may remain linked.
+# Re-check those settings after recreating the Pages project or changing the
+# repository/account connection; they cannot be enforced by this file alone.
 #
 # Deploys refuse to run unless the validated commit is still the tip of
 # main, checked once up front and again immediately before the upload:
@@ -153,10 +142,22 @@ jobs:
             sleep 15
           done
           [ "$live" = "trace-${HEAD_SHA}" ] || { echo "production still serves ${live:-unknown}"; exit 1; }
-          curl -fsSI "https://tracescan.pages.dev/" | grep -qi "^content-security-policy:"
+          headers=$(mktemp)
+          schema=$(mktemp)
+          trap 'rm -f "$headers" "$schema"' EXIT
+          curl -fsSI "https://tracescan.pages.dev/" > "$headers"
+          expected_csp=$(sed -n 's/^  Content-Security-Policy: //p' web/_headers)
+          [ -n "$expected_csp" ]
+          grep -Fqi "content-security-policy: ${expected_csp}" "$headers"
+          grep -Eqi '^cross-origin-opener-policy:[[:space:]]*same-origin([[:space:]]|$)' "$headers"
+          grep -Eqi '^x-content-type-options:[[:space:]]*nosniff([[:space:]]|$)' "$headers"
+          grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers"
           curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_clean.tar.gz"
           curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_infected.tar.gz"
           # The report schema must resolve at its declared $id, not fall
           # back to the SPA's index.html.
-          curl -fsS "https://tracescan.pages.dev/report.schema.json" | grep -q '"schema_version"'
+          curl -fsS "https://tracescan.pages.dev/report.schema.json" > "$schema"
+          jq -e --arg schema_id 'https://tracescan.pages.dev/report.schema.json' \
+            '.["$id"] == $schema_id and .properties.schema_version.const == 3' \
+            "$schema" > /dev/null
           echo "production verified at trace-${HEAD_SHA}"

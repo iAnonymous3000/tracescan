@@ -4,6 +4,29 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## Unreleased
+
+Responder-trust and operational-safety work. The report schema and engine-owned
+verdict semantics are unchanged.
+
+- Added a responder guide with a five-minute intake checklist, archive/report
+  hashing, schema and build checks, exact-commit semantic reproduction, field
+  interpretation, evidence-preservation guidance, and explicit unsigned-report
+  limits. Added a repository-scoped threat model covering the person, archive,
+  browser, parser, indicators, deployment, and responder handoff boundaries.
+- Added prominent pre-scan safety guidance: a visit, capture, transfer, and
+  download can be observable. The Windows guide now discloses that iCloud
+  stores another archive copy and can expose account activity, and phone-only
+  scanning is explicitly unvalidated.
+- Results now show and copy the engine-computed archive SHA-256. A new readable
+  HTML export previews privacy redactions, omits filename, device metadata, raw
+  evidence objects, and dedicated source-artifact fields by default, remains
+  printable without scripts or remote assets, and explains how responders
+  check report consistency by re-scanning.
+- Deployment documentation now reflects the completed CI-gated Cloudflare
+  cutover and its external configuration invariants instead of the retired
+  pre-CI git-integration path.
+
 ## v0.7.3 - 2026-07-13
 
 Fail-closed worker handling and real-capture parser coverage. Report schema v3

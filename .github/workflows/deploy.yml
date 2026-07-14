@@ -1,9 +1,10 @@
 name: Deploy Pages redirect
 
-# Production moved to Cloudflare Pages (https://tracescan.pages.dev), which
-# builds from main via its git integration and enforces web/_headers for
-# real (CSP, COOP, nosniff - GitHub Pages could never send them). This
-# workflow keeps the old GitHub Pages origin alive as a redirect only:
+# Production moved to Cloudflare Pages (https://tracescan.pages.dev), where the
+# CI-gated deploy-production workflow uploads the exact validated commit and
+# web/_headers is enforced for real (CSP, COOP, nosniff - GitHub Pages could
+# never send them). This workflow keeps the old GitHub Pages origin alive as a
+# redirect only:
 # returning visitors still have the old app cached by its service worker,
 # so redirect/sw.js ships a kill switch that clears those caches and
 # unregisters before sending them on. Leave this deployed indefinitely.

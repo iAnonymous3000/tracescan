@@ -3,6 +3,11 @@
 Trace parses untrusted archives in the browser and is used by people who may
 be at real risk. Bugs here can have consequences beyond broken software.
 
+The repository-scoped assets, trust boundaries, attacker stories, and severity
+calibration are documented in [THREAT_MODEL.md](THREAT_MODEL.md). Responder
+interpretation and report-verification guidance lives in
+[HELPLINE.md](HELPLINE.md).
+
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting on this repository

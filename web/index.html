@@ -27,24 +27,49 @@
 <div class="privacy-strip" id="privacy-strip">
   <div class="wrap">
     <span class="dot" id="offline-dot" aria-hidden="true"></span>
-    <span id="privacy-text">Analysis runs entirely in this browser tab. There is no upload - no server ever sees your file.</span>
-    <button class="linklike" id="prove-it">How can I verify that?</button>
+    <span id="privacy-text">Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes.</span>
+    <button class="linklike" id="prove-it">How can I check that?</button>
   </div>
 </div>
 
 <dialog id="prove-dialog">
-  <h2>Verify it yourself - no trust required</h2>
+  <h2>Check the local-processing claim</h2>
   <ol>
     <li>Load this page.</li>
     <li>Turn on <strong>Airplane Mode</strong> (or unplug your network).</li>
     <li>Run your scan. Everything still works, because the analysis is a WebAssembly program running inside this tab.</li>
   </ol>
-  <p>You can also open your browser's developer tools on the Network panel during a scan: the only requests this page ever makes are downloads of public indicator lists - your file is never in any request. The page's security policy (CSP) forbids connections to anywhere else.</p>
+  <p>An offline scan demonstrates that the loaded app has no scan-time server dependency. It does not authenticate code already loaded, erase records of the visit, or prove what a different build would do. You can also inspect the browser's Network panel during a particular scan and confirm that no request contains the archive; the intended app makes only site-resource and public-indicator requests allowed by its security policy.</p>
   <form method="dialog"><button class="btn">Close</button></form>
+</dialog>
+
+<dialog id="readable-dialog" class="report-dialog" aria-labelledby="readable-dialog-title" aria-describedby="readable-dialog-description">
+  <h2 id="readable-dialog-title">Prepare a responder-readable report</h2>
+  <p id="readable-dialog-description">The preview leaves the source filename, device metadata, raw evidence objects, and dedicated source-artifact fields out by default. Finding summaries remain and can name relevant processes or paths. The archive SHA-256 remains so a responder can compare this handoff with the archive bytes it identifies.</p>
+  <form id="readable-options">
+    <fieldset>
+      <legend>Include in this readable copy</legend>
+      <label><input type="checkbox" id="readable-source-name"> Source filename</label>
+      <label><input type="checkbox" id="readable-device"> Device metadata</label>
+      <label><input type="checkbox" id="readable-technical"> Raw evidence and dedicated source-artifact fields</label>
+    </fieldset>
+  </form>
+  <div class="actions">
+    <button type="button" class="btn" id="download-readable">Download HTML</button>
+    <button type="button" class="btn secondary" id="close-readable">Cancel</button>
+  </div>
+  <p class="fine">The downloaded file is self-contained and can be opened in a browser, printed, or saved as PDF. It contains no scripts or remote assets.</p>
+  <div id="readable-preview" class="report-preview" role="region" aria-label="Readable report preview" tabindex="0"></div>
 </dialog>
 
 <main class="wrap">
   <section id="landing">
+    <aside class="safety-note" aria-labelledby="safety-heading">
+      <h2 id="safety-heading">Before you scan: make sure this is safe for you</h2>
+      <p>If someone may control this iPhone, this computer, your network, or your cloud account, they may be able to notice parts of this process. Visiting Trace can leave browser, router, or DNS records; triggering a sysdiagnose happens on the phone itself; and transferring the archive through a cloud account stores a copy there. Private browsing does not hide network traffic.</p>
+      <p>If being noticed could put you at risk, use a trusted device and connection the other person cannot access, or contact <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's Digital Security Helpline</a> from a safer device before continuing. Leaving this page cannot erase records that already exist, so Trace does not present a quick-exit button as if it could.</p>
+    </aside>
+
     <div id="dropzone" tabindex="0" role="button" aria-label="Choose or drop a sysdiagnose archive to scan">
       <div class="dz-inner">
         <div class="dz-icon" aria-hidden="true">⇣</div>
@@ -60,13 +85,13 @@
     </p>
 
     <details class="guide" id="capture-guide">
-      <summary>How to capture a sysdiagnose on your iPhone (no computer skills needed)</summary>
+      <summary>How to capture a sysdiagnose on your iPhone (a computer is currently required)</summary>
       <ol>
         <li><strong>Trigger it:</strong> press and hold <em>both volume buttons and the side button together</em> for about 1 to 1.5 seconds, then release. You should feel a short vibration. If the power-off slider appears, you held too long: cancel and try a shorter press. If you felt no vibration, don't worry; continue with the next steps, and if no file appears, simply press the buttons again.</li>
         <li><strong>Wait 10 to 15 minutes.</strong> Your iPhone gathers diagnostics in the background; you can keep using it normally. Older phones take longer, so give it the full time before deciding it didn't work.</li>
         <li><strong>Find the file:</strong> open <em>Settings → Privacy &amp; Security → Analytics &amp; Improvements → Analytics Data</em>. The list is long and alphabetical: scroll near the bottom, past hundreds of routine entries, to the files starting with <code>sysdiagnose_</code>. The right one ends with the date and time you pressed the buttons. Tap it.</li>
-        <li><strong>Send it to your computer:</strong> tap the share icon in the top corner. On a Mac, AirDrop it and it will land in Downloads. On Windows, choose <em>Save to Files</em>, pick iCloud Drive, then download it from icloud.com on the computer. The file is large (usually 200 to 400 MB), so the transfer can take a few minutes.</li>
-        <li><strong>Drop it above.</strong> The analysis runs on your own computer and usually finishes in well under two minutes.</li>
+        <li><strong>Send it to your computer:</strong> tap the share icon in the top corner. On a Mac, AirDrop it and it will land in Downloads. On Windows, the simplest route is <em>Save to Files → iCloud Drive</em>, then downloading it from icloud.com. <strong>This uploads the archive to your iCloud account and may create account activity.</strong> Do not use that route if someone else may have access to the account; use a trusted Mac via AirDrop or ask a digital security helpline for a safer transfer plan. The file is large (usually 200 to 400 MB), so transfer can take a few minutes.</li>
+        <li><strong>Drop it above.</strong> The analysis runs on your own computer and usually finishes in well under two minutes. Scanning directly on an iPhone has not been validated, so Trace does not currently tell people to rely on a phone-only scan.</li>
       </ol>
     </details>
 
@@ -97,6 +122,7 @@
 <footer class="site-footer">
   <div class="wrap">
     <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener noreferrer">open source</a> and runs entirely on your device. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener noreferrer">AmnestyTech/investigations</a> and <a href="https://github.com/mvt-project/mvt-indicators" rel="noopener noreferrer">mvt-project/mvt-indicators</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener noreferrer">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener noreferrer">iShutdown</a> research.</p>
+    <p>For responders: <a href="https://github.com/iAnonymous3000/tracescan/blob/main/HELPLINE.md" rel="noopener noreferrer">understand and verify a Trace report</a>. Security model: <a href="https://github.com/iAnonymous3000/tracescan/blob/main/THREAT_MODEL.md" rel="noopener noreferrer">threats, trust boundaries, and residual risks</a>.</p>
     <p>If you believe you are in danger because of surveillance, contact <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's Digital Security Helpline</a>.</p>
   </div>
 </footer>
