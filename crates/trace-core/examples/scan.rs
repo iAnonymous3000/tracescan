@@ -27,6 +27,7 @@ fn main() {
         let meta = SetMeta {
             source: Some("local file".into()),
             url: Some(stix_path.clone()),
+            loaded_from: Some("local file".into()),
             ..Default::default()
         };
         let stats = engine

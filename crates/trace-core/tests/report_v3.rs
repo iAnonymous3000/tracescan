@@ -119,6 +119,32 @@ fn reports_validate_against_checked_in_schema() {
 }
 
 #[test]
+fn artifact_status_contract_matches_the_engine() {
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("web/report.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).expect("schema itself must be valid");
+    let base = scan_fixture("sysdiagnose_demo_clean.tar.gz");
+
+    for status in ["parsed", "parsed_partial", "unparsed", "truncated"] {
+        let mut report = base.clone();
+        report["artifacts"][0]["status"] = serde_json::Value::String(status.into());
+        assert!(
+            validator.is_valid(&report),
+            "engine artifact status {status:?} must remain valid in report v3"
+        );
+    }
+
+    let mut report = base;
+    report["artifacts"][0]["status"] = serde_json::Value::String("clean".into());
+    assert!(
+        !validator.is_valid(&report),
+        "unknown artifact statuses must fail the closed report contract"
+    );
+}
+
+#[test]
 fn field_shape_matches_golden() {
     let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/report_fields_v3.json");
     let report = scan_fixture("sysdiagnose_demo_infected.tar.gz");

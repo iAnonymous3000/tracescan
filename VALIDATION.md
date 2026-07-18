@@ -42,10 +42,10 @@ the 94 MB archive is externally hosted.
   resolved to paths. With all eight bundled indicator sets loaded, the overall
   verdict was `clear` with zero match or suspicious findings.
 
-## What "149 checkable indicators" means precisely
+## What "148 checkable indicators" means precisely
 
 The applicable indicators are process names (83), file names (15), and file
-paths (51). All four surfaces enumerate **process activity** - there is no
+paths (50). All four surfaces enumerate **process activity** - there is no
 filesystem listing in a sysdiagnose - so file name and path indicators are
 checked against the paths processes were observed running from, not against
 file presence on disk. A plist, database, or lock-file indicator therefore

@@ -57,6 +57,98 @@ test('clean demo produces the clear verdict', async ({ page }) => {
   await expect(page.locator('.verdict.clear')).toContainText('not the same as "your phone is clean."');
 });
 
+test('a paired-device-only clear report describes its narrow evidence without saying only 0', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+
+  const readable = await page.evaluate(async () => {
+    const report = structuredClone(window.__trace.lastReport);
+    report.artifacts = [{
+      path: 'root/logs/ProxiedDevice/watch.ips',
+      kind: 'crash_log',
+      status: 'parsed',
+      details: { paired_device: true },
+    }];
+    report.stats.artifacts_found = 1;
+    report.missing_artifacts = [
+      { kind: 'shutdown_log', note: 'not present' },
+      { kind: 'crash_log', note: 'not present' },
+      { kind: 'ps_listing', note: 'not present' },
+      { kind: 'unified_log', note: 'not present' },
+    ];
+    report.assurance.surfaces_examined = 0;
+    for (const surface of report.assurance.surfaces) surface.state = 'absent';
+    window.__trace.renderReport(report);
+    const { readableReportDocument, readableReportFragment } =
+      await import('./readable-report.js');
+    return {
+      fragment: readableReportFragment(report),
+      document: readableReportDocument(report),
+    };
+  });
+
+  const verdict = page.locator('.verdict.clear');
+  await expect(verdict).toContainText(
+    'none of the four primary artifact types were examined; this result rests only on paired-device crash reports'
+  );
+  await expect(verdict).not.toContainText('only 0');
+  expect(readable.fragment).toContain('paired-device crash log');
+  expect(readable.document).toContain('paired-device crash log');
+});
+
+test('unknown, missing, and null verdicts fail closed in both report renderers', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+
+  const results = await page.evaluate(async () => {
+    const base = structuredClone(window.__trace.lastReport);
+    const { readableReportDocument, readableReportFragment } =
+      await import('./readable-report.js');
+    const cases = ['unknown', 'missing', 'null'];
+    const observed = [];
+    for (const label of cases) {
+      const report = structuredClone(base);
+      if (label === 'unknown') report.verdict = 'future-verdict';
+      if (label === 'missing') delete report.verdict;
+      if (label === 'null') report.verdict = null;
+
+      window.__trace.renderReport(report);
+      const mainVerdict = document.querySelector('.verdict');
+      const readable = new DOMParser().parseFromString(
+        readableReportFragment(report),
+        'text/html'
+      );
+      const readableDocument = new DOMParser().parseFromString(
+        readableReportDocument(report),
+        'text/html'
+      );
+      observed.push({
+        label,
+        mainClass: mainVerdict.className,
+        mainTitle: mainVerdict.querySelector('h2').textContent,
+        mainHasClear: mainVerdict.classList.contains('clear'),
+        readableVerdict: readable.querySelector('.readable-report').dataset.verdict,
+        readableTitle: readable.querySelector('h1').textContent,
+        documentTitle: readableDocument.title,
+      });
+    }
+    return observed;
+  });
+
+  for (const result of results) {
+    expect(result.mainClass, result.label).toBe('verdict inconclusive');
+    expect(result.mainTitle, result.label).toBe('Scan incomplete - result inconclusive');
+    expect(result.mainHasClear, result.label).toBe(false);
+    expect(result.readableVerdict, result.label).toBe('inconclusive');
+    expect(result.readableTitle, result.label).toBe('Scan incomplete - result inconclusive');
+    expect(result.documentTitle, result.label).toBe(
+      'Trace report - Scan incomplete - result inconclusive'
+    );
+  }
+});
+
 test('infected demo produces the match verdict with helplines', async ({ page }) => {
   await page.goto('/');
   await page.click('#demo-infected');
@@ -436,6 +528,78 @@ test.describe('upstream indicator interception', () => {
     await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
   });
 
+  test('a bundled indicator set below its reviewed floor disables scanning', async ({ page }) => {
+    await page.route('**/iocs/coruna.stix2', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: '{"objects":[]}',
+      })
+    );
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+
+    await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('#ioc-note')).toContainText(
+      'Bundled indicator set "coruna" is below its reviewed floor'
+    );
+    expect(await page.evaluate(() => window.__trace.ready)).toBe(false);
+
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'Bundled indicator set "coruna" is below its reviewed floor'
+    );
+    await expect(page.locator('.verdict.clear')).toHaveCount(0);
+    expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
+  });
+
+  test('the background worker independently rejects a set below its reviewed floor', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for the worker boundary');
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+
+    const message = await page.evaluate(() => new Promise((resolve, reject) => {
+      const worker = new Worker('./worker.js', { type: 'module' });
+      const timeout = setTimeout(() => {
+        worker.terminate();
+        reject(new Error('background worker did not respond'));
+      }, 15_000);
+      worker.addEventListener('error', (event) => {
+        clearTimeout(timeout);
+        worker.terminate();
+        reject(new Error(event.message || 'background worker crashed'));
+      });
+      worker.addEventListener('message', (event) => {
+        if (event.data?.type === 'ready') {
+          worker.postMessage({
+            type: 'scan',
+            id: 77,
+            file: new File([], 'reviewed-floor.tar'),
+            sets: [{
+              name: 'below-floor',
+              text: '{"objects":[]}',
+              meta: {},
+              min_indicators: 1,
+              min_applicable: 1,
+            }],
+          });
+        } else if (event.data?.type === 'init-error') {
+          clearTimeout(timeout);
+          worker.terminate();
+          reject(new Error(event.data.message));
+        } else if (event.data?.type === 'error' && event.data.id === 77) {
+          clearTimeout(timeout);
+          worker.terminate();
+          resolve(event.data.message);
+        }
+      });
+    }));
+
+    expect(message).toContain(
+      'Bundled indicator set "below-floor" is below its reviewed floor in the background scanner.'
+    );
+  });
+
   test('live indicator data never reaches a scan, even when plausible', async ({ page }) => {
     // A live feed that swaps reviewed indicators for different ones while
     // preserving counts must not influence verdicts: scans always run on the
@@ -538,11 +702,15 @@ test.describe('worker failure boundaries', () => {
     expect(await page.evaluate(() => window.__trace.lastReport.scanned_via)).toBe('inline');
   });
 
-  test('a structured scan error keeps the worker usable without inline reads', async ({ page }) => {
+  test('a silent in-flight worker times out, is recycled, and never replays inline', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for the scan deadline');
     await page.addInitScript(() => {
       const stream = File.prototype.stream;
+      window.__TRACE_TEST_WORKER_TIMEOUT_MS = 50;
       window.__traceFileStreamCalls = 0;
-      window.__traceWorkerPosts = 0;
+      window.__traceWorkerConstructed = 0;
+      window.__traceWorkerPosts = [];
+      window.__traceWorkerTerminated = [];
       File.prototype.stream = function (...args) {
         window.__traceFileStreamCalls += 1;
         return stream.apply(this, args);
@@ -550,35 +718,596 @@ test.describe('worker failure boundaries', () => {
       window.Worker = class extends EventTarget {
         constructor() {
           super();
+          this.instance = ++window.__traceWorkerConstructed;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type === 'scan') {
+            window.__traceWorkerPosts.push(this.instance);
+          }
+        }
+        terminate() {
+          window.__traceWorkerTerminated.push(this.instance);
+        }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it on the main page',
+      { timeout: 5_000 }
+    );
+    await page.waitForFunction(() => window.__traceWorkerConstructed >= 2);
+    const state = await page.evaluate(() => ({
+      constructed: window.__traceWorkerConstructed,
+      posts: window.__traceWorkerPosts,
+      terminated: window.__traceWorkerTerminated,
+      streams: window.__traceFileStreamCalls,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.constructed).toBe(2);
+    expect(state.posts).toEqual([1]);
+    expect(state.terminated).toEqual([1]);
+    expect(state.streams).toBe(0);
+    expect(state.report).toBeNull();
+    expect(state.via).toBe('worker');
+  });
+
+  test('a structured scan error replaces the worker without inline reads', async ({ page }) => {
+    await page.addInitScript(() => {
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      window.__traceWorkerConstructed = 0;
+      window.__traceWorkerPosts = [];
+      window.__traceWorkerTerminated = [];
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          this.instance = ++window.__traceWorkerConstructed;
           setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
             data: { type: 'ready' },
           })), 0);
         }
         postMessage(message) {
           if (message.type !== 'scan') return;
-          window.__traceWorkerPosts += 1;
+          window.__traceWorkerPosts.push(this.instance);
           setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
             data: { type: 'error', id: message.id, message: 'scan rejected' },
           })), 0);
         }
-        terminate() {}
+        terminate() {
+          window.__traceWorkerTerminated.push(this.instance);
+        }
       };
     });
     await page.goto('/');
     await page.click('#demo-clean');
     await expect(page.locator('.error-box')).toContainText('scan rejected');
+    await page.waitForFunction(() => window.__traceWorkerConstructed >= 2);
     await page.click('#rescan-btn');
     // Returning to the landing page clears the prior case-data DOM.
     await expect(page.locator('#results')).toBeHidden();
     await page.click('#demo-clean');
     await expect(page.locator('#results')).toBeVisible();
     await expect(page.locator('.error-box')).toContainText('scan rejected');
+    await page.waitForFunction(() => window.__traceWorkerConstructed >= 3);
     const counts = await page.evaluate(() => ({
+      constructed: window.__traceWorkerConstructed,
       posts: window.__traceWorkerPosts,
+      terminated: window.__traceWorkerTerminated,
       streams: window.__traceFileStreamCalls,
     }));
-    expect(counts.posts).toBe(2);
+    expect(counts.constructed).toBe(3);
+    expect(counts.posts).toEqual([1, 2]);
+    expect(counts.terminated).toEqual([1, 2]);
     expect(counts.streams).toBe(0);
+  });
+
+  test('a malformed worker object report is rejected without an inline replay', async ({ page }) => {
+    await page.addInitScript(() => {
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      window.__traceWorkerConstructed = 0;
+      window.__traceWorkerTerminated = [];
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          this.instance = ++window.__traceWorkerConstructed;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type !== 'scan') return;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: {
+              type: 'report',
+              id: message.id,
+              report: {
+                schema_version: 3,
+                tool: { name: 'Trace' },
+                verdict: 'clear',
+                scanned_via: 'worker',
+              },
+            },
+          })), 0);
+        }
+        terminate() {
+          window.__traceWorkerTerminated.push(this.instance);
+        }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it on the main page'
+    );
+    await page.waitForFunction(() => window.__traceWorkerConstructed >= 2);
+    const state = await page.evaluate(() => ({
+      constructed: window.__traceWorkerConstructed,
+      terminated: window.__traceWorkerTerminated,
+      streams: window.__traceFileStreamCalls,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.constructed).toBe(2);
+    expect(state.terminated).toEqual([1]);
+    expect(state.streams).toBe(0);
+    expect(state.report).toBeNull();
+    expect(state.via).toBe('worker');
+  });
+
+  test('inconsistent clear envelopes proxied from a real worker fail closed', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for the worker envelope boundary');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      const pageFileStream = File.prototype.stream;
+      window.__traceEnvelopeVariant = 'bytes_read';
+      window.__traceEnvelopeMutations = [];
+      window.__tracePageFileStreamCalls = 0;
+      File.prototype.stream = function (...args) {
+        window.__tracePageFileStreamCalls += 1;
+        return pageFileStream.apply(this, args);
+      };
+
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              const variant = window.__traceEnvelopeVariant;
+              window.__traceEnvelopeMutations.push({
+                variant,
+                originalVerdict: data.report.verdict,
+                originalSchema: data.report.schema_version,
+                originalSha256: data.report.source_file.sha256,
+              });
+              if (variant === 'bytes_read') {
+                data.report.stats.bytes_read += 1;
+              } else if (variant === 'match_finding') {
+                data.report.findings.push({
+                  severity: 'match',
+                  artifact: 'proxy-only',
+                  summary: 'A Clear envelope cannot contain a match.',
+                  indicator: null,
+                  evidence: {},
+                });
+              } else if (variant === 'parsed_partial') {
+                data.report.artifacts[0].status = 'parsed_partial';
+              } else if (variant === 'missing_vs_absent') {
+                data.report.missing_artifacts = [];
+              } else if (variant === 'invalid_artifact_shape') {
+                data.report.artifacts = [{ status: 'parsed' }];
+              } else if (variant === 'missing_primary_artifacts') {
+                data.report.artifacts = [structuredClone(
+                  data.report.artifacts.find((artifact) => artifact.kind === 'crash_log')
+                )];
+              } else if (variant === 'provenance_url') {
+                data.report.indicator_provenance[0].url = 'https://example.invalid/decoy';
+              }
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) {
+          this.nativeWorker.postMessage(...args);
+        }
+        terminate() {
+          this.nativeWorker.terminate();
+        }
+      };
+    });
+    await page.goto('/');
+
+    const variants = [
+      'bytes_read',
+      'match_finding',
+      'parsed_partial',
+      'missing_vs_absent',
+      'invalid_artifact_shape',
+      'missing_primary_artifacts',
+      'provenance_url',
+    ];
+    for (const [index, variant] of variants.entries()) {
+      if (index > 0) {
+        await page.click('#rescan-btn');
+        await expect(page.locator('#results')).toBeHidden();
+      }
+      await page.evaluate((nextVariant) => {
+        window.__traceEnvelopeVariant = nextVariant;
+      }, variant);
+      await page.click('#demo-clean');
+      await expect(page.locator('.error-box')).toContainText(
+        'did not retry it on the main page',
+        { timeout: 10_000 }
+      );
+      await expect(page.locator('.verdict.clear')).toHaveCount(0);
+      const state = await page.evaluate(() => ({
+        report: window.__trace.lastReport,
+        via: window.__trace.lastScanVia,
+        mutations: window.__traceEnvelopeMutations.length,
+      }));
+      expect(state.report, variant).toBeNull();
+      expect(state.via, variant).toBe('worker');
+      expect(state.mutations, variant).toBe(index + 1);
+    }
+
+    const proxyState = await page.evaluate(() => ({
+      mutations: window.__traceEnvelopeMutations,
+      pageFileStreamCalls: window.__tracePageFileStreamCalls,
+    }));
+    expect(proxyState.pageFileStreamCalls).toBe(0);
+    expect(proxyState.mutations.map((entry) => entry.variant)).toEqual(variants);
+    for (const entry of proxyState.mutations) {
+      expect(entry.originalVerdict, entry.variant).toBe('clear');
+      expect(entry.originalSchema, entry.variant).toBe(3);
+      expect(entry.originalSha256, entry.variant).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  test('downgraded match verdicts proxied from a real infected worker fail closed', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for verdict precedence');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      const pageFileStream = File.prototype.stream;
+      window.__traceDowngradedVerdict = 'inconclusive';
+      window.__traceDowngradeMutations = [];
+      window.__tracePageFileStreamCalls = 0;
+      File.prototype.stream = function (...args) {
+        window.__tracePageFileStreamCalls += 1;
+        return pageFileStream.apply(this, args);
+      };
+
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              window.__traceDowngradeMutations.push({
+                requested: window.__traceDowngradedVerdict,
+                original: data.report.verdict,
+                hadMatch: data.report.findings.some((finding) => finding.severity === 'match'),
+              });
+              data.report.verdict = window.__traceDowngradedVerdict;
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) {
+          this.nativeWorker.postMessage(...args);
+        }
+        terminate() {
+          this.nativeWorker.terminate();
+        }
+      };
+    });
+    await page.goto('/');
+
+    for (const [index, verdict] of ['inconclusive', 'invalid'].entries()) {
+      if (index > 0) {
+        await page.click('#rescan-btn');
+        await expect(page.locator('#results')).toBeHidden();
+      }
+      await page.evaluate((nextVerdict) => {
+        window.__traceDowngradedVerdict = nextVerdict;
+      }, verdict);
+      await page.click('#demo-infected');
+      await expect(page.locator('.error-box')).toContainText(
+        'did not retry it on the main page',
+        { timeout: 10_000 }
+      );
+      await expect(page.locator('.verdict')).toHaveCount(0);
+      const state = await page.evaluate(() => ({
+        report: window.__trace.lastReport,
+        via: window.__trace.lastScanVia,
+        mutations: window.__traceDowngradeMutations.length,
+      }));
+      expect(state.report, verdict).toBeNull();
+      expect(state.via, verdict).toBe('worker');
+      expect(state.mutations, verdict).toBe(index + 1);
+    }
+
+    const proxyState = await page.evaluate(() => ({
+      mutations: window.__traceDowngradeMutations,
+      pageFileStreamCalls: window.__tracePageFileStreamCalls,
+    }));
+    expect(proxyState.pageFileStreamCalls).toBe(0);
+    expect(proxyState.mutations).toEqual([
+      { requested: 'inconclusive', original: 'match', hadMatch: true },
+      { requested: 'invalid', original: 'match', hadMatch: true },
+    ]);
+  });
+
+  test('a coherent inconclusive truncated-artifact report from a real worker is accepted', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for artifact status acceptance');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      window.__traceTruncatedOriginal = null;
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              const artifact = data.report.artifacts.find(
+                (candidate) => candidate.kind === 'crash_log'
+              ) || data.report.artifacts[0];
+              window.__traceTruncatedOriginal = {
+                verdict: data.report.verdict,
+                status: artifact.status,
+                surface: artifact.kind,
+              };
+              artifact.status = 'truncated';
+              data.report.scan_limits = [
+                'Proxy regression: one retained artifact exceeded its size limit.',
+              ];
+              data.report.assurance.complete = false;
+              data.report.assurance.surfaces.find(
+                (surface) => surface.kind === artifact.kind
+              ).state = 'partial';
+              data.report.verdict = 'inconclusive';
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) {
+          this.nativeWorker.postMessage(...args);
+        }
+        terminate() {
+          this.nativeWorker.terminate();
+        }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+
+    const verdict = page.locator('.verdict.inconclusive');
+    await expect(verdict).toBeVisible({ timeout: 10_000 });
+    await expect(verdict).toContainText(
+      'Proxy regression: one retained artifact exceeded its size limit.'
+    );
+    await expect(page.locator('.error-box')).toHaveCount(0);
+    await expect(page.locator('.verdict.clear')).toHaveCount(0);
+    await expect(page.locator('.artifacts')).toContainText('truncated');
+
+    const state = await page.evaluate(() => ({
+      original: window.__traceTruncatedOriginal,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.original.verdict).toBe('clear');
+    expect(state.original.status).toBe('parsed');
+    expect(state.via).toBe('worker');
+    expect(state.report.verdict).toBe('inconclusive');
+    expect(state.report.assurance.complete).toBe(false);
+    expect(state.report.scan_limits).toHaveLength(1);
+    expect(state.report.artifacts.find(
+      (artifact) => artifact.kind === state.original.surface
+    ).status).toBe('truncated');
+    expect(state.report.assurance.surfaces.find(
+      (surface) => surface.kind === state.original.surface
+    ).state).toBe('partial');
+  });
+
+  test('required fields and partial-processing invariants on real worker reports fail closed', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for complete-envelope invariants');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      const pageFileStream = File.prototype.stream;
+      window.__traceInvariantVariant = 'indicator_set_fields';
+      window.__traceInvariantMutations = [];
+      window.__tracePageFileStreamCalls = 0;
+      File.prototype.stream = function (...args) {
+        window.__tracePageFileStreamCalls += 1;
+        return pageFileStream.apply(this, args);
+      };
+
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              const variant = window.__traceInvariantVariant;
+              window.__traceInvariantMutations.push({
+                variant,
+                originalVerdict: data.report.verdict,
+                originalHadMatch: data.report.findings.some(
+                  (finding) => finding.severity === 'match'
+                ),
+              });
+              if (variant === 'indicator_set_fields') {
+                delete data.report.indicator_sets[0].campaign;
+                delete data.report.indicator_sets[0].by_kind;
+              } else if (variant === 'tool_version') {
+                delete data.report.tool.version;
+              } else if (variant === 'note_ioc_match') {
+                const finding = data.report.findings.find(
+                  (candidate) => candidate.kind === 'ioc_match' && candidate.indicator
+                );
+                finding.severity = 'note';
+              } else if (variant === 'match_missing_indicator') {
+                const finding = data.report.findings.find(
+                  (candidate) => candidate.kind === 'ioc_match' && candidate.indicator
+                );
+                delete finding.indicator;
+              } else if (variant === 'indicator_attribution') {
+                const finding = data.report.findings.find(
+                  (candidate) => candidate.kind === 'ioc_match' && candidate.indicator
+                );
+                finding.indicator.set = 'proxy-decoy-set';
+                finding.indicator.campaign = 'Proxy decoy campaign';
+              } else if (variant === 'absent_crash_with_retained_evidence') {
+                data.report.assurance.surfaces.find(
+                  (surface) => surface.kind === 'crash_log'
+                ).state = 'absent';
+                data.report.missing_artifacts.push({
+                  kind: 'crash_log',
+                  note: 'Proxy contradiction: crash evidence was retained.',
+                });
+              } else if (variant === 'complete_unified_without_artifact') {
+                data.report.assurance.surfaces.find(
+                  (surface) => surface.kind === 'unified_log'
+                ).state = 'complete';
+                data.report.missing_artifacts = data.report.missing_artifacts.filter(
+                  (missing) => missing.kind !== 'unified_log'
+                );
+              } else if (variant === 'relabel_primary_crash_as_paired') {
+                const artifact = data.report.artifacts.find(
+                  (candidate) => candidate.kind === 'crash_log'
+                    && candidate.details.paired_device === false
+                );
+                artifact.details.paired_device = true;
+                data.report.assurance.surfaces.find(
+                  (surface) => surface.kind === 'crash_log'
+                ).state = 'absent';
+                data.report.missing_artifacts.push({
+                  kind: 'crash_log',
+                  note: 'Proxy contradiction: primary crash evidence was relabeled as paired.',
+                });
+              } else if (variant === 'partial_match_without_limit') {
+                const artifact = data.report.artifacts.find(
+                  (candidate) => candidate.kind === 'crash_log'
+                ) || data.report.artifacts[0];
+                artifact.status = 'truncated';
+                data.report.assurance.surfaces.find(
+                  (surface) => surface.kind === artifact.kind
+                ).state = 'partial';
+                data.report.scan_limits = [];
+                data.report.assurance.complete = true;
+              }
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) {
+          this.nativeWorker.postMessage(...args);
+        }
+        terminate() {
+          this.nativeWorker.terminate();
+        }
+      };
+    });
+    await page.goto('/');
+
+    const variants = [
+      'indicator_set_fields',
+      'tool_version',
+      'note_ioc_match',
+      'match_missing_indicator',
+      'indicator_attribution',
+      'absent_crash_with_retained_evidence',
+      'complete_unified_without_artifact',
+      'relabel_primary_crash_as_paired',
+      'partial_match_without_limit',
+    ];
+    for (const [index, variant] of variants.entries()) {
+      if (index > 0) {
+        await page.click('#rescan-btn');
+        await expect(page.locator('#results')).toBeHidden();
+      }
+      await page.evaluate((nextVariant) => {
+        window.__traceInvariantVariant = nextVariant;
+      }, variant);
+      await page.click('#demo-infected');
+      await expect(page.locator('.error-box')).toContainText(
+        'did not retry it on the main page',
+        { timeout: 10_000 }
+      );
+      await expect(page.locator('.verdict')).toHaveCount(0);
+      const state = await page.evaluate(() => ({
+        report: window.__trace.lastReport,
+        via: window.__trace.lastScanVia,
+        mutations: window.__traceInvariantMutations.length,
+      }));
+      expect(state.report, variant).toBeNull();
+      expect(state.via, variant).toBe('worker');
+      expect(state.mutations, variant).toBe(index + 1);
+    }
+
+    const proxyState = await page.evaluate(() => ({
+      mutations: window.__traceInvariantMutations,
+      pageFileStreamCalls: window.__tracePageFileStreamCalls,
+    }));
+    expect(proxyState.pageFileStreamCalls).toBe(0);
+    expect(proxyState.mutations.map((entry) => entry.variant)).toEqual(variants);
+    for (const entry of proxyState.mutations) {
+      expect(entry.originalVerdict, entry.variant).toBe('match');
+      expect(entry.originalHadMatch, entry.variant).toBe(true);
+    }
   });
 
   test('a worker crash during a scan never replays the file inline', async ({ page }) => {

@@ -63,7 +63,7 @@
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2026-03-03_coruna_cryptowaters/coruna.stix2",
       "source": "Google Threat Intelligence Group (via MVT)",
       "min_indicators": 216,
-      "min_applicable": 19
+      "min_applicable": 18
     },
     {
       "name": "darksword",

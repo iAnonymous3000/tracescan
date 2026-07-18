@@ -6,6 +6,37 @@ tree is exactly what that version shipped.
 
 ## Unreleased
 
+Scanner correctness and hardening. Verified end to end against a real iOS 26.5.2
+(23F84) capture, which now parses fully and reads clear with every surface
+complete. The report schema is unchanged.
+
+- iOS 26 parser coverage. Three diagnostic .ips families are now understood
+  (security analytics bug_type 226, cpu_resource 202, proactive_event_tracker
+  303), so a genuine sysdiagnose no longer reports its crash and diagnostic
+  files as unparseable. ps.txt accepts the iOS "?" process state (previously
+  every row of a real listing was skipped), and unified-log support files for
+  firmware coprocessors (AOP, DCP, ...) and trailing-slash .dext bundles are
+  recognized instead of counted as parse failures.
+- Closed false-clear gaps. Crash .ips outside crashes_and_spins (paired-device
+  ProxiedDevice reports, OTA update logs) are scanned and disclosed;
+  directory-valued (trailing-slash) file:path indicators match by prefix rather
+  than never matching, and relative-path indicators are recorded but not
+  counted as checkable; unified-log catalogs with inconsistent internal counts
+  degrade the surface instead of silently dropping processes; a PAX header with
+  an undecodable record, a ps row whose numeric fields overflow their columns,
+  a crash body naming no process, and a shutdown delay header with no client
+  lines all keep the scan fail-closed.
+- Closed false-positive paths. Indicator matching is case-sensitive, so
+  Amnesty's capitalized 'Diagnosticd' no longer matches Apple's legitimate
+  'diagnosticd'; a compound STIX pattern can no longer be split into a matchable
+  clause at a quote-adjacent AND.
+- Hardening. tracev3 chunkset sizes are validated before decompression so a
+  crafted file cannot force an unbounded allocation; a WASM trap retires and
+  replaces the background worker rather than reusing a poisoned instance; the
+  results banner treats any unrecognized verdict as inconclusive, never clear;
+  archives dropped at the retention cap and truncated process listings are
+  reported accurately instead of as absent or empty.
+
 Responder-trust and operational-safety work. The report schema and engine-owned
 verdict semantics are unchanged.
 

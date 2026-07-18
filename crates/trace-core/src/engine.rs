@@ -152,7 +152,9 @@ impl Engine {
             name: stats.name.clone(),
             campaign: stats.campaign.clone(),
             sha256: sha256_hex(json.as_bytes()),
-            loaded_from: meta.loaded_from.unwrap_or_else(|| "bundled".into()),
+            // Provenance claims are opt-in. Browser snapshots explicitly set
+            // "bundled"; callers without metadata remain honestly unknown.
+            loaded_from: meta.loaded_from.unwrap_or_else(|| "unknown".into()),
             date: meta.date,
             url: meta.url,
             source: meta.source,
@@ -210,8 +212,10 @@ impl Engine {
         let mut findings = Findings::new();
         let mut artifacts: Vec<ArtifactSummary> = Vec::new();
         let mut device: Option<DeviceInfo> = None;
+        let mut primary_crash_degraded = false;
 
         for f in &collector.files {
+            let invalid_utf8 = std::str::from_utf8(&f.data).is_err();
             let text = String::from_utf8_lossy(&f.data);
             match f.kind {
                 ArtifactKind::ShutdownLog => {
@@ -222,17 +226,20 @@ impl Engine {
                         &mut findings,
                     ));
                 }
-                ArtifactKind::CrashLog => {
+                ArtifactKind::CrashLog | ArtifactKind::PairedCrashLog => {
                     let (a, d) = crash_log::analyze(&f.path, &text, &self.db, &mut findings);
                     artifacts.push(a);
                     // Prefer the newest .ips report: an old report can predate
-                    // an OS upgrade and misstate the capture-time OS.
-                    if let Some(d) = d {
-                        if device
-                            .as_ref()
-                            .is_none_or(|cur| device_timestamp_is_newer(&d, cur))
-                        {
-                            device = Some(d);
+                    // an OS upgrade and misstate the capture-time OS. Paired
+                    // reports are scanned but describe a different device.
+                    if matches!(f.kind, ArtifactKind::CrashLog) {
+                        if let Some(d) = d {
+                            if device
+                                .as_ref()
+                                .is_none_or(|cur| device_timestamp_is_newer(&d, cur))
+                            {
+                                device = Some(d);
+                            }
                         }
                     }
                 }
@@ -240,9 +247,21 @@ impl Engine {
                     artifacts.push(ps::analyze(&f.path, &text, &self.db, &mut findings));
                 }
             }
-            if f.truncated {
-                if let Some(last) = artifacts.last_mut() {
+            if let Some(last) = artifacts.last_mut() {
+                // Lossy decoding is useful for salvaging ASCII evidence, but
+                // it changes bytes and therefore cannot count as a complete
+                // parse or a clean IOC comparison.
+                if invalid_utf8 {
+                    last.details["invalid_utf8"] = serde_json::Value::Bool(true);
+                    if last.status == "parsed" {
+                        last.status = "parsed_partial".into();
+                    }
+                }
+                if f.truncated {
                     last.status = "truncated".into();
+                }
+                if matches!(f.kind, ArtifactKind::CrashLog) && last.status != "parsed" {
+                    primary_crash_degraded = true;
                 }
             }
         }
@@ -252,22 +271,25 @@ impl Engine {
         // Health counters are captured first: parse failures must reach the
         // verdict, not just the artifact details.
         let unified = std::mem::take(&mut collector.unified);
-        let unified_truncated = unified.truncated_files;
+        let truncated_tracev3_files = unified.truncated_tracev3_files;
+        let truncated_uuidtext_files = unified.truncated_uuidtext_files;
         let unified_seen = unified.saw_content();
         let tracev3_files = unified.tracev3_files;
+        let unified_examined = tracev3_files > 0;
         let tracev3_failures = unified.tracev3_failures;
+        let tracev3_incomplete = unified.tracev3_incomplete;
         let uuidtext_files = unified.uuidtext_files;
         let uuidtext_failures = unified.uuidtext_failures;
         let unified_cap_hit = unified.cap_hit;
-        let mut unified_unresolved: Option<u64> = None;
+        let mut unified_unresolved: Option<(u64, u64)> = None;
         let mut unified_empty_inventory = false;
         if let Some(summary) = unified.finalize(&self.db, &mut findings) {
             let seen = summary.details["processes_seen"].as_u64().unwrap_or(0);
-            let resolved = summary.details["processes_resolved_to_path"]
+            let unresolved = summary.details["processes_unresolved"]
                 .as_u64()
                 .unwrap_or(0);
-            if seen > 0 && resolved == 0 {
-                unified_unresolved = Some(seen);
+            if unresolved > 0 {
+                unified_unresolved = Some((unresolved, seen));
             }
             // tracev3 that parsed to an empty inventory: real tracev3
             // always carries catalog processes, so nothing was checked.
@@ -284,20 +306,27 @@ impl Engine {
 
         let found: std::collections::HashSet<ArtifactKind> =
             collector.files.iter().map(|f| f.kind).collect();
+        // A kind whose files were all dropped after a retention cap was
+        // present in the archive - it is not "missing". Reporting it as
+        // not-found (with reassuring "this can be normal" wording) would
+        // contradict the dropped-artifacts scan limit. Treat it as present
+        // for the missing/absent determination; its own scan limit and the
+        // partial surface state carry the truth.
+        let present = |k: ArtifactKind| found.contains(&k) || collector.dropped_kinds.contains(&k);
         let mut missing_artifacts = Vec::new();
-        if !found.contains(&ArtifactKind::ShutdownLog) {
+        if !present(ArtifactKind::ShutdownLog) {
             missing_artifacts.push(MissingArtifact {
                 kind: "shutdown_log".into(),
                 note: "No shutdown.log was found in this archive. It normally exists once the device has been restarted at least once; without it, one of the four detection surfaces is unavailable for this scan.".into(),
             });
         }
-        if !found.contains(&ArtifactKind::CrashLog) {
+        if !present(ArtifactKind::CrashLog) {
             missing_artifacts.push(MissingArtifact {
                 kind: "crash_log".into(),
                 note: "No crash or diagnostic .ips reports were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into(),
             });
         }
-        if !found.contains(&ArtifactKind::PsListing) {
+        if !present(ArtifactKind::PsListing) {
             missing_artifacts.push(MissingArtifact {
                 kind: "ps_listing".into(),
                 note: "No process listing (ps.txt) was found in this archive, so running processes could not be checked.".into(),
@@ -330,9 +359,14 @@ impl Engine {
                 collector.dropped_artifacts
             ));
         }
-        if unified_truncated > 0 {
+        if truncated_tracev3_files > 0 {
             scan_limits.push(format!(
-                "{unified_truncated} unified log file(s) exceeded size limits and were skipped; the process history is incomplete."
+                "{truncated_tracev3_files} unified log (tracev3) file(s) exceeded size limits and were skipped; the process history is incomplete."
+            ));
+        }
+        if truncated_uuidtext_files > 0 {
+            scan_limits.push(format!(
+                "{truncated_uuidtext_files} unified log support (uuidtext) file(s) exceeded size limits and were skipped; some processes may not resolve to binary paths."
             ));
         }
         // Parser health. A surface that failed to parse - fully or in part -
@@ -356,12 +390,21 @@ impl Engine {
                 "{partial_ps} process listing file(s) contained rows that could not be parsed; those processes were not checked."
             ));
         }
+        // A truncated ps file was parsed from its retained prefix (its rows
+        // were checked) but its status is overwritten to "truncated"; the
+        // size-limit scan message already covers it. Excluding that case
+        // here avoids a contradictory "contained no process rows" claim.
+        let truncated_ps = artifacts
+            .iter()
+            .filter(|a| a.kind == "ps_listing" && a.status == "truncated")
+            .count();
         if found.contains(&ArtifactKind::PsListing)
             && unparsed_ps == 0
             && partial_ps == 0
+            && truncated_ps == 0
             && artifacts
                 .iter()
-                .filter(|a| a.kind == "ps_listing" && a.status == "parsed")
+                .filter(|a| a.kind == "ps_listing")
                 .map(|a| a.details["processes"].as_u64().unwrap_or(0))
                 .sum::<u64>()
                 == 0
@@ -380,18 +423,30 @@ impl Engine {
                 "{unparsed_shutdown} shutdown log file(s) contained no recognizable content; processes that delayed shutdown were not checked."
             ));
         }
+        let partial_shutdown = artifacts
+            .iter()
+            .filter(|a| a.kind == "shutdown_log" && a.status == "parsed_partial")
+            .count();
+        if partial_shutdown > 0 {
+            scan_limits.push(format!(
+                "{partial_shutdown} shutdown log file(s) had client entries in an unrecognized format; the processes those entries name were not checked."
+            ));
+        }
         let partial_crashes = artifacts
             .iter()
-            .filter(|a| a.kind == "crash_log" && a.status == "parsed_partial")
+            .filter(|a| {
+                matches!(a.kind.as_str(), "crash_log" | "paired_crash_log")
+                    && a.status == "parsed_partial"
+            })
             .count();
         if partial_crashes > 0 {
             scan_limits.push(format!(
                 "{partial_crashes} crash or diagnostic .ips file(s) could not be fully parsed; parts of their contents were not checked against indicators."
             ));
         }
-        if let Some(seen) = unified_unresolved {
+        if let Some((unresolved, seen)) = unified_unresolved {
             scan_limits.push(format!(
-                "None of the {seen} processes in the unified log inventory could be resolved to a binary path (no readable uuidtext files), so that surface could not be checked against indicators."
+                "{unresolved} of {seen} processes in the unified log inventory could not be resolved to a binary path, so those processes could not be checked against indicators."
             ));
         }
         if unified_empty_inventory {
@@ -402,6 +457,11 @@ impl Engine {
         if tracev3_failures > 0 {
             scan_limits.push(format!(
                 "{tracev3_failures} of {tracev3_files} unified log (tracev3) file(s) could not be parsed; the process history is incomplete."
+            ));
+        }
+        if tracev3_incomplete > 0 {
+            scan_limits.push(format!(
+                "{tracev3_incomplete} unified log (tracev3) file(s) had catalog sections that could not be read; some processes in the log history were not checked."
             ));
         }
         if uuidtext_failures > 0 {
@@ -425,10 +485,32 @@ impl Engine {
                 "An archive entry failed its integrity checksum; scanning stopped there and the rest of the archive was not analyzed.".into(),
             );
         }
+        if collector.malformed_header
+            && (collector.entries > 0 || !collector.files.is_empty() || unified_seen)
+        {
+            scan_limits.push(
+                "An archive header contained an invalid numeric framing field; scanning stopped there and the rest of the archive was not analyzed.".into(),
+            );
+        }
         if collector.stream_cap_hit {
             scan_limits.push(
                 "The archive expanded past the scanner's decompression budget; scanning stopped early and the rest was not analyzed.".into(),
             );
+        }
+        // A PAX/GNU extended header that could not be fully parsed means the
+        // following member could not be framed or classified safely. Parsing
+        // stops before it and the scan cannot be presented as complete.
+        if collector.meta_malformed > 0 {
+            scan_limits.push(format!(
+                "{} archive metadata header(s) could not be read safely; scanning stopped before the affected files.",
+                collector.meta_malformed
+            ));
+        }
+        if collector.malformed_paths > 0 {
+            scan_limits.push(format!(
+                "{} archive member path(s) were absolute or contained ambiguous components; scanning stopped before classifying the affected files.",
+                collector.malformed_paths
+            ));
         }
         if findings_capped {
             scan_limits.push(format!(
@@ -479,6 +561,21 @@ impl Engine {
         // less than fully; global limits are covered by `complete`.
         let missing_kinds: std::collections::HashSet<&str> =
             missing_artifacts.iter().map(|m| m.kind.as_str()).collect();
+        // A kind whose files were partly or wholly dropped at a retention
+        // cap is not fully examined even if some copies parsed cleanly.
+        let dropped_kind_names: std::collections::HashSet<&str> = collector
+            .dropped_kinds
+            .iter()
+            .filter_map(|k| match k {
+                ArtifactKind::ShutdownLog => Some("shutdown_log"),
+                ArtifactKind::CrashLog => Some("crash_log"),
+                ArtifactKind::PsListing => Some("ps_listing"),
+                // Paired reports are supplemental. Dropping one degrades the
+                // overall scan through the global limit, not the phone's
+                // primary crash-report surface.
+                ArtifactKind::PairedCrashLog => None,
+            })
+            .collect();
         let surfaces: Vec<SurfaceState> =
             ["shutdown_log", "crash_log", "ps_listing", "unified_log"]
                 .into_iter()
@@ -486,9 +583,12 @@ impl Engine {
                     kind,
                     state: if missing_kinds.contains(kind) {
                         "absent"
-                    } else if artifacts
-                        .iter()
-                        .any(|a| a.kind == kind && a.status != "parsed")
+                    } else if dropped_kind_names.contains(kind)
+                        || (kind == "crash_log" && primary_crash_degraded)
+                        || (kind != "crash_log"
+                            && artifacts
+                                .iter()
+                                .any(|a| a.kind == kind && a.status != "parsed"))
                     {
                         "partial"
                     } else {
@@ -496,7 +596,18 @@ impl Engine {
                     },
                 })
                 .collect();
-        let surfaces_examined = surfaces.iter().filter(|s| s.state != "absent").count();
+        // Presence and examination differ when a surface was seen but every
+        // file was dropped or skipped at a safety cap. Count only primary
+        // surfaces for which at least one file reached its parser.
+        let surfaces_examined = [
+            found.contains(&ArtifactKind::ShutdownLog),
+            found.contains(&ArtifactKind::CrashLog),
+            found.contains(&ArtifactKind::PsListing),
+            unified_examined,
+        ]
+        .into_iter()
+        .filter(|examined| *examined)
+        .count();
         let assurance = Assurance {
             // Input that was never recognizably a sysdiagnose was not
             // "completely processed" in any sense a consumer should rely on.
@@ -515,12 +626,15 @@ impl Engine {
         if found.contains(&ArtifactKind::CrashLog) {
             examined.push("iOS crash and diagnostic reports (crashes_and_spins/*.ips) - target process names/paths and process inventories where the format contains them");
         }
+        if found.contains(&ArtifactKind::PairedCrashLog) {
+            examined.push("Paired-device crash and diagnostic reports (logs/ProxiedDevice*/*.ips) - target process names/paths from the paired device; not counted as phone crash-report coverage");
+        }
         if found.contains(&ArtifactKind::PsListing) {
             examined.push(
                 "Process listings (ps.txt, ps_thread.txt) - processes running at capture time",
             );
         }
-        if unified_seen {
+        if unified_examined {
             examined.push("Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)");
         }
 
@@ -565,6 +679,7 @@ impl Engine {
             coverage: Coverage {
                 examined,
                 not_examined: vec![
+                    "OTA update logs (logs/OTAUpdateLogs/*.ips) - an undocumented restore-time text format, not the crash-report schema, so their contents are not checked",
                     "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file name and path indicators match only when a process was observed running from that file",
                     "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
@@ -618,6 +733,13 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(data).unwrap();
         enc.finish().unwrap()
+    }
+
+    #[test]
+    fn unspecified_indicator_provenance_is_unknown() {
+        let mut engine = Engine::new();
+        engine.load_stix("local-test", PEGASUS_MINI).unwrap();
+        assert_eq!(engine.provenance[0].loaded_from, "unknown");
     }
 
     #[test]
@@ -867,6 +989,238 @@ mod tests {
         let device = engine.finish().unwrap().device.unwrap();
         assert_eq!(device.os_version, "iPhone OS 18.5 (22F76)");
         assert!(device.source.contains("b-2026-07-01"));
+    }
+
+    #[test]
+    fn invalid_utf8_artifact_is_partial_not_clear() {
+        let mut crash = br#"{"name":"safe","bug_type":"309","os_version":"iPhone OS 18.5 (22F76)"}
+{"procName":"safe","procPath":"/usr/bin/"#
+            .to_vec();
+        crash.push(0xff);
+        crash.extend_from_slice(br#"safe"}"#);
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/safe-2026.ips",
+            &crash,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.status, "parsed_partial");
+        assert_eq!(artifact.details["invalid_utf8"], true);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "partial"
+        );
+    }
+
+    #[test]
+    fn paired_report_is_scanned_without_substituting_for_phone_surface() {
+        let watch = br#"{"name":"watchapp","timestamp":"2026-07-01 10:00:00.00 +0000","bug_type":"309","os_version":"Watch OS 11.5 (22T572)"}
+{"procName":"watchapp","procPath":"/Applications/watchapp"}"#;
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/logs/ProxiedDevice-ABC/watchapp-2026.ips",
+            watch,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert!(report.device.is_none());
+        assert_eq!(report.verdict, Verdict::Clear);
+        assert!(report.assurance.complete);
+        assert!(report
+            .missing_artifacts
+            .iter()
+            .any(|missing| missing.kind == "crash_log"));
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "absent"
+        );
+        assert!(report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("Paired-device")));
+        assert!(!report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("iOS crash")));
+        // Keep report v3's closed artifact-kind enum stable. The artifact's
+        // device scope is explicit in details and coverage.
+        assert_eq!(report.artifacts[0].kind, "crash_log");
+        assert_eq!(report.artifacts[0].details["paired_device"], true);
+    }
+
+    #[test]
+    fn phone_metadata_and_surface_are_independent_of_newer_paired_report() {
+        let phone = br#"{"name":"phoneapp","timestamp":"2026-01-01 10:00:00.00 +0000","bug_type":"309","os_version":"iPhone OS 18.0 (22A1)"}
+{"procName":"phoneapp","procPath":"/Applications/phoneapp"}"#;
+        let watch = br#"{"name":"watchapp","timestamp":"2026-07-01 10:00:00.00 +0000","bug_type":"309","os_version":"Watch OS 11.5 (22T572)"}
+{"procName":"watchapp","procPath":"/Applications/watchapp"}"#;
+        let mut archive =
+            test_util::entry("sysdiagnose_t/crashes_and_spins/phoneapp-2026.ips", phone);
+        archive.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/logs/ProxiedDevice-ABC/watchapp-2026.ips",
+            watch,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&test_util::finish(archive)).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.device.unwrap().os_version, "iPhone OS 18.0 (22A1)");
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "complete"
+        );
+        assert_eq!(report.coverage.examined.len(), 2);
+    }
+
+    #[test]
+    fn paired_parse_failure_does_not_degrade_complete_phone_surface() {
+        let phone = br#"{"name":"phoneapp","bug_type":"309","os_version":"iPhone OS 18.0 (22A1)"}
+{"procName":"phoneapp","procPath":"/Applications/phoneapp"}"#;
+        let mut archive =
+            test_util::entry("sysdiagnose_t/crashes_and_spins/phoneapp-2026.ips", phone);
+        archive.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/logs/ProxiedDevice-ABC/broken-2026.ips",
+            b"not json",
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&test_util::finish(archive)).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn truncated_tracev3_is_present_but_not_claimed_as_examined() {
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            b"XX",
+        ));
+        let mut engine = Engine::new();
+        engine.limits = Limits {
+            file_cap: 1,
+            ..Limits::default()
+        };
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report
+            .missing_artifacts
+            .iter()
+            .any(|missing| missing.kind == "unified_log"));
+        let unified = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "unified_log")
+            .unwrap();
+        assert_eq!(unified.status, "parsed_partial");
+        assert_eq!(unified.details["tracev3_truncated"], 1);
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "unified_log")
+                .unwrap()
+                .state,
+            "partial"
+        );
+        assert_eq!(report.assurance.surfaces_examined, 0);
+        assert!(!report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("Unified system logs")));
+    }
+
+    #[test]
+    fn truncated_retained_artifact_uses_the_disclosed_status() {
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/ps.txt",
+            b"USER PID COMMAND\nroot 1 /sbin/launchd\n",
+        ));
+        let mut engine = Engine::new();
+        engine.limits = Limits {
+            file_cap: 12,
+            ..Limits::default()
+        };
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert_eq!(report.artifacts[0].status, "truncated");
+        assert!(!report.assurance.complete);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("exceeded size limits")));
+    }
+
+    #[test]
+    fn empty_tracev3_is_not_erased_from_surface_health() {
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            b"",
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report
+            .missing_artifacts
+            .iter()
+            .any(|missing| missing.kind == "unified_log"));
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("no process inventory")));
+        assert!(report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("Unified system logs")));
     }
 
     #[test]

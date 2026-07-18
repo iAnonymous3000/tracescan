@@ -14,12 +14,13 @@ Trace makes credible spyware forensics accessible to people who have never opene
 2. AirDrop the `sysdiagnose_….tar.gz` file to a computer.
 3. Drag it into the Trace page. Analysis takes well under two minutes.
 
-The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory, with hard caps on retained bytes, per-file sizes, entry counts, findings, and total decompressed output, and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. One known gap: the upstream unified-log parser sizes some allocations from metadata inside the archive, so a deliberately crafted tracev3 file can force a large transient allocation. The worst case is that hostile file aborting its own scan (an availability nuisance, not a result-integrity risk; to be reported upstream). Four artifact types are analyzed:
+The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory, with hard caps on retained bytes, per-file sizes, entry counts, findings, unified-log allocations, and total decompressed output, and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. Four primary detection surfaces are analyzed; paired-device reports are scanned as supplemental evidence and never substitute for phone coverage:
 
 | Artifact | Signal |
 |---|---|
 | `system_logs.logarchive/Extra/shutdown.log` (rotated `shutdown.0.log` on iOS 26) | Processes that delayed shutdown, per reboot - the [iShutdown](https://github.com/KasperskyLab/iShutdown) technique; Pegasus artifacts run from `roleaccountd.staging` |
 | `crashes_and_spins/*.ips` | Crash and diagnostic reports: target process names/paths and complete process inventories where the format contains them |
+| `logs/ProxiedDevice*/*.ips` | Crash and diagnostic reports proxied from a paired device (normally Apple Watch), labeled separately and excluded from the phone's device metadata and crash-surface completeness |
 | `ps.txt`, `ps_thread.txt` | Processes running at capture time vs. process indicators |
 | `system_logs.logarchive` tracev3 + uuidtext | Every process that wrote a unified-log entry during the archive window (typically days of history), via [Mandiant's parser](https://github.com/mandiant/macos-UnifiedLogs) at catalog level - process inventory only, log messages are never rendered, and each file is reduced and dropped so memory stays flat |
 

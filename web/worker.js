@@ -11,6 +11,17 @@ ready.then(
   (err) => self.postMessage({ type: 'init-error', message: err?.message || String(err) })
 );
 
+function meetsReviewedFloor(set, stats) {
+  return Number.isSafeInteger(set.min_indicators)
+    && set.min_indicators >= 0
+    && Number.isSafeInteger(set.min_applicable)
+    && set.min_applicable >= 0
+    && Number.isSafeInteger(stats?.extracted)
+    && stats.extracted >= set.min_indicators
+    && Number.isSafeInteger(stats?.applicable)
+    && stats.applicable >= set.min_applicable;
+}
+
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type !== 'scan') return;
@@ -18,11 +29,22 @@ self.onmessage = async (e) => {
   // anything whose id doesn't match the scan it is waiting for, so results
   // can never attach to the wrong file.
   const { id } = msg;
+  let scanner;
   try {
     await ready;
-    const scanner = new Scanner();
+    scanner = new Scanner();
     for (const s of msg.sets) {
-      scanner.load_stix_with_meta(s.name, s.text, JSON.stringify(s.meta || {}));
+      const stats = JSON.parse(
+        scanner.load_stix_with_meta(s.name, s.text, JSON.stringify(s.meta || {}))
+      );
+      // Re-check inside the scan worker. A long-lived page can outlive a
+      // deployment and later create a worker/WASM pair from a newer cache;
+      // neither side may silently scan below the reviewed snapshot floor.
+      if (!meetsReviewedFloor(s, stats)) {
+        throw new Error(
+          `Bundled indicator set "${s.name}" is below its reviewed floor in the background scanner.`
+        );
+      }
     }
     const reader = msg.file.stream().getReader();
     let processed = 0;
@@ -48,8 +70,12 @@ self.onmessage = async (e) => {
       source_size: msg.file.size,
       scanned_via: 'worker',
     }));
-    self.postMessage({ type: 'report', id, report: JSON.parse(scanner.finish()) });
+    const report = JSON.parse(scanner.finish());
+    scanner.free();
+    scanner = null;
+    self.postMessage({ type: 'report', id, report });
   } catch (err) {
+    try { scanner?.free(); } catch { /* already released */ }
     self.postMessage({ type: 'error', id, message: err?.message || String(err) });
   }
 };

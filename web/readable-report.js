@@ -86,11 +86,17 @@ function findingsHtml(report, includeTechnical) {
     ${omitted > 0 ? `<p class="notice">This readable copy shows the first ${MAX_READABLE_FINDINGS} severity-ordered findings. ${omitted} additional findings remain in the JSON report.</p>` : ''}`;
 }
 
+function artifactLabel(artifact) {
+  return artifact?.kind === 'crash_log' && artifact?.details?.paired_device === true
+    ? 'paired-device crash log'
+    : artifact?.kind;
+}
+
 function artifactsHtml(report, includeTechnical) {
   const artifacts = Array.isArray(report?.artifacts) ? report.artifacts : [];
   const missing = Array.isArray(report?.missing_artifacts) ? report.missing_artifacts : [];
   const rows = artifacts.map((artifact) => `<tr>
-    <td>${esc(artifact.kind)}</td>
+    <td>${esc(artifactLabel(artifact))}</td>
     <td>${esc(artifact.status)}</td>
     ${includeTechnical ? `<td><code>${esc(artifact.path)}</code></td><td><code>${esc(JSON.stringify(artifact.details ?? {}))}</code></td>` : ''}
   </tr>`).join('');

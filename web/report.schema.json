@@ -257,7 +257,12 @@
             ]
           },
           "status": {
-            "type": "string"
+            "enum": [
+              "parsed",
+              "parsed_partial",
+              "unparsed",
+              "truncated"
+            ]
           },
           "details": {
             "description": "Parser-specific; intentionally unconstrained."

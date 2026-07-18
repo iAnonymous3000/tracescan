@@ -17,23 +17,46 @@ pub enum PathFlag {
 }
 
 pub fn path_flag(path: &str) -> Option<PathFlag> {
+    // Process paths reported by these artifacts should already be canonical.
+    // Classifying a lexical path that contains `.` or `..` can accuse the
+    // wrong location (for example staging/../usr/bin/legit). Leave ambiguous
+    // paths unclassified rather than applying a prefix heuristic to them.
+    if path
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+    {
+        return None;
+    }
     const ROLEACCOUNT_STAGING: &str = "/private/var/db/com.apple.xpc.roleaccountd.staging/";
     if let Some(relative) = path.strip_prefix(ROLEACCOUNT_STAGING) {
-        let relative = relative.trim_end_matches('/');
         // Published Pegasus/KingSpawn examples execute as a direct child of
         // roleaccountd.staging (for example `rolexd`, `bh`, `subridged`).
-        // iOS itself legitimately uses the specifically observed
-        // exec/<id>.xpc/... workspace shape here. Keep every other descendant
-        // suspicious; exempting arbitrary nested paths would create a bypass.
-        let is_apple_exec_workspace = relative
-            .strip_prefix("exec/")
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(workspace, executable)| {
+        // iOS itself legitimately uses the observed
+        // exec/<numeric>.<numeric>.xpc/<executable> workspace shape here.
+        // Require that exact component shape: accepting an arbitrary `.xpc`
+        // directory or additional descendants would let a suspicious path
+        // hide behind the false-positive exception.
+        let mut components = relative.split('/');
+        let is_apple_exec_workspace = match (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ) {
+            (Some("exec"), Some(workspace), Some(executable), None) => {
                 workspace
                     .strip_suffix(".xpc")
-                    .is_some_and(|id| !id.is_empty())
+                    .and_then(|id| id.split_once('.'))
+                    .is_some_and(|(account, instance)| {
+                        !account.is_empty()
+                            && account.bytes().all(|byte| byte.is_ascii_digit())
+                            && !instance.is_empty()
+                            && instance.bytes().all(|byte| byte.is_ascii_digit())
+                    })
                     && !executable.is_empty()
-            });
+            }
+            _ => false,
+        };
         if !relative.is_empty() && !is_apple_exec_workspace {
             return Some(PathFlag::Staging);
         }
@@ -99,8 +122,37 @@ mod tests {
             "arbitrary nested staging paths must remain suspicious"
         );
         assert_eq!(
+            path_flag(
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/drop/bh"
+            ),
+            Some(PathFlag::Staging),
+            "the legitimate workspace exception must cover exactly one executable component"
+        );
+        assert_eq!(
+            path_flag("/private/var/db/com.apple.xpc.roleaccountd.staging/exec/evil.xpc/drop/bh"),
+            Some(PathFlag::Staging),
+            "an arbitrary .xpc directory must not suppress the staging heuristic"
+        );
+        assert_eq!(
+            path_flag(
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/evil.xpc/com.apple.NRD.UpdateBrainService"
+            ),
+            Some(PathFlag::Staging),
+            "the workspace identifier must retain the observed numeric shape"
+        );
+        assert_eq!(
             path_flag("/private/var/tmp/agent"),
             Some(PathFlag::UnusualLocation)
+        );
+        assert_eq!(
+            path_flag("/private/var/db/com.apple.xpc.roleaccountd.staging/../usr/bin/legit"),
+            None,
+            "dot segments must not inherit the raw staging prefix"
+        );
+        assert_eq!(
+            path_flag("/private/var/tmp/./usr/bin/legit"),
+            None,
+            "dot segments make an unusual-location prefix ambiguous"
         );
         assert_eq!(path_flag("/usr/libexec/nfcd"), None);
         // app containers are normal ground and must not be flagged

@@ -12,6 +12,7 @@ use std::io::{self, Write};
 pub enum ArtifactKind {
     ShutdownLog,
     CrashLog,
+    PairedCrashLog,
     PsListing,
 }
 
@@ -27,8 +28,43 @@ fn is_shutdown_log(base: &str) -> bool {
         .is_some_and(|mid| !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Tar member names in a sysdiagnose are relative canonical paths. Reject
+/// absolute, empty-component, and dot-segment spellings before any scope
+/// classification: raw component matching on those names can attribute an
+/// artifact to a directory it lexically escapes.
+fn canonical_member_path(path: &str) -> Option<&str> {
+    // A single conventional `./` archive prefix is harmless. Any additional
+    // dot component remains visible to the validation below.
+    let p = path.strip_prefix("./").unwrap_or(path);
+    if p.is_empty()
+        || p.starts_with('/')
+        || p.split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return None;
+    }
+    Some(p)
+}
+
+fn is_paired_device_component(component: &str) -> bool {
+    component == "ProxiedDevice"
+        || component
+            .strip_prefix("ProxiedDevice-")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+pub(crate) fn is_paired_device_path(path: &str) -> bool {
+    let Some(p) = canonical_member_path(path) else {
+        return false;
+    };
+    let components: Vec<&str> = p.split('/').collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0] == "logs" && is_paired_device_component(pair[1]))
+}
+
 pub fn classify(path: &str) -> Option<ArtifactKind> {
-    let p = path.trim_start_matches("./");
+    let p = canonical_member_path(path)?;
     let base = p.rsplit('/').next().unwrap_or(p);
     // AppleDouble metadata companions ("._foo.ips") appear in archives that
     // passed through a Mac; they are resource forks, not artifacts.
@@ -38,12 +74,25 @@ pub fn classify(path: &str) -> Option<ArtifactKind> {
     if is_shutdown_log(base) {
         return Some(ArtifactKind::ShutdownLog);
     }
-    // Component-wise match: "notcrashes_and_spins/x.ips" must not qualify.
-    if base.ends_with(".ips") && p.split('/').any(|seg| seg == "crashes_and_spins") {
-        return Some(ArtifactKind::CrashLog);
+    if !base.ends_with(".ips") {
+        return if base == "ps.txt" || base == "ps_thread.txt" {
+            Some(ArtifactKind::PsListing)
+        } else {
+            None
+        };
     }
-    if base == "ps.txt" || base == "ps_thread.txt" {
-        return Some(ArtifactKind::PsListing);
+
+    // ProxiedDevice directories under logs/ carry reports from a paired
+    // device (normally Apple Watch). They are scanned, but must not substitute
+    // for the phone's crash-report surface or supply phone device metadata.
+    let components: Vec<&str> = p.split('/').collect();
+    if is_paired_device_path(p) {
+        return Some(ArtifactKind::PairedCrashLog);
+    }
+
+    // Component-wise match: "notcrashes_and_spins/x.ips" must not qualify.
+    if components.contains(&"crashes_and_spins") {
+        return Some(ArtifactKind::CrashLog);
     }
     None
 }
@@ -66,17 +115,20 @@ fn is_upper_hex(s: &str) -> bool {
 }
 
 fn classify_consume(path: &str) -> Option<ConsumeKind> {
-    let p = path.trim_start_matches("./");
-    let rest = &p[p.find("system_logs.logarchive/")? + "system_logs.logarchive/".len()..];
-    let base = rest.rsplit('/').next().unwrap_or(rest);
+    let p = canonical_member_path(path)?;
+    let components: Vec<&str> = p.split('/').collect();
+    let logarchive = components
+        .iter()
+        .position(|component| *component == "system_logs.logarchive")?;
+    let rest = components.get(logarchive + 1..)?;
+    let base = *rest.last()?;
     if base.starts_with("._") {
         return None;
     }
     if base.ends_with(".tracev3") {
         return Some(ConsumeKind::Tracev3);
     }
-    let mut comps = rest.split('/');
-    if let (Some(dir), Some(name), None) = (comps.next(), comps.next(), comps.next()) {
+    if let [dir, name] = rest {
         if dir.len() == 2 && name.len() == 30 && is_upper_hex(dir) && is_upper_hex(name) {
             return Some(ConsumeKind::UuidText(format!("{dir}{name}")));
         }
@@ -148,20 +200,31 @@ enum State {
         buf: Vec<u8>,
         real: u64,
         total: u64,
+        capped: bool,
     },
     Done,
 }
 
+#[derive(Clone, Copy)]
 enum MetaKind {
     Pax,
     PaxGlobal,
     LongName,
 }
 
+#[derive(Default, Debug, PartialEq, Eq)]
+struct LocalMeta {
+    path: Option<String>,
+    size: Option<u64>,
+}
+
 pub struct TarCollector {
     pending: Vec<u8>,
     state: State,
-    next_path: Option<String>,
+    /// A local PAX/GNU header applies to exactly the next archive member.
+    /// Keeping the metadata as an Option also records that an otherwise-empty
+    /// (for our purposes) xheader is still waiting for its target.
+    next_meta: Option<LocalMeta>,
     limits: Limits,
     retained_bytes: usize,
     pub files: Vec<CollectedFile>,
@@ -178,6 +241,17 @@ pub struct TarCollector {
     /// Artifact files the scanner wanted but dropped because a global cap
     /// was already reached. Any nonzero value means the scan is incomplete.
     pub dropped_artifacts: u64,
+    /// Kinds among the dropped artifacts. A kind that was present but
+    /// entirely dropped must not be reported as "not found in the archive".
+    pub dropped_kinds: std::collections::HashSet<ArtifactKind>,
+    /// PAX/GNU metadata headers that could not be fully understood (bad
+    /// record structure, undecodable path, or larger than META_CAP). Parsing
+    /// stops before the affected member and the scan must not read as clean.
+    pub meta_malformed: u64,
+    /// Regular members with absolute, empty-component, or dot-segment paths.
+    /// Their scope cannot be classified without normalization assumptions, so
+    /// parsing stops before they can hide an artifact.
+    pub malformed_paths: u64,
     /// Parsing stopped early because the archive had too many entries.
     pub entry_cap_hit: bool,
     /// Parsing stopped early because the stream exceeded the total byte
@@ -187,6 +261,9 @@ pub struct TarCollector {
     /// first header this means "not a tar"; after valid entries it means
     /// the archive is corrupt and the remainder was never seen.
     pub bad_checksum: bool,
+    /// Parsing stopped at a checksum-valid header whose numeric framing
+    /// fields were malformed or outside the supported non-negative range.
+    pub malformed_header: bool,
     zero_blocks: u8,
 }
 
@@ -195,42 +272,109 @@ fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Tar numeric field: octal text, or GNU base-256 when the high bit is set.
-fn parse_num(field: &[u8]) -> u64 {
+/// Tar numeric field: octal text, or a non-negative GNU base-256 value when
+/// the high bit is set. Framing must never guess that malformed input means
+/// zero bytes: doing so changes every following header boundary.
+fn parse_num(field: &[u8]) -> Option<u64> {
     if !field.is_empty() && field[0] & 0x80 != 0 {
+        if field[0] & 0x40 != 0 {
+            return None;
+        }
         let mut v: u128 = (field[0] & 0x7f) as u128;
         for &b in &field[1..] {
             v = (v << 8) | b as u128;
         }
-        v.min(u64::MAX as u128) as u64
+        u64::try_from(v).ok()
     } else {
-        let s = String::from_utf8_lossy(field);
+        let s = std::str::from_utf8(field).ok()?;
         let t = s.trim_matches(|c: char| c == '\0' || c == ' ');
-        u64::from_str_radix(t, 8).unwrap_or(0)
+        if t.is_empty() || !t.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return None;
+        }
+        u64::from_str_radix(t, 8).ok()
     }
 }
 
-/// PAX extended header body: sequence of "<len> <key>=<value>\n" records.
-fn pax_path(data: &[u8]) -> Option<String> {
+/// Strict local PAX extended-header parser. Records are length-delimited, so
+/// unrelated values may contain arbitrary binary bytes (Apple xattrs do), but
+/// the record envelope itself must be exact. `path` and `size` affect archive
+/// framing/classification and therefore receive stricter semantic validation.
+fn pax_local_meta(data: &[u8]) -> Result<LocalMeta, ()> {
+    if data.is_empty() {
+        return Err(());
+    }
+
+    let mut meta = LocalMeta::default();
     let mut i = 0;
     while i < data.len() {
-        let sp = data[i..].iter().position(|&b| b == b' ')? + i;
-        let len: usize = std::str::from_utf8(&data[i..sp])
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
+        let sp = data[i..]
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|p| p + i)
+            .ok_or(())?;
+        let len_bytes = &data[i..sp];
+        if len_bytes.is_empty() || !len_bytes.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let len = std::str::from_utf8(len_bytes)
+            .map_err(|_| ())?
+            .parse::<usize>()
+            .map_err(|_| ())?;
         // Checked arithmetic: a crafted length near usize::MAX would wrap
         // on 32-bit wasm, slip past the bounds check, and trap on the slice.
-        let end = i.checked_add(len).filter(|&e| e <= data.len() && e > sp)?;
-        let rec = std::str::from_utf8(&data[sp + 1..end]).ok()?;
-        let rec = rec.strip_suffix('\n').unwrap_or(rec);
-        if let Some(v) = rec.strip_prefix("path=") {
-            return Some(v.to_string());
+        let end = i
+            .checked_add(len)
+            .filter(|&e| e <= data.len() && e > sp + 1)
+            .ok_or(())?;
+        if data[end - 1] != b'\n' {
+            return Err(());
+        }
+        let record = &data[sp + 1..end - 1];
+        let eq = record.iter().position(|&b| b == b'=').ok_or(())?;
+        if eq == 0 {
+            return Err(());
+        }
+        let key = &record[..eq];
+        let value = &record[eq + 1..];
+        match key {
+            b"path" => {
+                if value.is_empty() || value.contains(&0) {
+                    return Err(());
+                }
+                meta.path = Some(std::str::from_utf8(value).map_err(|_| ())?.to_string());
+            }
+            b"size" => {
+                if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                    return Err(());
+                }
+                meta.size = Some(
+                    std::str::from_utf8(value)
+                        .map_err(|_| ())?
+                        .parse::<u64>()
+                        .map_err(|_| ())?,
+                );
+            }
+            // Other keys are irrelevant to classification/framing. Their
+            // values are deliberately not decoded: vendor xattrs can be raw
+            // binary, including invalid UTF-8 and NUL bytes.
+            _ => {}
         }
         i = end;
     }
-    None
+    Ok(meta)
+}
+
+/// GNU `L` body. The extension stores exactly one NUL-terminated path; a
+/// missing terminator or trailing bytes mean the following member cannot be
+/// classified reliably.
+fn gnu_long_path(data: &[u8]) -> Result<String, ()> {
+    let end = data.iter().position(|&b| b == 0).ok_or(())?;
+    if end == 0 || end + 1 != data.len() {
+        return Err(());
+    }
+    Ok(std::str::from_utf8(&data[..end])
+        .map_err(|_| ())?
+        .to_string())
 }
 
 /// Tar header checksum: sum of all header bytes with the checksum field
@@ -238,7 +382,9 @@ fn pax_path(data: &[u8]) -> Option<String> {
 /// sum, so both are accepted; anything else is a corrupt or fabricated
 /// header, and parsing must not continue past it on guessed offsets.
 fn checksum_ok(block: &[u8]) -> bool {
-    let stored = parse_num(&block[148..156]);
+    let Some(stored) = parse_num(&block[148..156]) else {
+        return false;
+    };
     let mut unsigned: u64 = 0;
     let mut signed: i64 = 0;
     for (i, &b) in block.iter().enumerate() {
@@ -254,7 +400,7 @@ impl TarCollector {
         TarCollector {
             pending: Vec::new(),
             state: State::Header,
-            next_path: None,
+            next_meta: None,
             limits,
             retained_bytes: 0,
             files: Vec::new(),
@@ -263,16 +409,20 @@ impl TarCollector {
             headers: 0,
             stream_bytes: 0,
             dropped_artifacts: 0,
+            dropped_kinds: Default::default(),
+            meta_malformed: 0,
+            malformed_paths: 0,
             entry_cap_hit: false,
             stream_cap_hit: false,
             bad_checksum: false,
+            malformed_header: false,
             zero_blocks: 0,
         }
     }
 
     /// True once parsing reached a terminal state: the end-of-archive marker,
-    /// or a deliberate early stop (entry cap, byte budget, bad checksum -
-    /// each of which raises its own flag and its own scan-limit message).
+    /// or a deliberate early stop (entry cap, byte budget, bad checksum, or
+    /// malformed metadata - each raises its own scan-limit flag/message).
     /// False means the stream just stopped mid-archive: it may have been
     /// truncated in transit, and the scan must not be presented as complete.
     pub fn terminated_cleanly(&self) -> bool {
@@ -299,6 +449,11 @@ impl TarCollector {
                         cur += 512;
                         self.zero_blocks += 1;
                         if self.zero_blocks >= 2 {
+                            // A local extended header without a following
+                            // member is a damaged archive, not a clean EOA.
+                            if self.next_meta.take().is_some() {
+                                self.meta_malformed += 1;
+                            }
                             self.state = State::Done;
                         }
                         continue;
@@ -317,7 +472,11 @@ impl TarCollector {
                         self.state = State::Done;
                         continue;
                     }
-                    let size = parse_num(&block[124..136]);
+                    let Some(header_size) = parse_num(&block[124..136]) else {
+                        self.malformed_header = true;
+                        self.state = State::Done;
+                        continue;
+                    };
                     let typeflag = block[156];
                     let name = cstr(&block[0..100]);
                     let prefix = if &block[257..262] == b"ustar" {
@@ -325,7 +484,23 @@ impl TarCollector {
                     } else {
                         String::new()
                     };
-                    let path = match self.next_path.take() {
+                    cur += 512;
+
+                    // Local metadata applies to one ordinary member. A
+                    // second local/global metadata header cannot safely be
+                    // combined with it by this reader, so stop rather than
+                    // silently consuming the first override as the second
+                    // metadata header's own name.
+                    if self.next_meta.is_some() && matches!(typeflag, b'x' | b'g' | b'L') {
+                        self.next_meta = None;
+                        self.meta_malformed += 1;
+                        self.state = State::Done;
+                        continue;
+                    }
+
+                    let local = self.next_meta.take().unwrap_or_default();
+                    let size = local.size.unwrap_or(header_size);
+                    let path = match local.path {
                         Some(p) => p,
                         None if prefix.is_empty() => name,
                         None => format!("{}/{}", prefix, name),
@@ -337,16 +512,21 @@ impl TarCollector {
                     // bogus entry swallow the rest of the stream, which is
                     // the safe outcome for garbage input.
                     let total = size.div_ceil(512).saturating_mul(512);
-                    cur += 512;
 
                     match typeflag {
                         b'0' | 0 | b'7' => {
                             self.entries += 1;
+                            let Some(path) = canonical_member_path(&path).map(str::to_owned) else {
+                                self.malformed_paths += 1;
+                                self.state = State::Done;
+                                continue;
+                            };
                             let at_cap = self.files.len() >= self.limits.max_retained_files
                                 || self.retained_bytes >= self.limits.total_retain_cap;
                             let keep = match classify(&path) {
-                                Some(_) if at_cap => {
+                                Some(k) if at_cap => {
                                     self.dropped_artifacts += 1;
+                                    self.dropped_kinds.insert(k);
                                     Keep::No
                                 }
                                 Some(k) => Keep::Retain(path, k),
@@ -359,13 +539,24 @@ impl TarCollector {
                                 },
                             };
                             if total == 0 {
-                                if let Keep::Retain(p, k) = keep {
-                                    self.files.push(CollectedFile {
+                                match keep {
+                                    Keep::Retain(p, k) => self.files.push(CollectedFile {
                                         path: p,
                                         kind: k,
                                         data: Vec::new(),
                                         truncated: false,
-                                    });
+                                    }),
+                                    // Empty unified-log members are still
+                                    // evidence that the surface was present;
+                                    // pass them through so validation records
+                                    // the parse failure instead of erasing it.
+                                    Keep::Consume(p, ConsumeKind::Tracev3) => {
+                                        self.unified.consume_tracev3(&p, &[])
+                                    }
+                                    Keep::Consume(_, ConsumeKind::UuidText(uuid)) => {
+                                        self.unified.consume_uuidtext(uuid, &[])
+                                    }
+                                    Keep::No => {}
                                 }
                             } else {
                                 self.state = State::Data {
@@ -383,17 +574,31 @@ impl TarCollector {
                                 b'g' => MetaKind::PaxGlobal,
                                 _ => MetaKind::LongName,
                             };
-                            if total > 0 {
+                            if total == 0 {
+                                // A local/global PAX header has no records,
+                                // and a GNU long-name header has no name.
+                                self.meta_malformed += 1;
+                                self.state = State::Done;
+                            } else {
                                 self.state = State::Meta {
                                     kind,
                                     buf: Vec::new(),
                                     real: size,
                                     total,
+                                    capped: false,
                                 };
                             }
                         }
+                        // Directories, links, devices, and FIFOs carry no
+                        // data blocks (POSIX), and mainstream readers
+                        // (libarchive/bsdtar) ignore their size field on
+                        // read. Honoring it here let a crafted archive give
+                        // a directory a "payload" sized to swallow the next
+                        // real entry - an artifact bsdtar extracts but this
+                        // reader would never see.
+                        b'1' | b'2' | b'3' | b'4' | b'5' | b'6' => {}
                         _ => {
-                            // Directories, links, and unknown types: skip payload.
+                            // Unknown types: treated as data-bearing, per POSIX.
                             if total > 0 {
                                 self.state = State::Data {
                                     keep: Keep::No,
@@ -452,8 +657,11 @@ impl TarCollector {
                             // A partially buffered unified-log file would
                             // parse to an under-count, not an error; skip
                             // it and let the engine surface the gap.
-                            Keep::Consume(_, _) if truncated => {
-                                self.unified.truncated_files += 1;
+                            Keep::Consume(_, ConsumeKind::Tracev3) if truncated => {
+                                self.unified.record_truncated_tracev3();
+                            }
+                            Keep::Consume(_, ConsumeKind::UuidText(_)) if truncated => {
+                                self.unified.record_truncated_uuidtext();
                             }
                             Keep::Consume(p, kind) => match kind {
                                 ConsumeKind::Tracev3 => self.unified.consume_tracev3(&p, &buf),
@@ -480,6 +688,7 @@ impl TarCollector {
                     mut buf,
                     mut real,
                     mut total,
+                    mut capped,
                 } => {
                     let avail = (self.pending.len() - cur) as u64;
                     let n = avail.min(total);
@@ -488,25 +697,58 @@ impl TarCollector {
                         let room = (META_CAP as usize).saturating_sub(buf.len());
                         let take = (r as usize).min(room);
                         buf.extend_from_slice(&self.pending[cur..cur + take]);
+                        if take < r as usize {
+                            // A header larger than META_CAP was only
+                            // partially read: whatever the unread tail
+                            // declared (possibly the path itself) is lost,
+                            // so the header cannot count as understood.
+                            capped = true;
+                        }
                     }
                     cur += n as usize;
                     real -= r;
                     total -= n;
                     if total == 0 {
-                        match kind {
-                            MetaKind::Pax => {
-                                if let Some(p) = pax_path(&buf) {
-                                    self.next_path = Some(p);
+                        let parsed = if capped {
+                            Err(())
+                        } else {
+                            match kind {
+                                MetaKind::Pax => pax_local_meta(&buf),
+                                MetaKind::LongName => gnu_long_path(&buf).map(|path| LocalMeta {
+                                    path: Some(path),
+                                    size: None,
+                                }),
+                                // Persistent path/size overrides would change
+                                // classification or framing for every later
+                                // member. This reader does not model that
+                                // state, so reject them rather than silently
+                                // scanning different bytes than an extractor.
+                                MetaKind::PaxGlobal => pax_local_meta(&buf).and_then(|meta| {
+                                    if meta.path.is_some() || meta.size.is_some() {
+                                        Err(())
+                                    } else {
+                                        Ok(LocalMeta::default())
+                                    }
+                                }),
+                            }
+                        };
+                        match parsed {
+                            Ok(meta) => {
+                                if !matches!(kind, MetaKind::PaxGlobal) {
+                                    self.next_meta = Some(meta);
                                 }
+                                self.state = State::Header;
                             }
-                            MetaKind::LongName => {
-                                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                                self.next_path =
-                                    Some(String::from_utf8_lossy(&buf[..end]).into_owned());
+                            Err(()) => {
+                                // Once metadata that controls a following
+                                // member is malformed or truncated, offsets
+                                // and names are no longer trustworthy. Stop
+                                // before guessing where the next header is.
+                                self.next_meta = None;
+                                self.meta_malformed += 1;
+                                self.state = State::Done;
                             }
-                            MetaKind::PaxGlobal => {}
                         }
-                        self.state = State::Header;
                         continue;
                     }
                     self.state = State::Meta {
@@ -514,6 +756,7 @@ impl TarCollector {
                         buf,
                         real,
                         total,
+                        capped,
                     };
                     break;
                 }
@@ -623,6 +866,36 @@ pub mod test_util {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let content_len = 1 + key.len() + 1 + value.len() + 1; // space + key=value\n
+        let mut len = content_len + 1;
+        while len.to_string().len() + content_len != len {
+            len = len.to_string().len() + content_len;
+        }
+        let mut record = format!("{len} ").into_bytes();
+        record.extend_from_slice(key);
+        record.push(b'=');
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        assert_eq!(record.len(), len);
+        record
+    }
+
+    fn typed_entry(name: &str, typeflag: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&test_util::header(name, data.len(), typeflag));
+        out.extend_from_slice(data);
+        out.extend(std::iter::repeat_n(0u8, (512 - data.len() % 512) % 512));
+        out
+    }
+
+    fn resign_header(header: &mut [u8; 512]) {
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+    }
 
     #[test]
     fn collects_only_selected_files_and_handles_pax() {
@@ -751,6 +1024,37 @@ mod tests {
     }
 
     #[test]
+    fn malformed_numeric_size_stops_instead_of_guessing_zero() {
+        assert_eq!(parse_num(b"zzzzzzzzzzz\0"), None);
+        assert_eq!(parse_num(b"00000000002\0"), Some(2));
+
+        let mut archive = test_util::entry("root/ps.txt", b"PS");
+        let mut malformed = test_util::header("root/unknown.bin", 0, b'0');
+        malformed[124..136].copy_from_slice(b"zzzzzzzzzzz\0");
+        resign_header(&mut malformed);
+        archive.extend_from_slice(&malformed);
+        archive.extend_from_slice(&test_util::entry("root/ps_thread.txt", b"PS2"));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&test_util::finish(archive)).unwrap();
+        assert!(col.malformed_header);
+        assert_eq!(
+            col.files.len(),
+            1,
+            "nothing after malformed framing is read"
+        );
+    }
+
+    #[test]
+    fn ambiguous_regular_member_path_stops_instead_of_hiding_artifacts() {
+        let mut archive = test_util::entry("root/crashes_and_spins/../other/bh.ips", b"ambiguous");
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&test_util::finish(archive)).unwrap();
+        assert_eq!(col.malformed_paths, 1);
+        assert!(col.files.is_empty());
+    }
+
+    #[test]
     fn stream_byte_budget_stops_parsing() {
         let mut archive = Vec::new();
         for i in 0..8 {
@@ -805,15 +1109,198 @@ mod tests {
         // A record length near usize::MAX would wrap on 32-bit wasm and trap
         // on the slice; checked arithmetic must reject it instead.
         let huge = format!("{} path=/x\n", u64::MAX);
-        assert_eq!(pax_path(huge.as_bytes()), None);
+        assert_eq!(pax_local_meta(huge.as_bytes()), Err(()));
         let also_huge = b"99999999999999999999 path=/x\n"; // > u64::MAX: parse fails
-        assert_eq!(pax_path(also_huge), None);
+        assert_eq!(pax_local_meta(also_huge), Err(()));
         // a well-formed record still parses (length is self-inclusive)
         assert_eq!(
-            pax_path(b"15 path=/a/b/c\n").as_deref(),
-            Some("/a/b/c"),
+            pax_local_meta(b"15 path=/a/b/c\n"),
+            Ok(LocalMeta {
+                path: Some("/a/b/c".into()),
+                size: None,
+            }),
             "sanity: valid record"
         );
+    }
+
+    #[test]
+    fn pax_binary_record_before_path_does_not_hide_the_path() {
+        // Apple's tar writes raw-binary xattr records (for example
+        // SCHILY.xattr.com.apple.provenance); one ordered before path= used
+        // to abort the whole header, dropping the long name and letting the
+        // entry fall back to a truncated ustar name that may no longer
+        // classify as an artifact.
+        let mut body = Vec::new();
+        let bin_value = [0x01u8, 0xFF, 0x00, 0xC3, 0x28]; // invalid UTF-8
+        let key = "SCHILY.xattr.com.apple.provenance";
+        let content_len = 1 + key.len() + 1 + bin_value.len() + 1; // ' ' key '=' value '\n'
+        let mut len = content_len + 2;
+        while (len.to_string().len() + content_len) != len {
+            len = len.to_string().len() + content_len;
+        }
+        body.extend_from_slice(len.to_string().as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(key.as_bytes());
+        body.push(b'=');
+        body.extend_from_slice(&bin_value);
+        body.push(b'\n');
+        // path record, length prefix computed to be self-inclusive
+        let path_body = "path=/root/dir/long-name.ips\n";
+        let mut plen = path_body.len() + 2;
+        while plen.to_string().len() + 1 + path_body.len() != plen {
+            plen = plen.to_string().len() + 1 + path_body.len();
+        }
+        body.extend_from_slice(format!("{plen} {path_body}").as_bytes());
+        assert_eq!(
+            pax_local_meta(&body),
+            Ok(LocalMeta {
+                path: Some("/root/dir/long-name.ips".into()),
+                size: None,
+            })
+        );
+    }
+
+    #[test]
+    fn pax_undecodable_path_is_malformed() {
+        assert_eq!(pax_local_meta(b"11 path=\xFF\xFE\n"), Err(()));
+    }
+
+    #[test]
+    fn pax_path_and_size_are_strict() {
+        let mut both = pax_record(b"path", b"root/ignored.bin");
+        both.extend_from_slice(&pax_record(b"size", b"2"));
+        assert_eq!(
+            pax_local_meta(&both),
+            Ok(LocalMeta {
+                path: Some("root/ignored.bin".into()),
+                size: Some(2),
+            })
+        );
+        assert_eq!(pax_local_meta(&pax_record(b"path", b"")), Err(()));
+        assert_eq!(
+            pax_local_meta(&pax_record(b"path", b"root/ps\0.txt")),
+            Err(())
+        );
+        assert_eq!(pax_local_meta(b"10 path=/x"), Err(()));
+        assert_eq!(pax_local_meta(&pax_record(b"size", b"2x")), Err(()));
+    }
+
+    #[test]
+    fn pax_size_override_preserves_member_boundaries() {
+        // The ustar header claims zero bytes, but PAX size=2 is authoritative.
+        // Ignoring it would interpret the payload padding as headers and lose
+        // the following process inventory.
+        let mut meta = pax_record(b"path", b"root/ignored.bin");
+        meta.extend_from_slice(&pax_record(b"size", b"2"));
+        let mut archive = typed_entry("PaxHeaders/x", b'x', &meta);
+        archive.extend_from_slice(&test_util::header("short", 0, b'0'));
+        archive.extend_from_slice(b"XY");
+        archive.extend(std::iter::repeat_n(0u8, 510));
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS CONTENT"));
+        let archive = test_util::finish(archive);
+
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.meta_malformed, 0);
+        assert_eq!(col.files.len(), 1);
+        assert_eq!(col.files[0].path, "root/ps.txt");
+        assert_eq!(col.files[0].data, b"PS CONTENT");
+    }
+
+    #[test]
+    fn malformed_or_dangling_local_metadata_stops_safely() {
+        let path = pax_record(b"path", b"root/ps.txt");
+
+        let dangling = test_util::finish(typed_entry("PaxHeaders/x", b'x', &path));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&dangling).unwrap();
+        assert_eq!(col.meta_malformed, 1, "metadata needs a target member");
+
+        let mut consecutive = typed_entry("PaxHeaders/x", b'x', &path);
+        consecutive.extend_from_slice(&typed_entry("././@LongLink", b'L', b"root/ps.txt\0"));
+        consecutive.extend_from_slice(&test_util::entry("short", b"PS"));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&test_util::finish(consecutive)).unwrap();
+        assert_eq!(col.meta_malformed, 1);
+        assert!(col.files.is_empty());
+    }
+
+    #[test]
+    fn gnu_long_name_requires_one_utf8_nul_terminated_path() {
+        assert_eq!(gnu_long_path(b"root/ps.txt\0"), Ok("root/ps.txt".into()));
+        assert_eq!(gnu_long_path(b"root/ps.txt"), Err(()));
+        assert_eq!(gnu_long_path(b"\0"), Err(()));
+        assert_eq!(gnu_long_path(b"root/ps.txt\0junk"), Err(()));
+        assert_eq!(gnu_long_path(b"root/\xFF\0"), Err(()));
+    }
+
+    #[test]
+    fn global_pax_framing_override_is_rejected() {
+        let global = pax_record(b"size", b"2");
+        let mut archive = typed_entry("GlobalHead.0", b'g', &global);
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&test_util::finish(archive)).unwrap();
+        assert_eq!(col.meta_malformed, 1);
+        assert!(col.files.is_empty());
+    }
+
+    #[test]
+    fn malformed_pax_header_raises_counter_and_stops_before_target() {
+        let mut archive = Vec::new();
+        // 'x' header whose body has a garbage length prefix
+        let body = b"not-a-length path=/x\n";
+        archive.extend_from_slice(&test_util::header("PaxHeaders/x", body.len(), b'x'));
+        archive.extend_from_slice(body);
+        archive.extend(std::iter::repeat_n(0u8, (512 - body.len() % 512) % 512));
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.meta_malformed, 1);
+        assert!(
+            col.files.is_empty(),
+            "members after untrusted metadata must not be guessed"
+        );
+    }
+
+    #[test]
+    fn directory_size_field_cannot_swallow_the_next_entry() {
+        // POSIX directories have no data blocks and libarchive ignores their
+        // size on read. A crafted type-'5' header with size=1024 used to make
+        // this reader skip the next entry (here: ps.txt) as directory payload
+        // while bsdtar would extract it - a silently unscanned artifact.
+        let mut archive = Vec::new();
+        let mut dir = test_util::header("root/x/", 1024, b'5');
+        // recompute checksum after forging the size is handled by header();
+        // (header() already wrote size 1024 and a valid checksum)
+        let _ = &mut dir;
+        archive.extend_from_slice(&dir);
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS CONTENT"));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.files.len(), 1, "ps.txt must not be swallowed");
+        assert_eq!(col.files[0].data, b"PS CONTENT");
+    }
+
+    #[test]
+    fn dropped_artifacts_record_their_kind() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
+        archive.extend_from_slice(&test_util::entry(
+            "root/crashes_and_spins/a-2026.ips",
+            b"{}\n{}",
+        ));
+        let archive = test_util::finish(archive);
+        let mut col = TarCollector::with_limits(Limits {
+            max_retained_files: 1,
+            ..Limits::default()
+        });
+        col.write_all(&archive).unwrap();
+        assert_eq!(col.dropped_artifacts, 1);
+        assert!(col.dropped_kinds.contains(&ArtifactKind::CrashLog));
+        assert!(!col.dropped_kinds.contains(&ArtifactKind::PsListing));
     }
 
     #[test]
@@ -839,6 +1326,16 @@ mod tests {
         assert!(classify_consume(&format!("{lp}/ab/cdef01234567890123456789012345")).is_none());
         // tracev3 outside a logarchive is not ours
         assert!(classify_consume("root/other/x.tracev3").is_none());
+        // component boundary: a lookalike suffix must not become the real
+        // unified-log surface.
+        assert!(classify_consume(
+            "root/not-system_logs.logarchive/Persist/0000000000000001.tracev3"
+        )
+        .is_none());
+        assert!(
+            classify_consume("root/system_logs.logarchive/../other/0000000000000001.tracev3")
+                .is_none()
+        );
         // AppleDouble companions are ignored here too
         assert!(classify_consume(&format!("{lp}/Persist/._0000000000000001.tracev3")).is_none());
     }
@@ -858,6 +1355,35 @@ mod tests {
         assert_eq!(col.files.len(), 1, "only ps.txt is retained");
         assert_eq!(col.unified.tracev3_files, 1);
         assert_eq!(col.unified.tracev3_failures, 1);
+    }
+
+    #[test]
+    fn empty_and_truncated_unified_members_are_recorded() {
+        let lp = "root/system_logs.logarchive";
+        let empty = test_util::finish(test_util::entry(
+            &format!("{lp}/Persist/0000000000000001.tracev3"),
+            b"",
+        ));
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&empty).unwrap();
+        assert_eq!(col.unified.tracev3_files, 1);
+        assert!(col.unified.saw_content());
+
+        let mut archive =
+            test_util::entry(&format!("{lp}/Persist/0000000000000002.tracev3"), b"XX");
+        archive.extend_from_slice(&test_util::entry(
+            &format!("{lp}/AB/CDEF01234567890123456789012345"),
+            b"YY",
+        ));
+        let mut col = TarCollector::with_limits(Limits {
+            file_cap: 1,
+            ..Limits::default()
+        });
+        col.write_all(&test_util::finish(archive)).unwrap();
+        assert_eq!(col.unified.truncated_tracev3_files, 1);
+        assert_eq!(col.unified.truncated_uuidtext_files, 1);
+        assert_eq!(col.unified.tracev3_files, 0);
+        assert_eq!(col.unified.uuidtext_files, 0);
     }
 
     #[test]
@@ -881,10 +1407,42 @@ mod tests {
             classify("./root/crashes_and_spins/Panics/panic-full.ips"),
             Some(ArtifactKind::CrashLog)
         );
+        // paired-device (watchOS) crash reports proxied into the phone's
+        // sysdiagnose are the same format and must be scanned
+        assert_eq!(
+            classify("root/logs/ProxiedDevice/TodoistWatchOS-2026-07-16-202231.ips"),
+            Some(ArtifactKind::PairedCrashLog)
+        );
+        assert_eq!(
+            classify("root/logs/ProxiedDevice-ABC123/app-2026.ips"),
+            Some(ArtifactKind::PairedCrashLog)
+        );
+        assert_eq!(classify("root/logs/ProxiedDeviceBackup/app-2026.ips"), None);
+        assert_eq!(classify("root/logs/ProxiedDevice-/app-2026.ips"), None);
+        // A root directory that happens to contain the word ProxiedDevice
+        // must not relabel a phone report nested under crashes_and_spins.
+        assert_eq!(
+            classify("ProxiedDevice-root/crashes_and_spins/app-2026.ips"),
+            Some(ArtifactKind::CrashLog)
+        );
+        // OTA restore logs are a different, undocumented text format;
+        // deliberately out of scope and disclosed in coverage.not_examined
+        assert_eq!(classify("root/logs/OTAUpdateLogs/OTAUpdate-2026.ips"), None);
         assert_eq!(classify("root/ps.txt"), Some(ArtifactKind::PsListing));
         assert_eq!(classify("root/otherdir/x.ips"), None);
         // component boundary: a lookalike directory must not qualify
         assert_eq!(classify("root/notcrashes_and_spins/x.ips"), None);
+        assert_eq!(classify("/root/crashes_and_spins/app-2026.ips"), None);
+        assert_eq!(classify("../root/crashes_and_spins/app-2026.ips"), None);
+        assert_eq!(classify("./../root/crashes_and_spins/app-2026.ips"), None);
+        assert_eq!(
+            classify("root/crashes_and_spins/../other/app-2026.ips"),
+            None
+        );
+        assert_eq!(
+            classify("root/logs/ProxiedDevice/../../crashes_and_spins/app-2026.ips"),
+            None
+        );
         assert_eq!(classify("root/sysdiagnose.log"), None);
         // AppleDouble companions must be ignored even when the suffix matches
         assert_eq!(classify("root/crashes_and_spins/._bh-2026.ips"), None);
