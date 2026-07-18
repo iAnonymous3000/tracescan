@@ -27,8 +27,14 @@ pub fn path_flag(path: &str) -> Option<PathFlag> {
     {
         return None;
     }
-    const ROLEACCOUNT_STAGING: &str = "/private/var/db/com.apple.xpc.roleaccountd.staging/";
-    if let Some(relative) = path.strip_prefix(ROLEACCOUNT_STAGING) {
+    // On Apple platforms `/var` is a symlink to `/private/var`. Diagnostic
+    // artifacts can retain either spelling, so compare the path relative to
+    // that shared location instead of assuming the canonical prefix.
+    let var_relative = path
+        .strip_prefix("/private/var/")
+        .or_else(|| path.strip_prefix("/var/"));
+    const ROLEACCOUNT_STAGING: &str = "db/com.apple.xpc.roleaccountd.staging/";
+    if let Some(relative) = var_relative.and_then(|path| path.strip_prefix(ROLEACCOUNT_STAGING)) {
         // Published Pegasus/KingSpawn examples execute as a direct child of
         // roleaccountd.staging (for example `rolexd`, `bh`, `subridged`).
         // iOS itself legitimately uses the observed
@@ -61,10 +67,9 @@ pub fn path_flag(path: &str) -> Option<PathFlag> {
             return Some(PathFlag::Staging);
         }
     }
-    if path.starts_with("/private/var/db/")
-        || path.starts_with("/private/var/tmp/")
-        || path.starts_with("/private/var/root/")
-    {
+    if var_relative.is_some_and(|path| {
+        path.starts_with("db/") || path.starts_with("tmp/") || path.starts_with("root/")
+    }) {
         return Some(PathFlag::UnusualLocation);
     }
     None
@@ -160,5 +165,57 @@ mod tests {
             path_flag("/private/var/containers/Bundle/Application/X/App.app/App"),
             None
         );
+    }
+
+    #[test]
+    fn classifies_var_symlink_spelling_like_private_var() {
+        for (alias, canonical, expected) in [
+            (
+                "/var/db/com.apple.xpc.roleaccountd.staging/bh",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/bh",
+                Some(PathFlag::Staging),
+            ),
+            (
+                "/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/com.apple.NRD.UpdateBrainService",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/com.apple.NRD.UpdateBrainService",
+                Some(PathFlag::UnusualLocation),
+            ),
+            (
+                "/var/db/agent",
+                "/private/var/db/agent",
+                Some(PathFlag::UnusualLocation),
+            ),
+            (
+                "/var/tmp/agent",
+                "/private/var/tmp/agent",
+                Some(PathFlag::UnusualLocation),
+            ),
+            (
+                "/var/root/agent",
+                "/private/var/root/agent",
+                Some(PathFlag::UnusualLocation),
+            ),
+            (
+                "/var/containers/Bundle/Application/X/App.app/App",
+                "/private/var/containers/Bundle/Application/X/App.app/App",
+                None,
+            ),
+        ] {
+            assert_eq!(path_flag(canonical), expected, "canonical control: {canonical}");
+            assert_eq!(path_flag(alias), expected, "symlink spelling: {alias}");
+        }
+
+        // /tmp and /etc point to /private/tmp and /private/etc, respectively,
+        // but neither canonical location is part of this heuristic's narrow
+        // /private/var/{db,tmp,root} unusual-location set.
+        for (alias, canonical) in [
+            ("/tmp/agent", "/private/tmp/agent"),
+            ("/etc/agent", "/private/etc/agent"),
+        ] {
+            assert_eq!(path_flag(canonical), None, "canonical control: {canonical}");
+            assert_eq!(path_flag(alias), None, "symlink spelling: {alias}");
+        }
+
+        assert_eq!(path_flag("/variable/tmp/agent"), None);
     }
 }

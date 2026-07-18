@@ -4,7 +4,7 @@ const MAX_READABLE_ARTIFACTS = 200;
 const VERDICTS = {
   match: {
     label: 'Traces matching known spyware were found',
-    meaning: 'One or more process-bearing entries matched a published indicator. Trace compares exact process names and full paths; a file-name indicator may also match an observed process basename, and a directory path ending in / may match a canonical descendant. This is a serious signal that needs expert review, but it is not final proof on its own.',
+    meaning: 'One or more process-bearing entries matched a published indicator. Trace compares exact process names and file paths after treating Apple /var, /tmp, and /etc aliases as equivalent to /private/...; a file-name indicator may also match an observed process basename, and a directory path ending in / may match a descendant under the same comparison. This is a serious signal that needs expert review, but it is not final proof on its own.',
   },
   suspicious: {
     label: 'Anomalies worth expert review',
@@ -165,7 +165,7 @@ function provenanceHtml(report) {
       <td><code class="hash">${esc(set.sha256 || 'unavailable')}</code></td>
     </tr>`).join('')}</tbody>
   </table></div>
-  <p class="notice">Applicable counts show how many extracted indicators Trace's current matcher treats as process names, file names, or paths checkable against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths. Trace does not inspect a filesystem listing. A count of 0 means none are classified as applicable.</p>`;
+  <p class="notice">Applicable counts show how many extracted indicators Trace's current matcher treats as process names, file names, or paths checkable against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison. Trace does not inspect a filesystem listing. A count of 0 means none are classified as applicable.</p>`;
 }
 
 export function readableReportFragment(report, options = {}) {

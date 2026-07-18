@@ -222,12 +222,13 @@ budget, a 5,000-finding cap, checked/saturating arithmetic, tar checksum
 validation, and explicit incomplete-scan reporting. Higher-severity findings
 can evict lower-severity entries at the cap.
 
-Before bytes reach the upstream unified-log parser, Trace now validates the
-tracev3 framing and bounds declared inner decompression to 64 MiB per
-compressed chunkset and 256 MiB in aggregate per tracev3 file. That closes the
-known path in which one attacker-controlled declaration could request roughly
-4.3 GiB from the parser. These inner limits sit inside the outer archive and
-retained-member limits above.
+Before bytes reach the upstream unified-log parser, Trace validates complete
+tracev3 framing plus catalog offsets, nested counts, and exact declared-body
+consumption. It then exposes only catalog frames to that parser. Message
+chunksets never cross the parser boundary, so attacker-controlled compressed
+size declarations cannot trigger LZ4 allocation or retained firehose parsing.
+These catalog checks sit inside the outer archive and retained-member limits
+above.
 
 The controls do not prove bounded aggregate CPU use or browser-tab
 responsiveness for every hostile archive. An attacker can still supply many

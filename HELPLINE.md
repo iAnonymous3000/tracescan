@@ -115,7 +115,7 @@ of the scan was incomplete.
 
 | Verdict | Exact meaning | Responder action |
 | --- | --- | --- |
-| `match` | At least one observed process identity, executable basename, or canonical executable path matched a published indicator loaded for this scan. Names and full file paths use exact, case-sensitive equality; a trailing-slash directory path matches canonical descendants. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
+| `match` | At least one observed process identity, executable basename, or canonical executable path matched a published indicator loaded for this scan. Names use exact, case-sensitive equality. Full file paths use exact, case-sensitive equality after treating Apple's `/var`, `/tmp`, and `/etc` aliases as equivalent to `/private/...`; a trailing-slash directory path matches descendants under the same comparison. Raw observed paths and published IOC values remain unchanged in evidence. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
 | `suspicious` | No published-indicator match was found, but at least one anomaly documented in public spyware research was found. It can have a benign cause and can coexist with an incomplete scan. | Review the evidence in context. Escalate when the person's risk, other observations, or scan limits warrant it. |
 | `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a recorded limit; applicable indicators were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings may remain, and other supported surface types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
 | `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap was hit, the archive was truncated or corrupt, or no applicable indicators were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
@@ -167,9 +167,10 @@ evidence.
 The report's `stats.applicable_indicators` is the number of loaded process-name,
 file-name, and file-path indicators that this scanner could apply. File-name
 indicators use observed process identities and executable basenames. File-path
-indicators use only canonical observed executable paths, with descendant
-matching for a trailing-slash directory indicator. A sysdiagnose does not
-provide a complete filesystem inventory.
+indicators use only canonical observed executable paths, resolving the
+well-known Apple `/var`, `/tmp`, and `/etc` aliases to `/private/...` for
+comparison and using descendant matching for a trailing-slash directory
+indicator. A sysdiagnose does not provide a complete filesystem inventory.
 
 Trace does not currently examine, among other things:
 

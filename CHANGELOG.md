@@ -4,6 +4,28 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
+## Unreleased
+
+Post-v0.7.4 audit hardening. The report schema and tool version are unchanged;
+untagged production builds remain identified by `tool.build_commit`.
+
+- Unified-log analysis now validates complete tracev3 framing, catalog offset
+  ordering, nested counts, and exact catalog-body consumption before exposing
+  only catalog frames to the upstream parser. Message chunksets never cross
+  that boundary, replacing the v0.7.4 declared-decompression ceilings with no
+  LZ4 message decompression or retained firehose parsing at all.
+- Apple diagnostic paths using `/var`, `/tmp`, or `/etc` now match file-path
+  indicators published under the equivalent `/private/...` spelling (and vice
+  versa) while preserving the raw observed path and published IOC in evidence.
+  The unusual-location heuristic likewise treats `/var/...` like
+  `/private/var/...` without broadening its intentionally narrow path set.
+- A hard background-worker failure remains reportless and replaces the Worker;
+  if that replacement cannot initialize, an explicit retry stays fail-closed
+  instead of replaying the archive on the main page. Provenance links render as
+  anchors only for absolute HTTPS URLs.
+- Release WASM no longer installs the verbose debug panic hook. Dead crash-kind
+  handling, missing-path wording, and binary-size units were also corrected.
+
 ## v0.7.4 - 2026-07-17
 
 Scanner correctness and hardening. A pre-final candidate beginning at `8ff0208`
@@ -359,13 +381,13 @@ degraded scan could still render "No known spyware traces found" is closed.
 - Tar reader hardening: header checksums are validated (corruption mid-
   archive is inconclusive, not silently misparsed); the entry cap counts
   every header type so directory/PAX floods cannot bypass it; a total
-  decompressed-byte budget (8 GB) caps gzip bombs; PAX record lengths use
+  decompressed-byte budget (8 GiB) caps gzip bombs; PAX record lengths use
   checked arithmetic (a crafted length could previously trap the WASM
   module on 32-bit).
 - Output hardening: findings are capped at 5,000 (capped scans are
   inconclusive unless a match was already found), the DOM renders at most
   200 finding cards (the exported JSON always has all of them), and
-  uuidtext binary paths are truncated at 4 KB.
+  uuidtext binary paths are truncated at 4 KiB.
 - `crashes_and_spins` is matched as a path component, so lookalike
   directories in unrelated archives no longer classify as crash logs.
 - STIX AND/FOLLOWEDBY rejection is token-based: a multi-line or

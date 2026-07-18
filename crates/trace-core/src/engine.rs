@@ -466,10 +466,7 @@ impl Engine {
         }
         let partial_crashes = artifacts
             .iter()
-            .filter(|a| {
-                matches!(a.kind.as_str(), "crash_log" | "paired_crash_log")
-                    && a.status == "parsed_partial"
-            })
+            .filter(|a| a.kind == "crash_log" && a.status == "parsed_partial")
             .count();
         let capped_crash_inventories = artifacts
             .iter()
@@ -740,14 +737,14 @@ impl Engine {
                 examined,
                 not_examined: vec![
                     "OTA update logs (logs/OTAUpdateLogs/*.ips) - an undocumented restore-time text format, not the crash-report schema, so their contents are not checked",
-                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file-name indicators are checked only against observed process basenames and file-path indicators only against observed canonical executable paths",
+                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file-name indicators are checked only against observed process basenames and file-path indicators only against observed canonical executable paths (with Apple's /var, /tmp, and /etc aliases resolved to /private/... for comparison)",
                     "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
                     "SMS/iMessage link payloads - device backups only",
                     "Per-process network usage (DataUsage) - device backups only",
                     "Installed apps and configuration profiles - device backups only",
                 ],
-                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. Process and file indicators are checked only against observed process names and canonical paths; a directory-valued path indicator matches observed descendants of that directory. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
+                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. Process and file indicators are checked only against observed process names and canonical paths; Apple's /var, /tmp, and /etc aliases are resolved to /private/... for path comparison, and a directory-valued path indicator matches observed descendants of that directory. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
             },
         })
     }
@@ -829,6 +826,33 @@ mod tests {
         // applicable-indicator accounting excludes the domain
         assert_eq!(report.stats.total_indicators, 2);
         assert_eq!(report.stats.applicable_indicators, 1);
+    }
+
+    #[test]
+    fn aliased_ioc_path_controls_verdict_and_preserves_observed_path() {
+        let ps = "USER PID COMMAND\nroot 2143 /var/tmp/trace-alias\n";
+        let tar = test_util::finish(test_util::entry("sysdiagnose_t/ps.txt", ps.as_bytes()));
+        let mut engine = Engine::new();
+        engine
+            .load_stix(
+                "path-alias",
+                r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/tmp/trace-alias']"}]}"#,
+            )
+            .unwrap();
+        engine.push(&tar).unwrap();
+
+        let report = engine.finish().unwrap();
+        assert_eq!(report.verdict, Verdict::Match);
+        let matched = report
+            .findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .expect("the aliased path must produce an IOC finding");
+        assert_eq!(matched.evidence["command"], "/var/tmp/trace-alias");
+        assert_eq!(
+            matched.indicator.as_ref().unwrap().value,
+            "/private/var/tmp/trace-alias"
+        );
     }
 
     #[test]

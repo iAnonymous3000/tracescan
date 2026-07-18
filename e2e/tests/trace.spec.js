@@ -593,6 +593,47 @@ test('exported report records indicator provenance', async ({ page }) => {
   expect(secondDownload.suggestedFilename()).not.toBe(download.suggestedFilename());
 });
 
+test('indicator provenance renders source links only for absolute HTTPS URLs', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+
+  const result = await page.evaluate(() => {
+    const base = structuredClone(window.__trace.lastReport);
+    const originalUrl = base.indicator_provenance[0].url;
+    const sources = [
+      ['https', originalUrl],
+      ['http', 'http://example.invalid/indicators.stix2'],
+      ['javascript', 'javascript:window.__traceProvenanceExecuted=true'],
+      ['data', 'data:text/html,unsafe'],
+      ['relative', '/local-indicators.stix2'],
+      ['malformed', 'not a URL'],
+    ].map(([label, url]) => {
+      const report = structuredClone(base);
+      report.indicator_provenance[0].url = url;
+      window.__trace.renderReport(report);
+      const row = document.querySelector('#results .ioc-row');
+      const link = row.querySelector('a');
+      return {
+        label,
+        href: link?.getAttribute('href') ?? null,
+        text: row.textContent,
+      };
+    });
+    return { originalUrl, sources };
+  });
+
+  expect(result.sources[0]).toMatchObject({
+    label: 'https',
+    href: result.originalUrl,
+  });
+  for (const source of result.sources.slice(1)) {
+    expect(source.href, source.label).toBeNull();
+    expect(source.text, source.label).toContain('source unavailable');
+  }
+  expect(await page.evaluate(() => window.__traceProvenanceExecuted)).toBeUndefined();
+});
+
 test('main and readable reports cap artifact rows without changing the JSON report', async ({ page }) => {
   await page.goto('/');
   await page.click('#demo-clean');
@@ -658,6 +699,7 @@ test('a zero-artifact invalid report still renders its missing-artifact inventor
   });
 
   await expect(page.locator('.artifacts tbody tr')).toHaveCount(4);
+  await expect(page.locator('.artifacts')).toContainText('not applicable');
   await expect(page.locator('.artifacts')).toContainText('No process-bearing crash report was found.');
   expect(readableText).toContain('No process-bearing crash report was found.');
 });
@@ -1214,6 +1256,155 @@ test.describe('worker failure boundaries', () => {
     expect(counts.posts).toEqual([1, 2]);
     expect(counts.terminated).toEqual([1, 2]);
     expect(counts.streams).toBe(0);
+  });
+
+  test('a hard worker crash fails closed and the next scan uses a fresh worker', async ({ page }) => {
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      window.__traceWorkerConstructed = 0;
+      window.__traceWorkerPosts = [];
+      window.__traceWorkerTerminated = [];
+      window.__traceWorkerReadyMessages = 0;
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.instance = ++window.__traceWorkerConstructed;
+          this.native = new NativeWorker(...args);
+          this.native.addEventListener('message', (event) => {
+            if (event.data?.type === 'ready') window.__traceWorkerReadyMessages += 1;
+            this.dispatchEvent(new MessageEvent('message', { data: event.data }));
+          });
+          this.native.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              filename: event.filename,
+              lineno: event.lineno,
+              colno: event.colno,
+              error: event.error,
+            }));
+          });
+          this.native.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(message, ...rest) {
+          if (message.type === 'scan') {
+            window.__traceWorkerPosts.push(this.instance);
+            if (this.instance === 1) {
+              setTimeout(() => this.dispatchEvent(new ErrorEvent('error', {
+                message: 'simulated worker crash',
+              })), 0);
+              return;
+            }
+          }
+          this.native.postMessage(message, ...rest);
+        }
+        terminate() {
+          window.__traceWorkerTerminated.push(this.instance);
+          this.native.terminate();
+        }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it',
+      { timeout: 30_000 }
+    );
+    expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
+    await page.waitForFunction(() => window.__traceWorkerConstructed >= 2);
+    await page.waitForFunction(() => window.__traceWorkerReadyMessages >= 2);
+
+    await page.click('#rescan-btn');
+    await page.click('#demo-clean');
+    await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+    const state = await page.evaluate(() => ({
+      constructed: window.__traceWorkerConstructed,
+      posts: window.__traceWorkerPosts,
+      terminated: window.__traceWorkerTerminated,
+      streams: window.__traceFileStreamCalls,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.constructed).toBe(2);
+    expect(state.posts).toEqual([1, 2]);
+    expect(state.terminated).toEqual([1]);
+    expect(state.streams).toBe(0);
+    expect(state.report.verdict).toBe('clear');
+    expect(state.report.scanned_via).toBe('worker');
+    expect(state.via).toBe('worker');
+  });
+
+  test('a failed replacement worker keeps the next retry fail closed', async ({ page }) => {
+    await page.addInitScript(() => {
+      const stream = File.prototype.stream;
+      window.__traceFileStreamCalls = 0;
+      window.__traceWorkerConstructed = 0;
+      window.__traceWorkerPosts = [];
+      window.__traceWorkerTerminated = [];
+      File.prototype.stream = function (...args) {
+        window.__traceFileStreamCalls += 1;
+        return stream.apply(this, args);
+      };
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          this.instance = ++window.__traceWorkerConstructed;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: this.instance === 1
+              ? { type: 'ready' }
+              : { type: 'init-error', message: 'replacement failed' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type !== 'scan') return;
+          window.__traceWorkerPosts.push(this.instance);
+          setTimeout(() => this.dispatchEvent(new ErrorEvent('error', {
+            message: 'simulated worker crash',
+          })), 0);
+        }
+        terminate() {
+          window.__traceWorkerTerminated.push(this.instance);
+        }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'did not retry it on the main page',
+      { timeout: 10_000 }
+    );
+    await page.waitForFunction(() =>
+      window.__traceWorkerConstructed === 2
+        && window.__traceWorkerTerminated.includes(2));
+
+    await page.click('#rescan-btn');
+    await page.click('#demo-clean');
+    await expect(page.locator('.error-box')).toContainText(
+      'background scanner could not be restarted',
+      { timeout: 10_000 }
+    );
+    const state = await page.evaluate(() => ({
+      constructed: window.__traceWorkerConstructed,
+      posts: window.__traceWorkerPosts,
+      terminated: window.__traceWorkerTerminated,
+      streams: window.__traceFileStreamCalls,
+      report: window.__trace.lastReport,
+      via: window.__trace.lastScanVia,
+    }));
+    expect(state.constructed).toBe(2);
+    expect(state.posts).toEqual([1]);
+    expect(state.terminated).toEqual([1, 2]);
+    expect(state.streams).toBe(0);
+    expect(state.report).toBeNull();
+    expect(state.via).toBe('worker');
+    await expect(page.locator('.verdict')).toHaveCount(0);
   });
 
   test('a malformed worker object report is rejected without an inline replay', async ({ page }) => {
@@ -1892,56 +2083,6 @@ test.describe('worker failure boundaries', () => {
     }
   });
 
-  test('a worker crash during a scan never replays the file inline', async ({ page }) => {
-    await page.addInitScript(() => {
-      const stream = File.prototype.stream;
-      window.__traceFileStreamCalls = 0;
-      File.prototype.stream = function (...args) {
-        window.__traceFileStreamCalls += 1;
-        return stream.apply(this, args);
-      };
-      window.Worker = class extends EventTarget {
-        constructor() {
-          super();
-          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
-            data: { type: 'ready' },
-          })), 0);
-        }
-        postMessage(message) {
-          if (message.type === 'scan') {
-            setTimeout(() => this.dispatchEvent(new ErrorEvent('error')), 0);
-          }
-        }
-        terminate() {}
-      };
-    });
-    await page.goto('/');
-    await page.click('#demo-clean');
-    await expect(page.locator('.error-box')).toContainText(
-      'did not retry it on the main page',
-      { timeout: 5_000 }
-    );
-    const state = await page.evaluate(() => ({
-      streamCalls: window.__traceFileStreamCalls,
-      report: window.__trace.lastReport,
-      via: window.__trace.lastScanVia,
-    }));
-    expect(state.streamCalls).toBe(0);
-    expect(state.report).toBeNull();
-    expect(state.via).toBe('worker');
-
-    // The failed state is terminal for this page: another user action must
-    // not dispatch to the dead worker or silently switch to inline scanning.
-    // The previous error DOM is cleared before the next scan begins.
-    await page.click('#rescan-btn');
-    await expect(page.locator('#results')).toBeHidden();
-    await page.click('#demo-clean');
-    await expect(page.locator('#results')).toBeVisible();
-    await expect(page.locator('.error-box')).toContainText(
-      'did not retry it on the main page'
-    );
-    expect(await page.evaluate(() => window.__traceFileStreamCalls)).toBe(0);
-  });
 });
 
 test('scanning still works fully offline once the app is cached', async ({ page, context, browserName }) => {

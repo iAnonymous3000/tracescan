@@ -93,14 +93,18 @@ Matching is deliberately narrow:
 - Process and file names use exact, case-sensitive equality. This preserves
   distinctions such as the published `Diagnosticd` indicator versus Apple's
   legitimate `diagnosticd` process.
-- File paths must be canonical absolute paths. Directory-valued indicators with
-  a trailing slash match canonical descendants by prefix. Relative, dot-segment,
-  or slash-bearing name indicators remain in totals but are not called
-  checkable.
+- File paths must be canonical absolute paths. Matching is exact and
+  case-sensitive after resolving the well-known Apple `/var`, `/tmp`, and
+  `/etc` compatibility aliases to their `/private/...` forms; reports preserve
+  the raw observed path and published IOC value. Directory-valued indicators
+  with a trailing slash match descendants under the same comparison. Relative,
+  dot-segment, or slash-bearing name indicators remain in totals but are not
+  called checkable.
 - File-name indicators are compared with observed process identities and
   executable basenames. File-path indicators are compared only with canonical
-  observed executable paths. A sysdiagnose is not a filesystem inventory, so
-  neither rule establishes that an arbitrary file exists on disk.
+  observed executable paths under the alias rule above. A sysdiagnose is not a
+  filesystem inventory, so neither rule establishes that an arbitrary file
+  exists on disk.
 
 Most bundled indicators are domains, URLs, email addresses, hashes, or other
 values that these surfaces cannot evaluate. Trace v1 neither parses iPhone

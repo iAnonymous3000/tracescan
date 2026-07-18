@@ -19,7 +19,7 @@ use macos_unifiedlogs::parser::parse_log;
 use macos_unifiedlogs::uuidtext::UUIDText;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
+use std::io::{self, Read};
 
 /// A real logarchive holds a few hundred binaries; these caps only matter
 /// for hostile input, and hitting one surfaces in the artifact details.
@@ -43,76 +43,238 @@ const UUIDTEXT_MINOR_VERSION: u32 = 1;
 const CHUNK_HEADER: u32 = 0x1000;
 const CHUNK_CATALOG: u32 = 0x600b;
 const CHUNK_CHUNKSET: u32 = 0x600d;
-/// "bv41": lz4-compressed chunkset block.
-const BV41_COMPRESSED: u32 = 825_521_762;
-/// Real chunkset blocks decompress to at most a few megabytes; the sizes
-/// below are far above anything a genuine logarchive produces, so hitting
-/// one means hostile input, surfaced as a parse failure (fail-closed).
-const MAX_CHUNKSET_UNCOMPRESS: u64 = 64 * 1024 * 1024;
-const MAX_FILE_UNCOMPRESS: u64 = 256 * 1024 * 1024;
+/// Bytes after the chunk preamble and before the catalog UUID array.
+const CATALOG_FIXED_BODY_SIZE: usize = 24;
 
-/// Walks the tracev3 chunk framing without parsing chunk bodies. Returns the
-/// number of catalog chunks in the file.
+fn u16_at(data: &[u8], offset: usize) -> Result<u16, &'static str> {
+    let end = offset.checked_add(2).ok_or("catalog offset overflow")?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or("catalog field exceeds its declared body")?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn u32_at(data: &[u8], offset: usize) -> Result<u32, &'static str> {
+    let end = offset.checked_add(4).ok_or("catalog offset overflow")?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or("catalog field exceeds its declared body")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn checked_region_end(start: usize, len: usize, region_end: usize) -> Result<usize, &'static str> {
+    start
+        .checked_add(len)
+        .filter(|&end| end <= region_end)
+        .ok_or("catalog entry exceeds its declared region")
+}
+
+/// Mirrors the upstream process-entry byte layout without allocating. Nested
+/// counts are bounded against the process region before the dependency sees
+/// them, and the returned cursor includes the format-defined 8-byte alignment
+/// after subsystem entries.
+fn validate_catalog_process_entry(
+    data: &[u8],
+    start: usize,
+    region_end: usize,
+) -> Result<usize, &'static str> {
+    // Four u16 fields, one u64, and six u32 fields through `unknown3`.
+    let fixed_end = checked_region_end(start, 40, region_end)?;
+    let uuid_count = usize::try_from(u32_at(data, start + 32)?)
+        .map_err(|_| "catalog UUID-entry count is too large")?;
+    let uuid_bytes = uuid_count
+        .checked_mul(16)
+        .ok_or("catalog UUID-entry size overflow")?;
+    let uuid_end = checked_region_end(fixed_end, uuid_bytes, region_end)?;
+
+    // `number_subsystems` and `unknown4` follow the UUID entries.
+    let subsystem_header_end = checked_region_end(uuid_end, 8, region_end)?;
+    let subsystem_count = usize::try_from(u32_at(data, uuid_end)?)
+        .map_err(|_| "catalog subsystem count is too large")?;
+    let subsystem_bytes = subsystem_count
+        .checked_mul(6)
+        .ok_or("catalog subsystem size overflow")?;
+    let subsystem_end = checked_region_end(subsystem_header_end, subsystem_bytes, region_end)?;
+    let padding = (8 - (subsystem_bytes % 8)) % 8;
+    checked_region_end(subsystem_end, padding, region_end)
+}
+
+/// Mirrors the upstream catalog-subchunk layout without allocating. Its two
+/// attacker-controlled array counts are checked against the declared catalog
+/// body before upstream's repeated parsers run.
+fn validate_catalog_subchunk(
+    data: &[u8],
+    start: usize,
+    region_end: usize,
+) -> Result<usize, &'static str> {
+    // start, end, uncompressed size, compression algorithm, and index count.
+    let fixed_end = checked_region_end(start, 28, region_end)?;
+    let index_count = usize::try_from(u32_at(data, start + 24)?)
+        .map_err(|_| "catalog subchunk index count is too large")?;
+    let index_bytes = index_count
+        .checked_mul(2)
+        .ok_or("catalog subchunk index size overflow")?;
+    let indexes_end = checked_region_end(fixed_end, index_bytes, region_end)?;
+
+    let strings_header_end = checked_region_end(indexes_end, 4, region_end)?;
+    let string_count = usize::try_from(u32_at(data, indexes_end)?)
+        .map_err(|_| "catalog subchunk string count is too large")?;
+    let string_bytes = string_count
+        .checked_mul(2)
+        .ok_or("catalog subchunk string size overflow")?;
+    let strings_end = checked_region_end(strings_header_end, string_bytes, region_end)?;
+    let array_bytes = index_bytes
+        .checked_add(string_bytes)
+        .ok_or("catalog subchunk array size overflow")?;
+    let padding = (8 - (array_bytes % 8)) % 8;
+    checked_region_end(strings_end, padding, region_end)
+}
+
+/// Validates the catalog's offset relationships and consumes every declared
+/// process entry and subchunk exactly. The dependency trusts several offsets,
+/// ignores the declared process/subchunk boundary, and accepts a parsed prefix
+/// with trailing body bytes, so these invariants must hold before parsing.
+fn validate_catalog_body(body: &[u8]) -> Result<(), &'static str> {
+    if body.len() < CATALOG_FIXED_BODY_SIZE {
+        return Err("catalog body is shorter than its fixed header");
+    }
+    let subsystem_offset = usize::from(u16_at(body, 0)?);
+    let process_offset = usize::from(u16_at(body, 2)?);
+    let process_count = usize::from(u16_at(body, 4)?);
+    let subchunk_offset = usize::from(u16_at(body, 6)?);
+    let subchunk_count = usize::from(u16_at(body, 8)?);
+    let payload = &body[CATALOG_FIXED_BODY_SIZE..];
+
+    if subsystem_offset % 16 != 0 {
+        return Err("catalog UUID region is not a whole number of UUIDs");
+    }
+    if subsystem_offset > process_offset
+        || process_offset > subchunk_offset
+        || subchunk_offset > payload.len()
+    {
+        return Err("catalog internal offsets are unordered or out of bounds");
+    }
+
+    let mut cursor = process_offset;
+    for _ in 0..process_count {
+        cursor = validate_catalog_process_entry(payload, cursor, subchunk_offset)?;
+    }
+    if cursor != subchunk_offset {
+        return Err("catalog process inventory does not consume its declared region");
+    }
+
+    for _ in 0..subchunk_count {
+        cursor = validate_catalog_subchunk(payload, cursor, payload.len())?;
+    }
+    if cursor != payload.len() {
+        return Err("catalog subchunks do not consume the declared body");
+    }
+    Ok(())
+}
+
+/// Validates one top-level tracev3 frame and returns its tag and the offset of
+/// its body end and the next frame (including source padding).
+fn tracev3_chunk_at(data: &[u8], i: usize) -> Result<(u32, usize, usize), &'static str> {
+    let remaining = data.get(i..).ok_or("chunk offset overruns the file")?;
+    if remaining.len() < 16 {
+        return Err("truncated chunk preamble");
+    }
+    let tag = u32::from_le_bytes(remaining[0..4].try_into().unwrap());
+    if !matches!(tag, CHUNK_HEADER | CHUNK_CATALOG | CHUNK_CHUNKSET) {
+        return Err("unknown top-level chunk type");
+    }
+    let size = u64::from_le_bytes(remaining[8..16].try_into().unwrap());
+    let body_start = i + 16;
+    let Some(body_end) = (body_start as u64)
+        .checked_add(size)
+        .filter(|&e| e <= data.len() as u64)
+        .map(|e| e as usize)
+    else {
+        return Err("chunk overruns the file");
+    };
+    let pad = ((8 - (size % 8)) % 8) as usize;
+    let Some(next) = body_end.checked_add(pad).filter(|&next| next <= data.len()) else {
+        return Err("chunk padding overruns the file");
+    };
+    Ok((tag, body_end, next))
+}
+
+/// Walks the original tracev3 framing and structurally validates every catalog
+/// body without parsing message data. Returns the number of catalog chunks.
 ///
-/// Three jobs, all prerequisites for handing the bytes to the upstream
-/// parser. First, require complete framing and only chunk types the parser
-/// understands, so its log-and-continue behavior cannot hide truncation or
-/// format drift. Second, bound declared decompression sizes: upstream passes each
-/// chunkset's attacker-controlled u32 uncompress_size straight to
-/// lz4_flex::decompress, which eagerly allocates it - up to ~4.3 GB, a
-/// capacity-overflow panic on wasm32 that would abort the whole scan.
-/// Third, the caller compares the returned catalog count against what the
-/// upstream parser actually yielded: upstream silently drops catalogs whose
-/// internal structure fails to parse (log-and-continue), and a dropped
-/// catalog is an uninventoried set of processes that must not read as a
-/// fully checked surface.
+/// Complete framing and recognized top-level types are prerequisites for
+/// using any catalog, so truncation or format drift cannot hide uninventoried
+/// processes. Chunkset bodies contain message data that Trace does not use;
+/// they are deliberately kept outside the parser boundary so their declared
+/// decompressed sizes cannot allocate memory or retain parsed firehose data.
+/// The caller compares this count with the catalogs that parse successfully.
 fn validate_tracev3(data: &[u8]) -> Result<u64, &'static str> {
     let mut catalogs = 0u64;
-    let mut total_uncompress = 0u64;
     let mut i = 0usize;
     while i < data.len() {
-        if data.len() - i < 16 {
-            return Err("truncated chunk preamble");
-        }
-        let tag = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
-        if !matches!(tag, CHUNK_HEADER | CHUNK_CATALOG | CHUNK_CHUNKSET) {
-            return Err("unknown top-level chunk type");
-        }
-        let size = u64::from_le_bytes(data[i + 8..i + 16].try_into().unwrap());
-        let body_start = i + 16;
-        let Some(body_end) = (body_start as u64)
-            .checked_add(size)
-            .filter(|&e| e <= data.len() as u64)
-            .map(|e| e as usize)
-        else {
-            return Err("chunk overruns the file");
-        };
+        let (tag, body_end, next) = tracev3_chunk_at(data, i)?;
         if tag == CHUNK_CATALOG {
+            validate_catalog_body(&data[i + 16..body_end])?;
             catalogs += 1;
         }
-        if tag == CHUNK_CHUNKSET {
-            let body = &data[body_start..body_end];
-            if body.len() >= 8 {
-                let sig = u32::from_le_bytes(body[0..4].try_into().unwrap());
-                let uncompress = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
-                if sig == BV41_COMPRESSED {
-                    if uncompress > MAX_CHUNKSET_UNCOMPRESS {
-                        return Err("chunkset declares an implausible decompressed size");
-                    }
-                    total_uncompress += uncompress;
-                    if total_uncompress > MAX_FILE_UNCOMPRESS {
-                        return Err("file declares an implausible total decompressed size");
-                    }
-                }
-            }
-        }
-        let pad = ((8 - (size % 8)) % 8) as usize;
-        if data.len() - body_end < pad {
-            return Err("chunk padding overruns the file");
-        }
-        i = body_end + pad;
+        i = next;
     }
     Ok(catalogs)
+}
+
+/// A zero-copy source view that emits only catalog frames. The upstream crate
+/// exposes its catalog parser only through the full-log API, so filtering at
+/// the Read boundary prevents that API from ever seeing (and decompressing)
+/// CHUNK_CHUNKSET message data. The full source is validated first.
+struct CatalogOnlyReader<'a> {
+    data: &'a [u8],
+    scan_offset: usize,
+    emit_offset: usize,
+    emit_end: usize,
+}
+
+impl<'a> CatalogOnlyReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            scan_offset: 0,
+            emit_offset: 0,
+            emit_end: 0,
+        }
+    }
+
+    fn select_next_catalog(&mut self) -> bool {
+        while self.scan_offset < self.data.len() {
+            let start = self.scan_offset;
+            let (tag, _, next) =
+                tracev3_chunk_at(self.data, start).expect("tracev3 framing was already validated");
+            self.scan_offset = next;
+            if tag == CHUNK_CATALOG {
+                self.emit_offset = start;
+                self.emit_end = next;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Read for CatalogOnlyReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.emit_offset == self.emit_end && !self.select_next_catalog() {
+                break;
+            }
+            let available = self.emit_end - self.emit_offset;
+            let copy = available.min(out.len() - written);
+            out[written..written + copy]
+                .copy_from_slice(&self.data[self.emit_offset..self.emit_offset + copy]);
+            self.emit_offset += copy;
+            written += copy;
+        }
+        Ok(written)
+    }
 }
 
 #[derive(Default)]
@@ -221,19 +383,20 @@ impl Aggregator {
                 return;
             }
         };
-        let Ok(log) = parse_log(Cursor::new(data), source) else {
-            self.tracev3_failures += 1;
-            return;
-        };
         // A real tracev3 member carries at least one catalog. Track this per
         // file: an empty member must still degrade a healthy aggregate that
         // also contains process-bearing files.
+        let Ok(log) = parse_log(CatalogOnlyReader::new(data), source) else {
+            self.tracev3_failures += 1;
+            return;
+        };
         let mut incomplete =
             catalog_chunks == 0 || (log.catalog_data.len() as u64) != catalog_chunks;
         for cat in &log.catalog_data {
             self.catalogs += 1;
             if usize::from(cat.catalog.number_process_information_entries)
                 != cat.catalog.catalog_process_info_entries.len()
+                || usize::from(cat.catalog.number_sub_chunks) != cat.catalog.catalog_subchunks.len()
             {
                 incomplete = true;
             }
@@ -753,11 +916,17 @@ mod tests {
     }
 
     fn catalog_chunk(entries: &[(u16, u64, u32, u32)]) -> Vec<u8> {
+        let process_region_size = entries
+            .len()
+            .checked_mul(48)
+            .and_then(|size| size.checked_add(16))
+            .and_then(|size| u16::try_from(size).ok())
+            .expect("test catalog process region must fit its u16 offset");
         let mut body = Vec::new();
         body.extend_from_slice(&16u16.to_le_bytes()); // one catalog UUID
         body.extend_from_slice(&16u16.to_le_bytes()); // no subsystem strings
         body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&process_region_size.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes()); // no subchunks
         body.extend_from_slice(&[0u8; 6]);
         body.extend_from_slice(&0u64.to_le_bytes());
@@ -780,6 +949,25 @@ mod tests {
         chunk(CHUNK_CATALOG, &body)
     }
 
+    fn catalog_chunk_with_empty_subchunk() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&16u16.to_le_bytes()); // one catalog UUID
+        body.extend_from_slice(&16u16.to_le_bytes()); // no subsystem strings
+        body.extend_from_slice(&0u16.to_le_bytes()); // no process entries
+        body.extend_from_slice(&16u16.to_le_bytes()); // subchunks follow the UUID
+        body.extend_from_slice(&1u16.to_le_bytes()); // one subchunk
+        body.extend_from_slice(&[0u8; 6]);
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&[0xAA; 16]);
+        body.extend_from_slice(&0u64.to_le_bytes()); // start
+        body.extend_from_slice(&0u64.to_le_bytes()); // end
+        body.extend_from_slice(&0u32.to_le_bytes()); // uncompressed size
+        body.extend_from_slice(&256u32.to_le_bytes()); // LZ4
+        body.extend_from_slice(&0u32.to_le_bytes()); // no indexes
+        body.extend_from_slice(&0u32.to_le_bytes()); // no string offsets
+        chunk(CHUNK_CATALOG, &body)
+    }
+
     #[test]
     fn strict_framing_rejects_tails_missing_padding_and_unknown_chunks() {
         let mut short_tail = chunk(CHUNK_HEADER, &[]);
@@ -792,6 +980,108 @@ mod tests {
 
         assert!(validate_tracev3(&chunk(0xDEAD, &[])).is_err());
         assert_eq!(validate_tracev3(&chunk(CHUNK_HEADER, &[])), Ok(0));
+    }
+
+    #[test]
+    fn catalog_validation_rejects_malformed_offsets_before_parsing() {
+        let valid = catalog_chunk(&[(0, 1, 2, 42)]);
+        let cases = [
+            (16u16, 15u16, 64u16), // process before subsystem: upstream u16 underflow
+            (16, 16, 15),          // subchunks before process inventory
+            (17, 17, 65),          // partial UUID in the UUID region
+            (16, 16, u16::MAX),    // offset outside the declared body
+        ];
+        for (subsystems, processes, subchunks) in cases {
+            let mut malformed = valid.clone();
+            malformed[16..18].copy_from_slice(&subsystems.to_le_bytes());
+            malformed[18..20].copy_from_slice(&processes.to_le_bytes());
+            malformed[22..24].copy_from_slice(&subchunks.to_le_bytes());
+            assert!(validate_tracev3(&malformed).is_err());
+
+            let mut agg = Aggregator::default();
+            agg.consume_tracev3("Persist/malformed-offset.tracev3", &malformed);
+            assert_eq!(agg.tracev3_failures, 1);
+            assert!(agg.procs.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_validation_rejects_underdeclared_or_trailing_body_data() {
+        // Keep two complete process entries in the declared process region but
+        // claim only one. Upstream otherwise accepts the first entry and then
+        // starts parsing subchunks from the second because it ignores the
+        // catalog's declared subchunk offset.
+        let mut underdeclared = catalog_chunk(&[(0, 1, 2, 42), (0, 3, 4, 43)]);
+        underdeclared[20..22].copy_from_slice(&1u16.to_le_bytes());
+        assert!(validate_tracev3(&underdeclared).is_err());
+
+        // A fully valid prefix plus non-padding bytes inside the top-level
+        // declared body must not be accepted as a complete inventory.
+        let mut trailing = catalog_chunk(&[(0, 1, 2, 42)]);
+        let old_size = u64::from_le_bytes(trailing[8..16].try_into().unwrap());
+        trailing[8..16].copy_from_slice(&(old_size + 8).to_le_bytes());
+        trailing.extend_from_slice(&[0xA5; 8]);
+        assert!(validate_tracev3(&trailing).is_err());
+
+        for malformed in [&underdeclared, &trailing] {
+            let mut agg = Aggregator::default();
+            agg.consume_tracev3("Persist/incomplete-body.tracev3", malformed);
+            assert_eq!(agg.tracev3_failures, 1);
+            assert!(agg.procs.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_validation_bounds_nested_counts_and_allows_outer_padding() {
+        let valid = catalog_chunk(&[(0, 1, 2, 42)]);
+
+        // number_uuids_entries sits 32 bytes into the process entry. A hostile
+        // count must be rejected against the declared process region before
+        // upstream's repeated parser sees it.
+        let mut hostile_uuid_count = valid.clone();
+        let count_offset = 16 + CATALOG_FIXED_BODY_SIZE + 16 + 32;
+        hostile_uuid_count[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_tracev3(&hostile_uuid_count).is_err());
+
+        let mut hostile_subsystem_count = valid.clone();
+        let count_offset = 16 + CATALOG_FIXED_BODY_SIZE + 16 + 40;
+        hostile_subsystem_count[count_offset..count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_tracev3(&hostile_subsystem_count).is_err());
+
+        let subchunk = catalog_chunk_with_empty_subchunk();
+        assert_eq!(validate_tracev3(&subchunk), Ok(1));
+        let mut hostile_index_count = subchunk.clone();
+        let count_offset = 16 + CATALOG_FIXED_BODY_SIZE + 16 + 24;
+        hostile_index_count[count_offset..count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_tracev3(&hostile_index_count).is_err());
+
+        let mut hostile_string_count = subchunk;
+        let count_offset = 16 + CATALOG_FIXED_BODY_SIZE + 16 + 28;
+        hostile_string_count[count_offset..count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_tracev3(&hostile_string_count).is_err());
+
+        // Insert one legitimate subsystem-string byte. That makes the catalog
+        // body non-aligned and requires seven bytes of top-level source
+        // padding. The dependency treats those bytes as framing, not body, and
+        // does not require a particular padding value.
+        let body_size =
+            usize::try_from(u64::from_le_bytes(valid[8..16].try_into().unwrap())).unwrap();
+        let mut body = valid[16..16 + body_size].to_vec();
+        body.insert(CATALOG_FIXED_BODY_SIZE + 16, b'x');
+        body[2..4].copy_from_slice(&17u16.to_le_bytes());
+        body[6..8].copy_from_slice(&65u16.to_le_bytes());
+        let mut padded = chunk(CHUNK_CATALOG, &body);
+        *padded.last_mut().unwrap() = 0xA5;
+        assert_eq!(validate_tracev3(&padded), Ok(1));
+
+        let mut agg = Aggregator::default();
+        agg.consume_tracev3("Persist/padded.tracev3", &padded);
+        assert_eq!(agg.tracev3_failures, 0);
+        assert_eq!(agg.tracev3_incomplete, 0);
+        assert_eq!(agg.procs.len(), 1);
     }
 
     #[test]
@@ -825,8 +1115,12 @@ mod tests {
         let entries: Vec<_> = (0..=MAX_PIDS_PER_PROCESS)
             .map(|pid| (0, pid as u64, 0, pid as u32))
             .collect();
+        let mut tracev3 = Vec::new();
+        for entries in entries.chunks(1_024) {
+            tracev3.extend_from_slice(&catalog_chunk(entries));
+        }
         let mut agg = Aggregator::default();
-        agg.consume_tracev3("Persist/per-process-cap.tracev3", &catalog_chunk(&entries));
+        agg.consume_tracev3("Persist/per-process-cap.tracev3", &tracev3);
         assert!(agg.cap_hit);
         assert_eq!(
             agg.procs["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"].pids.len(),
@@ -835,51 +1129,64 @@ mod tests {
     }
 
     #[test]
-    fn hostile_chunkset_decompress_size_is_a_parse_failure_not_a_panic() {
-        // Upstream hands the declared u32 uncompress_size straight to
-        // lz4_flex, which eagerly allocates it: u32::MAX would be a
-        // capacity-overflow panic on wasm32, aborting the whole scan.
+    fn chunkset_payloads_stay_outside_the_catalog_parser_boundary() {
+        // The full-log parser would hand this attacker-controlled size to
+        // lz4_flex and attempt an enormous allocation. Trace needs only the
+        // preceding catalog, so even deliberately invalid message data must
+        // never cross that parser boundary.
         let mut body = Vec::new();
-        body.extend_from_slice(&BV41_COMPRESSED.to_le_bytes());
+        body.extend_from_slice(&825_521_762u32.to_le_bytes()); // "bv41"
         body.extend_from_slice(&u32::MAX.to_le_bytes()); // uncompress_size
         body.extend_from_slice(&8u32.to_le_bytes()); // block_size
-        body.extend_from_slice(&[0u8; 8]);
-        let file = chunk(CHUNK_CHUNKSET, &body);
-        assert!(validate_tracev3(&file).is_err());
+        body.extend_from_slice(&[0u8; 8]); // invalid lz4, no footer
+        let catalog = catalog_chunk(&[(0, 1, 2, 42)]);
+        let mut file = catalog.clone();
+        file.extend_from_slice(&chunk(CHUNK_CHUNKSET, &body));
+
+        assert_eq!(validate_tracev3(&file), Ok(1));
+        let mut parser_input = Vec::new();
+        CatalogOnlyReader::new(&file)
+            .read_to_end(&mut parser_input)
+            .unwrap();
+        assert_eq!(parser_input, catalog, "chunkset bytes reached the parser");
         let mut agg = Aggregator::default();
         agg.consume_tracev3("Persist/0.tracev3", &file);
-        assert_eq!(agg.tracev3_failures, 1, "rejected before upstream parse");
+        assert_eq!(agg.tracev3_failures, 0);
+        assert_eq!(agg.tracev3_incomplete, 0);
+        assert_eq!(agg.catalogs, 1);
+        assert_eq!(agg.procs.len(), 1);
     }
 
     #[test]
-    fn many_large_chunksets_exceed_the_file_budget() {
+    fn chunksets_without_a_catalog_never_claim_inventory_coverage() {
         let mut body = Vec::new();
-        body.extend_from_slice(&BV41_COMPRESSED.to_le_bytes());
-        body.extend_from_slice(&(MAX_CHUNKSET_UNCOMPRESS as u32).to_le_bytes());
+        body.extend_from_slice(&825_521_762u32.to_le_bytes()); // "bv41"
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
         body.extend_from_slice(&8u32.to_le_bytes());
         body.extend_from_slice(&[0u8; 8]);
         let one = chunk(CHUNK_CHUNKSET, &body);
         let mut file = Vec::new();
         for _ in 0..5 {
-            file.extend_from_slice(&one); // 5 * 64 MiB declared > 256 MiB cap
+            file.extend_from_slice(&one);
         }
-        assert!(validate_tracev3(&file).is_err());
-    }
-
-    #[test]
-    fn silently_dropped_catalog_marks_file_incomplete() {
-        // A catalog chunk whose body fails the upstream catalog parser is
-        // dropped log-and-continue: parse_log still returns Ok, minus that
-        // catalog's process inventory. The framing count must catch it.
-        let file = chunk(CHUNK_CATALOG, &[0xFFu8; 32]);
-        assert_eq!(validate_tracev3(&file), Ok(1));
+        assert_eq!(validate_tracev3(&file), Ok(0));
         let mut agg = Aggregator::default();
         agg.consume_tracev3("Persist/0.tracev3", &file);
         assert_eq!(agg.tracev3_failures, 0);
-        assert_eq!(
-            agg.tracev3_incomplete, 1,
-            "dropped catalog must be detected"
-        );
+        assert_eq!(agg.tracev3_incomplete, 1);
+        assert!(agg.procs.is_empty());
+    }
+
+    #[test]
+    fn malformed_catalog_body_is_rejected_before_upstream_parsing() {
+        // Malformed catalogs are rejected before they can reach dependency
+        // arithmetic or its log-and-continue path.
+        let file = chunk(CHUNK_CATALOG, &[0xFFu8; 32]);
+        assert!(validate_tracev3(&file).is_err());
+        let mut agg = Aggregator::default();
+        agg.consume_tracev3("Persist/0.tracev3", &file);
+        assert_eq!(agg.tracev3_failures, 1);
+        assert_eq!(agg.tracev3_incomplete, 0);
         let mut findings = Findings::new();
         let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
         assert_eq!(summary.status, "parsed_partial");

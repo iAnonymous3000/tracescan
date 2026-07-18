@@ -45,11 +45,11 @@ the archive is truthful or representative.
 | Surface | Automated evidence |
 |---|---|
 | Archive streaming | Property tests over arbitrary bytes and chunking; unit tests for single and concatenated gzip members, tar streaming, PAX and GNU long names, canonical and undecodable paths, checksums, metadata ambiguity, truncation, end markers, retained-file limits, entry limits, and decompression limits |
-| Unified logs | Unit tests for tracev3 framing, catalog-count consistency, uuidtext structure and conflicts, canonical path resolution, unresolved processes, per-process and aggregate retention caps, 64 MiB per-chunkset and 256 MiB per-file declared inner-decompression limits, and fail-closed partial status |
+| Unified logs | Unit tests for tracev3 framing, catalog-only parser isolation under hostile chunkset size declarations, catalog-count consistency, uuidtext structure and conflicts, canonical path resolution, unresolved processes, per-process and aggregate retention caps, and fail-closed partial status |
 | Shutdown logs | Classic one-line and iOS 26 rotated/header-plus-client parsing; reboot-block boundaries; malformed delay blocks; binary-UUID suffix stripping; direct-child versus nested staging-path heuristics |
 | Crash and diagnostic `.ips` | Ordinary crash reports, kernel panics, disk-write diagnostics, Jetsam, stacks, forceReset, Siri feedback, ResetCounter, security analytics (`bug_type` 226), CPU resource (`202`), and proactive event tracker (`303`), including malformed rows, schema drift, and the fail-closed 10,000-candidate cap |
 | Process listings | Real-format `ps.txt` and `ps_thread.txt`; commands containing spaces; wide and overflowing numeric columns; thread continuations; full-path command columns; iOS 26 `?` process state; malformed rows; valid header-only auxiliary listings |
-| STIX extraction and matching | Fully anchored single-equality parsing; rejection of compound, qualified, malformed, and non-STIX patterns; exact case-sensitive names and paths; canonical absolute paths; directory-prefix indicators; non-applicable relative, dot-segment, and slash-bearing name indicators; per-set duplicate-value reduction; exact reviewed manifest counts and one malware object per snapshot; hostile JSON properties |
+| STIX extraction and matching | Fully anchored single-equality parsing; rejection of compound, qualified, malformed, and non-STIX patterns; exact case-sensitive names and alias-equivalent canonical paths; `/var`, `/tmp`, and `/etc` compatibility aliases; directory-prefix indicators; non-applicable relative, dot-segment, and slash-bearing name indicators; per-set duplicate-value reduction; exact reviewed manifest counts and one malware object per snapshot; hostile JSON properties |
 | Verdict and report | Fail-closed invalid/inconclusive paths, anchored primary-phone surface classification, severity- and indicator-diversity-aware findings retention, process-bearing versus metadata-only surface accounting, producer parity, schema version 3 validation, engine-measured archive size, archive and indicator hashing, and golden field shape |
 | Browser application | Playwright on Chromium, Firefox, and WebKit, including worker and inline producers, demo scans, rendering, accessibility flows, exports, scan limits, and service-worker behavior; cached offline scanning runs on Chromium and Firefox, while Playwright WebKit is skipped because it cannot reliably emulate offline service-worker navigation |
 
@@ -107,14 +107,16 @@ The snapshots dated 2026-07-08 contain 2,887 extracted indicators:
 |---|---:|---|
 | Process name | 83 | Exact, case-sensitive observed basename |
 | File name | 15 | Exact, case-sensitive observed basename |
-| File path | 50 | Exact canonical absolute path, or canonical descendant of a trailing-slash directory indicator |
+| File path | 50 | Exact, case-sensitive canonical absolute path after resolving `/var`, `/tmp`, and `/etc` to `/private/...` for comparison, or a descendant of a trailing-slash directory indicator under the same rule |
 
 All four primary surfaces enumerate **process activity**. There is no complete
 filesystem listing in a sysdiagnose. File-name indicators use observed process
 identities or executable basenames; file-path indicators use only canonical
-observed executable paths. A plist, database, directory, or lock-file indicator
-does not prove file presence and matches only when the published value can be
-applied under one of those process-derived rules.
+observed executable paths. The well-known Apple `/var`, `/tmp`, and `/etc`
+aliases resolve to `/private/...` only for comparison; reports retain the raw
+observed path and published indicator. A plist, database, directory, or
+lock-file indicator does not prove file presence and matches only when the
+published value can be applied under one of those process-derived rules.
 
 The STIX parser accepts exactly one fully anchored equality clause. It never
 turns one side of `AND`, `OR`, `FOLLOWEDBY`, a qualifier, a comment, or malformed

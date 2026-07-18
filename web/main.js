@@ -39,6 +39,16 @@ function fmtBytes(n) {
   return n + ' B';
 }
 
+function httpsHref(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 const UPSTREAM_BODY_LIMIT = Number.isSafeInteger(globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES)
   && globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES > 0
   ? globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES
@@ -294,7 +304,7 @@ function renderIocPanel() {
       ? ` Upstream freshness is currently unknown for ${unknown} indicator set${unknown > 1 ? 's' : ''}; scans still use the dated, reviewed snapshots shown above.`
       : ' The published upstream files matched all reviewed snapshots at this check.';
   $('#ioc-note').textContent =
-    `${applicable} of ${total} loaded indicators are process names, file names, or paths that can be checked against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths (and canonical descendants when an indicator is a directory ending in /). Trace does not inspect a filesystem listing. ` +
+    `${applicable} of ${total} loaded indicators are process names, file names, or paths that can be checked against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison (and matching descendants when an indicator is a directory ending in /). Trace does not inspect a filesystem listing. ` +
     `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.` +
     freshnessNote;
   $('#ioc-panel').hidden = false;
@@ -303,8 +313,14 @@ function renderIocPanel() {
 /* ---------- scanning ---------- */
 
 let worker = null;
-let workerState = 'unavailable'; // unavailable | starting | ready | scanning | failed
+let workerState = 'unavailable'; // unavailable | starting | ready | scanning
 let workerReady = Promise.resolve(false);
+// Inline scanning is an availability fallback only for browsers where the
+// background worker could not be started before any archive was handed to it.
+// Once a scan has reached a worker, a failed replacement must never turn the
+// next explicit retry into a main-thread replay of the same potentially
+// hostile bytes.
+let workerRequiredForRetry = false;
 const WORKER_STARTUP_TIMEOUT_MS = 8_000;
 const WORKER_SCAN_INACTIVITY_TIMEOUT_MS = Number.isSafeInteger(
   globalThis.__TRACE_TEST_WORKER_TIMEOUT_MS
@@ -318,7 +334,9 @@ const WORKER_SCAN_INACTIVITY_TIMEOUT_MS = Number.isSafeInteger(
 // because failing here rejects a valid scan of a healthy worker.
 const WORKER_SCAN_FINALIZE_TIMEOUT_MS = 120_000;
 const WORKER_SCAN_FAILURE =
-  'The background scanner stopped while reading this file. Trace did not retry it on the main page because doing so could freeze or crash the tab. Keep the original file, reload this page, and contact a digital security helpline if the problem repeats.';
+  'The background scanner stopped while reading this file. Trace did not retry it on the main page because doing so could freeze or crash the tab. A fresh background scanner is preparing; go back and choose the file again. Keep the original file and contact a digital security helpline if the problem repeats.';
+const WORKER_RESTART_FAILURE =
+  'The background scanner could not be restarted. Trace did not retry this file on the main page because doing so could freeze or crash the tab. Reload the page before trying again. Keep the original file and contact a digital security helpline if the problem repeats.';
 
 function initWorker() {
   try {
@@ -367,6 +385,7 @@ function initWorker() {
 // tear down a worker that has already been replaced.
 function recycleWorker(expected) {
   if (worker !== expected) return;
+  workerRequiredForRetry = true;
   worker = null;
   try {
     expected.terminate();
@@ -479,11 +498,7 @@ function scanWithWorker(file, expectedSets, control) {
       settled = true;
       cleanup();
       if (disposition === 'recycle') recycleWorker(w);
-      else if (disposition === 'failed') {
-        if (worker === w) worker = null;
-        workerState = 'failed';
-        w.terminate();
-      } else restoreReady();
+      else restoreReady();
       reject(error);
     };
     const finishResolve = (report) => {
@@ -537,7 +552,7 @@ function scanWithWorker(file, expectedSets, control) {
       }
     };
     const onErr = () => {
-      finishReject(new Error(WORKER_SCAN_FAILURE), 'failed');
+      failClosed();
     };
     const onMessageError = () => failClosed();
     const cancel = () => {
@@ -666,7 +681,6 @@ async function handleFile(file, context = {}, intent = null) {
     if (control.cancelled) throw new ScanCancelledError();
     if (workerState === 'starting') await workerReady;
     if (control.cancelled) throw new ScanCancelledError();
-    if (workerState === 'failed') throw new Error(WORKER_SCAN_FAILURE);
     const expectedSets = snapshotIndicatorSets();
     let report;
     if (worker && workerState === 'ready') {
@@ -674,6 +688,8 @@ async function handleFile(file, context = {}, intent = null) {
       control.via = 'worker';
       setScanPhase('reading', file, control);
       report = await scanWithWorker(file, expectedSets, control);
+    } else if (workerRequiredForRetry) {
+      throw new Error(WORKER_RESTART_FAILURE);
     } else {
       state.lastScanVia = 'inline';
       control.via = 'inline';
@@ -751,7 +767,7 @@ function verdictHtml(report) {
   if (v === 'match') {
     return `<div class="verdict match">
       <h2>Traces matching known spyware were found</h2>
-      <p>This file contains process-bearing entries that matched published indicators of mercenary spyware. Trace compares exact process names and full paths; a file-name indicator may also match an observed process basename, and a directory path ending in <code>/</code> may match a canonical descendant. This is a serious signal that deserves expert review, but it is not final proof on its own.</p>
+      <p>This file contains process-bearing entries that matched published indicators of mercenary spyware. Trace compares exact process names and file paths after treating Apple's <code>/var</code>, <code>/tmp</code>, and <code>/etc</code> aliases as equivalent to <code>/private/...</code>; a file-name indicator may also match an observed process basename, and a directory path ending in <code>/</code> may match a descendant under the same comparison. This is a serious signal that deserves expert review, but it is not final proof on its own.</p>
       ${limitNote}
       <p>Please follow the steps below. You are not alone in this, and help is free.</p>
     </div>` + HELP_BLOCK;
@@ -859,7 +875,7 @@ function artifactsHtml(report) {
   const missingRows = missing.map((m) => `
     <tr>
       <td>${esc(m.kind)}</td>
-      <td class="path">–</td>
+      <td class="path">not applicable</td>
       <td>not found</td>
       <td>${esc(m.note)}</td>
     </tr>`).join('');
@@ -895,12 +911,18 @@ function coverageHtml(report) {
 }
 
 function provenanceHtml(report) {
-  const rows = (report.indicator_provenance || []).map((p) => `
+  const rows = (report.indicator_provenance || []).map((p) => {
+    const sourceHref = httpsHref(p.url);
+    const source = sourceHref
+      ? `<a href="${esc(sourceHref)}" target="_blank" rel="noopener noreferrer" aria-label="Indicator source for ${esc(p.campaign)}">source</a>`
+      : '<span>source unavailable</span>';
+    return `
     <div class="ioc-row">
       <span><span class="campaign">${esc(p.campaign)}</span>
         <span class="badge bundled">reviewed snapshot · ${esc(p.date)}</span></span>
-      <span class="meta">${p.sha256 ? `<code title="SHA-256 of the indicator file used: ${esc(p.sha256)}">sha256:${esc(p.sha256.slice(0, 12))}…</code> · ` : ''}<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer" aria-label="Indicator source for ${esc(p.campaign)}">source</a></span>
-    </div>`).join('');
+      <span class="meta">${p.sha256 ? `<code title="SHA-256 of the indicator file used: ${esc(p.sha256)}">sha256:${esc(p.sha256.slice(0, 12))}…</code> · ` : ''}${source}</span>
+    </div>`;
+  }).join('');
   return `<div class="panel"><h2>Indicators used</h2>${rows}
     <p class="fine">Scans use only reviewed snapshot indicators; the hash identifies the exact revision this scan used and is recorded in the exported report. Public indicators inherit a time lag: new campaigns appear here only after researchers publish them and the snapshots are reviewed. A scan can only be as current as the open ecosystem.</p></div>`;
 }
@@ -1277,6 +1299,7 @@ window.__trace = {
     worker = null;
     workerState = 'unavailable';
     workerReady = Promise.resolve(false);
+    workerRequiredForRetry = false;
   },
 };
 

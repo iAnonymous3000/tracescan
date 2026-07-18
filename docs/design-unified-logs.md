@@ -34,9 +34,14 @@ at a time and dropped after their durable process facts have been retained:
 1. A `.tracev3` member under the archive root's direct
    `system_logs.logarchive` child is buffered only up to the outer 32 MiB member
    cap. Nested or paired-device lookalikes are ignored. Trace validates complete
-   top-level chunk framing, recognized chunk types, and declared decompression
-   sizes before invoking the upstream parser. It then retains
-   `(main_uuid, pid)` observations and catalog-appearance counts.
+   top-level chunk framing and recognized chunk types. Catalog bodies must also
+   have ordered, in-bounds internal offsets, bounded nested entry counts, and
+   exact process/subchunk consumption before Trace exposes catalog frames to the
+   upstream parser. Header and message-chunkset frames remain part of the
+   original framing validation, but `CHUNK_CHUNKSET` bytes never cross the parser
+   boundary, so Trace performs no LZ4 message decompression and retains no parsed
+   firehose data. It retains `(main_uuid, pid)` observations and
+   catalog-appearance counts.
 2. A canonical uuidtext member has a two-character uppercase-hex directory and
    a 30-character uppercase-hex filename. Trace parses its footer, validates
    its version and path, and retains a `uuid -> canonical binary path` mapping.
@@ -61,8 +66,7 @@ The unified-log path applies both archive-wide limits and its own reduction
 limits:
 
 - 32 MiB buffered per tracev3 or uuidtext member;
-- 64 MiB declared inner decompression per compressed tracev3 chunkset;
-- 256 MiB aggregate declared inner decompression per tracev3 file;
+- message chunksets are excluded from the parser rather than decompressed;
 - 65,536 tracked process UUIDs and 65,536 retained uuidtext mappings;
 - 4,096 retained PIDs per process and 262,144 retained PIDs in aggregate;
 - 4,096 bytes per retained path and 16 MiB of retained path bytes in
@@ -77,18 +81,23 @@ inventoried, or any inventoried process cannot be resolved to a path. Surviving
 findings from structurally usable catalogs remain visible, but a no-finding
 result with one of these conditions is inconclusive rather than reassuring.
 
-These limits close known single-declaration allocation hazards; they do not
-prove bounded aggregate CPU time or browser responsiveness for an archive with
-many individually valid hostile members. Availability loss remains a residual
-risk and must produce a visible error or incomplete result, never a trustworthy
+The catalog-only parser boundary removes the chunkset size-declaration
+allocation and retained-firehose hazards. These limits do not prove bounded
+aggregate CPU time or browser responsiveness for an archive with many
+individually valid hostile members. Availability loss remains a residual risk
+and must produce a visible error or incomplete result, never a trustworthy
 negative.
 
 ## Validation status
 
-Public fixtures and CI cover framing, truncation, unsupported chunks, declared
-decompression limits, catalog integrity, UUID/path validation, conflicts,
-inventory caps, matching, and degraded-surface verdict behavior. Sanitized
-aggregates from private real captures and the command for an ignored local
-real-capture test are recorded in [`VALIDATION.md`](../VALIDATION.md). The
-private archives are not published, so those results are receipts rather than
-independently replayable public evidence.
+Public fixtures and CI cover framing, truncation, unsupported chunks, the
+catalog-only boundary under hostile chunkset size declarations, malformed
+catalog offsets and nested counts, exact declared-body consumption,
+catalog-count parity, UUID/path validation, conflicts, inventory caps, matching,
+and degraded-surface verdict behavior. The ignored real-capture harness can
+replay the independently obtainable public iOS 15 archive or maintainer-only
+iOS 26 captures through the same boundary. Dated public and private receipts,
+along with the replay command, are recorded in
+[`VALIDATION.md`](../VALIDATION.md); each receipt remains scoped to its cited
+tree. The private archives are not published, so those results are receipts
+rather than independently replayable public evidence.

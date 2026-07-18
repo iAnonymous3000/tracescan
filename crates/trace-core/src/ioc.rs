@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -237,6 +238,26 @@ pub(crate) fn is_canonical_observed_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
+/// Resolve the stable, well-known Darwin compatibility aliases used in
+/// diagnostics. IOC values stay exactly as published for evidence and report
+/// provenance; only the internal comparison key uses the `/private` spelling.
+/// Requiring either equality or a following slash keeps lookalike components
+/// such as `/variable`, `/tmp-old`, and `/etcetera` distinct.
+fn apple_alias_comparison_path(path: &str) -> Cow<'_, str> {
+    for (alias, canonical) in [
+        ("/var", "/private/var"),
+        ("/tmp", "/private/tmp"),
+        ("/etc", "/private/etc"),
+    ] {
+        if let Some(suffix) = path.strip_prefix(alias) {
+            if suffix.is_empty() || suffix.starts_with('/') {
+                return Cow::Owned(format!("{canonical}{suffix}"));
+            }
+        }
+    }
+    Cow::Borrowed(path)
+}
+
 impl IocDb {
     pub fn new() -> Self {
         IocDb::default()
@@ -333,11 +354,15 @@ impl IocDb {
                         .strip_suffix('/')
                         .is_some_and(is_canonical_observed_path) =>
                 {
-                    self.by_dir.push((value.clone(), idx));
+                    self.by_dir
+                        .push((apple_alias_comparison_path(&value).into_owned(), idx));
                     stats.applicable += 1;
                 }
                 IocKind::FilePath if is_canonical_observed_path(&value) => {
-                    self.by_path.entry(value.clone()).or_default().push(idx);
+                    self.by_path
+                        .entry(apple_alias_comparison_path(&value).into_owned())
+                        .or_default()
+                        .push(idx);
                     stats.applicable += 1;
                 }
                 IocKind::FilePath => {}
@@ -360,11 +385,12 @@ impl IocDb {
         if !is_canonical_observed_path(full) {
             return idxs;
         }
-        if let Some(v) = self.by_path.get(full) {
+        let comparison_path = apple_alias_comparison_path(full);
+        if let Some(v) = self.by_path.get(comparison_path.as_ref()) {
             idxs.extend(v);
         }
         for (dir, idx) in &self.by_dir {
-            if full.len() > dir.len() && full.starts_with(dir.as_str()) {
+            if comparison_path.len() > dir.len() && comparison_path.starts_with(dir.as_str()) {
                 idxs.push(*idx);
             }
         }
@@ -379,11 +405,12 @@ impl IocDb {
         idxs.into_iter().map(|i| &self.all[i]).collect()
     }
 
-    /// Matches only full file paths. This intentionally does not consult
-    /// process/file-name indicators, so a caller handling an ambiguous full
-    /// command line cannot turn the basename of a path argument into an IOC
-    /// match. Dot-segment paths are rejected rather than lexically matching a
-    /// directory prefix they ultimately escape.
+    /// Matches only full file paths, resolving the well-known Apple
+    /// `/var`/`/tmp`/`/etc` aliases for comparison. This intentionally does
+    /// not consult process/file-name indicators, so a caller handling an
+    /// ambiguous full command line cannot turn the basename of a path
+    /// argument into an IOC match. Dot-segment paths are rejected rather than
+    /// lexically matching a directory prefix they ultimately escape.
     pub fn match_path(&self, raw: &str) -> Vec<&Indicator> {
         if raw.is_empty() {
             return vec![];
@@ -393,9 +420,10 @@ impl IocDb {
 
     /// Matches a process name or full path against loaded indicators.
     /// Exact, case-sensitive equality on the basename (against process/file
-    /// name indicators) and on the full path (against file path indicators),
-    /// plus prefix matching for directory-valued path indicators -
-    /// deliberately no substring matching, to keep false positives out.
+    /// name indicators) and on the alias-resolved full path (against file path
+    /// indicators), plus prefix matching for directory-valued path indicators
+    /// - deliberately no substring matching, to keep false positives out.
+    ///
     /// Case-sensitivity mirrors MVT: published sets use capitalization to
     /// tell an implant apart from the legitimate daemon it masquerades as.
     pub fn match_process(&self, raw: &str) -> Vec<&Indicator> {
@@ -434,6 +462,19 @@ mod tests {
         {"type": "indicator", "pattern": "[file:hashes.'SHA-256' = 'abc123']"}
       ]
     }"#;
+
+    fn db_with_path_indicator(path: &str) -> IocDb {
+        let bundle = serde_json::json!({
+            "objects": [{
+                "type": "indicator",
+                "pattern": format!("[file:path='{path}']")
+            }]
+        })
+        .to_string();
+        let mut db = IocDb::new();
+        db.load_stix("alias-test", &bundle).unwrap();
+        db
+    }
 
     #[test]
     fn parses_stix_and_classifies_kinds() {
@@ -587,6 +628,76 @@ mod tests {
         assert!(db.match_process("/private/var/tmp/l/").is_empty());
         assert!(db.match_process("/private/var/tmp/lx/loader").is_empty());
         assert!(db.match_process("/private/var/tmp/l").is_empty());
+    }
+
+    #[test]
+    fn apple_path_aliases_match_exact_indicators_bidirectionally() {
+        for (short, private) in [
+            ("/var/tmp/trace-alias", "/private/var/tmp/trace-alias"),
+            ("/tmp/trace-alias", "/private/tmp/trace-alias"),
+            ("/etc/trace-alias.conf", "/private/etc/trace-alias.conf"),
+        ] {
+            let short_db = db_with_path_indicator(short);
+            let matched = short_db.match_path(private);
+            assert_eq!(matched.len(), 1, "published {short}, observed {private}");
+            assert_eq!(matched[0].value, short, "published value must stay raw");
+
+            let private_db = db_with_path_indicator(private);
+            let matched = private_db.match_process(short);
+            assert_eq!(matched.len(), 1, "published {private}, observed {short}");
+            assert_eq!(matched[0].value, private, "published value must stay raw");
+        }
+    }
+
+    #[test]
+    fn apple_path_aliases_match_directory_indicators_bidirectionally() {
+        for (short, private) in [
+            ("/var/tmp/trace-dir/", "/private/var/tmp/trace-dir/"),
+            ("/tmp/trace-dir/", "/private/tmp/trace-dir/"),
+            ("/etc/trace-dir/", "/private/etc/trace-dir/"),
+        ] {
+            let private_child = format!("{private}payload");
+            let short_db = db_with_path_indicator(short);
+            let matched = short_db.match_path(&private_child);
+            assert_eq!(
+                matched.len(),
+                1,
+                "published {short}, observed {private_child}"
+            );
+            assert_eq!(matched[0].value, short, "published value must stay raw");
+
+            let short_child = format!("{short}payload");
+            let private_db = db_with_path_indicator(private);
+            let matched = private_db.match_process(&short_child);
+            assert_eq!(
+                matched.len(),
+                1,
+                "published {private}, observed {short_child}"
+            );
+            assert_eq!(matched[0].value, private, "published value must stay raw");
+        }
+    }
+
+    #[test]
+    fn apple_path_aliases_require_component_boundaries() {
+        for (published, observed) in [
+            ("/private/variable/payload", "/variable/payload"),
+            ("/private/tmp-old/payload", "/tmp-old/payload"),
+            ("/private/etcetera/payload", "/etcetera/payload"),
+        ] {
+            assert!(
+                db_with_path_indicator(published)
+                    .match_path(observed)
+                    .is_empty(),
+                "lookalike alias component matched: {observed}"
+            );
+        }
+
+        let directory_db = db_with_path_indicator("/private/var/tmp/trace-dir/");
+        assert!(directory_db
+            .match_path("/var/tmp/trace-directory/payload")
+            .is_empty());
+        assert!(directory_db.match_path("/var/tmp/trace-dir").is_empty());
     }
 
     #[test]
