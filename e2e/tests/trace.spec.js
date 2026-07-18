@@ -52,12 +52,22 @@ test('clean demo produces the clear verdict', async ({ page }) => {
   await page.goto('/');
   await page.click('#demo-clean');
   await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('.example-note')).toContainText(
+    'Example result - no device was scanned.'
+  );
   await expect(page.locator('.verdict h2')).toHaveText('No known spyware traces found');
   // the honest-epistemics disclaimer must always accompany a clear verdict
   await expect(page.locator('.verdict.clear')).toContainText('not the same as "your phone is clean."');
   // The verdict heading takes focus so a screen reader announces the outcome
   // rather than leaving it on an unnamed container.
   await expect(page.locator('.verdict h2')).toBeFocused();
+  await expect(page.locator('#export-btn')).toContainText('includes identifying metadata');
+  expect(await page.evaluate(() => {
+    const actions = document.querySelector('.report-actions');
+    const firstDetail = document.querySelector('#results .finding, #results .panel');
+    return Boolean(actions && firstDetail
+      && (actions.compareDocumentPosition(firstDetail) & Node.DOCUMENT_POSITION_FOLLOWING));
+  })).toBe(true);
 });
 
 test('a paired-device-only clear report describes its narrow evidence without saying only 0', async ({ page }) => {
@@ -153,6 +163,7 @@ test('unknown, missing, and null verdicts fail closed in both report renderers',
 });
 
 test('infected demo produces the match verdict with helplines', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 568 });
   await page.goto('/');
   await page.click('#demo-infected');
   await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
@@ -163,6 +174,14 @@ test('infected demo produces the match verdict with helplines', async ({ page })
   await expect(artifacts.filter({ hasText: '.ips' })).toHaveCount(1);
   await expect(artifacts.filter({ hasText: 'ps.txt' })).toHaveCount(1);
   await expect(artifacts.filter({ hasText: 'shutdown.0.log' })).toHaveCount(1);
+  expect(await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    document: document.documentElement.scrollWidth,
+  }))).toEqual({ viewport: 320, document: 320 });
+  const findingCount = await page.locator('.finding').count();
+  await expect(page.locator('.finding[aria-labelledby]')).toHaveCount(findingCount);
+  await expect(page.locator('.finding summary')).toHaveCount(findingCount);
+  await expect(page.locator('[aria-label^="Indicator source for "]')).toHaveCount(8);
 });
 
 test('results show and copy the engine-owned archive SHA-256', async ({ page }) => {
@@ -210,6 +229,7 @@ test('archive SHA-256 is absent without a current report and after a later error
     window.__trace.handleFile(broken);
   });
   await expect(page.locator('.error-box')).toContainText('forced read failure');
+  await expect(page.locator('#scan-error-heading')).toBeFocused();
   await expect(page.locator('#source-sha256')).toHaveCount(0);
   expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
 });
@@ -256,6 +276,9 @@ test('readable report previews redactions and downloads self-contained HTML', as
     'readable-dialog-description'
   );
   const preview = page.locator('#readable-preview');
+  await expect(preview.locator('.example-notice')).toContainText(
+    'Example report - no device was scanned.'
+  );
   await expect(preview).toContainText(identity.hash);
   await expect(preview).toContainText('redacted from this readable copy');
   await expect(preview).not.toContainText(identity.name);
@@ -286,6 +309,9 @@ test('readable report previews redactions and downloads self-contained HTML', as
   const downloadPromise = page.waitForEvent('download');
   await page.click('#download-readable');
   const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(
+    /^trace-example-readable-report-\d{8}T\d{6}Z-[0-9a-f]{8}\.html$/
+  );
   const html = fs.readFileSync(await download.path(), 'utf8');
   expect(html).toContain('<!doctype html>');
   expect(html).toContain(identity.hash);
@@ -297,6 +323,8 @@ test('readable report previews redactions and downloads self-contained HTML', as
   expect(html).toContain('This readable HTML is a reduced convenience copy');
   expect(html).toContain('.verification a::after');
   expect(html).toContain('attr(href)');
+  expect(html).toContain('<title>Example Trace report -');
+  expect(html).toContain('Example report - no device was scanned.');
 });
 
 test('withholding device metadata strips it from technical details and evidence too', async ({ page }) => {
@@ -472,6 +500,9 @@ test('exported report records indicator provenance', async ({ page }) => {
   const downloadPromise = page.waitForEvent('download');
   await page.click('#export-btn');
   const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(
+    /^trace-example-technical-report-\d{8}T\d{6}Z-[0-9a-f]{8}\.json$/
+  );
   const report = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
   expect(report.tool.name).toBe('Trace');
   expect(report.stats.applicable_indicators).toBeGreaterThan(0);
@@ -479,6 +510,139 @@ test('exported report records indicator provenance', async ({ page }) => {
   for (const p of report.indicator_provenance) {
     expect(p.sha256).toMatch(/^[0-9a-f]{64}$/);
   }
+
+  const secondDownloadPromise = page.waitForEvent('download');
+  await page.click('#export-btn');
+  const secondDownload = await secondDownloadPromise;
+  expect(secondDownload.suggestedFilename()).not.toBe(download.suggestedFilename());
+});
+
+test('main and readable reports cap artifact rows without changing the JSON report', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+
+  const result = await page.evaluate(async () => {
+    const report = structuredClone(window.__trace.lastReport);
+    const template = report.artifacts[0];
+    report.artifacts = Array.from({ length: 245 }, (_, index) => ({
+      ...structuredClone(template),
+      path: `root/very-long-artifact-path-${index}.log`,
+    }));
+    report.missing_artifacts = [];
+    window.__trace.renderReport(report);
+    const { readableReportFragment } = await import('./readable-report.js');
+    const parsed = new DOMParser().parseFromString(
+      readableReportFragment(report, { includeTechnical: true }),
+      'text/html'
+    );
+    const artifactSection = [...parsed.querySelectorAll('.report-section')].find(
+      (section) => section.querySelector('h2')?.textContent === 'What Trace examined'
+    );
+    return {
+      reportArtifacts: window.__trace.lastReport.artifacts.length,
+      readableRows: artifactSection.querySelectorAll('tbody tr').length,
+      readableText: parsed.body.textContent,
+    };
+  });
+
+  await expect(page.locator('.artifacts tbody tr')).toHaveCount(200);
+  await expect(page.locator('.panel', { hasText: 'What was examined' })).toContainText(
+    'Showing the first 200 processed artifacts; 45 more remain'
+  );
+  expect(result.reportArtifacts).toBe(245);
+  expect(result.readableRows).toBeLessThanOrEqual(204);
+  expect(result.readableText).toContain(
+    'This readable copy shows the first 200 processed artifacts. 45 additional artifacts remain'
+  );
+});
+
+test('a zero-artifact invalid report still renders its missing-artifact inventory', async ({ page }) => {
+  await page.goto('/');
+  await page.click('#demo-clean');
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+
+  const readableText = await page.evaluate(async () => {
+    const report = structuredClone(window.__trace.lastReport);
+    report.verdict = 'invalid';
+    report.artifacts = [];
+    report.stats.artifacts_found = 0;
+    report.missing_artifacts = [
+      { kind: 'shutdown_log', note: 'No shutdown log was found.' },
+      { kind: 'crash_log', note: 'No process-bearing crash report was found.' },
+      { kind: 'ps_listing', note: 'No process listing was found.' },
+      { kind: 'unified_log', note: 'No unified log was found.' },
+    ];
+    window.__trace.renderReport(report);
+    const { readableReportFragment } = await import('./readable-report.js');
+    return new DOMParser().parseFromString(
+      readableReportFragment(report, { includeTechnical: true }),
+      'text/html'
+    ).body.textContent;
+  });
+
+  await expect(page.locator('.artifacts tbody tr')).toHaveCount(4);
+  await expect(page.locator('.artifacts')).toContainText('No process-bearing crash report was found.');
+  expect(readableText).toContain('No process-bearing crash report was found.');
+});
+
+test.describe('scanner readiness and optional freshness', () => {
+  test.use({ serviceWorkers: 'block' });
+
+  test('controls stay disabled until bundled indicators pass validation', async ({ page }) => {
+    await page.route('**/iocs/manifest.json', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await route.continue();
+    });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+
+    await expect(page.locator('#scanner-status')).toHaveClass(/preparing/);
+    await expect(page.locator('#demo-clean')).toBeDisabled();
+    await expect(page.locator('#file-input')).toBeDisabled();
+    await expect(page.locator('#dropzone')).toHaveAttribute('aria-disabled', 'true');
+
+    await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+    await expect(page.locator('#scanner-status')).toContainText('passed their integrity floors');
+    await expect(page.locator('#demo-clean')).toBeEnabled();
+    await expect(page.locator('#file-input')).toBeEnabled();
+    await expect(page.locator('#dropzone')).toHaveAttribute('aria-disabled', 'false');
+  });
+
+  test('slow optional upstream requests do not delay scanning', async ({ page }) => {
+    await page.route('https://raw.githubusercontent.com/**', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: '{"objects":[]}',
+      });
+    });
+    await page.goto('/');
+    await expect(page.locator('#demo-clean')).toBeEnabled({ timeout: 30_000 });
+    expect(await page.evaluate(() => Promise.race([
+      window.__trace.freshnessReady.then(() => 'done'),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 50)),
+    ]))).toBe('pending');
+    await page.click('#demo-clean');
+    await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
+  });
+
+  test('an oversized upstream body is treated as unknown', async ({ page }) => {
+    await page.addInitScript(() => { window.__TRACE_TEST_UPSTREAM_MAX_BYTES = 64; });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({ objects: [{ type: 'indicator', pattern: 'x'.repeat(200) }] }),
+    }));
+    await page.goto('/');
+    await page.waitForFunction(() => window.__trace.ready);
+    await page.evaluate(() => window.__trace.freshnessReady);
+    await expect(page.locator('#ioc-list .freshness-unknown')).toHaveCount(8);
+    await expect(page.locator('#ioc-note')).toContainText('freshness is currently unknown');
+  });
 });
 
 test('an archive that trips scan limits is reported as inconclusive', async ({ page }) => {
@@ -565,8 +729,12 @@ test.describe('upstream indicator interception', () => {
     );
     await page.goto('/');
     await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
+    await page.waitForFunction(() => window.__trace.ready);
+    await page.evaluate(() => window.__trace.freshnessReady);
     await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
-    await expect(page.locator('#ioc-note')).not.toContainText('newer data');
+    await expect(page.locator('#ioc-list .freshness-unknown')).toHaveCount(8);
+    await expect(page.locator('#ioc-note')).toContainText('freshness is currently unknown');
+    await expect(page.locator('#ioc-note')).not.toContainText('content was detected');
     // and scanning with the snapshots still detects the seeded indicator
     await page.click('#demo-infected');
     await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
@@ -589,10 +757,14 @@ test.describe('upstream indicator interception', () => {
     );
     expect(await page.evaluate(() => window.__trace.ready)).toBe(false);
 
-    await page.click('#demo-clean');
-    await expect(page.locator('.error-box')).toContainText(
+    await expect(page.locator('#scanner-status')).toContainText(
       'Bundled indicator set "coruna" is below its reviewed floor'
     );
+    await expect(page.locator('#scanner-status')).toHaveClass(/error/);
+    await expect(page.locator('#demo-clean')).toBeDisabled();
+    await expect(page.locator('#demo-infected')).toBeDisabled();
+    await expect(page.locator('#file-input')).toBeDisabled();
+    await expect(page.locator('#dropzone')).toHaveAttribute('aria-disabled', 'true');
     await expect(page.locator('.verdict.clear')).toHaveCount(0);
     expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
   });
@@ -666,8 +838,16 @@ test.describe('upstream indicator interception', () => {
     );
     await page.goto('/');
     await expect(page.locator('#ioc-panel')).toBeVisible({ timeout: 30_000 });
-    // the plausible upstream change is announced, not loaded
-    await expect(page.locator('#ioc-note')).toContainText('newer data');
+    await page.waitForFunction(() => window.__trace.ready);
+    await page.evaluate(() => window.__trace.freshnessReady);
+    // A hash difference is announced neutrally, not claimed to be newer.
+    await expect(page.locator('#ioc-note')).toContainText(
+      'Different plausible upstream content was detected'
+    );
+    await expect(page.locator('#ioc-note')).toContainText(
+      'does not prove that the upstream content is newer'
+    );
+    await expect(page.locator('#ioc-note')).not.toContainText('has published newer');
     await expect(page.locator('#ioc-list .badge.bundled')).toHaveCount(8);
     // the infected demo still matches via the reviewed snapshot indicator
     await page.click('#demo-infected');
@@ -693,6 +873,112 @@ test('a second file arriving mid-scan is ignored, not interleaved', async ({ pag
   await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
   const name = await page.evaluate(() => window.__trace.lastReport.source_file.name);
   expect(name).toBe('sysdiagnose_demo_clean.tar.gz');
+});
+
+test.describe('scan intent and cancellation', () => {
+  test.use({ serviceWorkers: 'block' });
+
+  test('a delayed demo completion cannot overwrite a later real-file scan', async ({ page }) => {
+    let releaseDemo;
+    const heldDemo = new Promise((resolve) => { releaseDemo = resolve; });
+    await page.route('**/fixtures/sysdiagnose_demo_clean.tar.gz', async (route) => {
+      await heldDemo;
+      await route.continue();
+    });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('#scanner-status')).toContainText('Loading the synthetic example');
+
+    await page.evaluate(async () => {
+      const infected = await (await fetch(
+        './fixtures/sysdiagnose_demo_infected.tar.gz'
+      )).blob();
+      window.__trace.handleFile(new File([infected], 'real-case.tar.gz'));
+    });
+    await expect(page.locator('.verdict.match')).toBeVisible({ timeout: 30_000 });
+    releaseDemo();
+    await page.waitForTimeout(500);
+
+    await expect(page.locator('.verdict.match')).toBeVisible();
+    await expect(page.locator('.example-note')).toHaveCount(0);
+    expect(await page.evaluate(() => window.__trace.lastReport.source_file.name)).toBe(
+      'real-case.tar.gz'
+    );
+  });
+
+  test('worker finalization is indeterminate and can be safely canceled', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.Worker = class extends EventTarget {
+        constructor() {
+          super();
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })), 0);
+        }
+        postMessage(message) {
+          if (message.type !== 'scan') return;
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: {
+              type: 'progress',
+              id: message.id,
+              processed: Math.floor(message.file.size / 2),
+            },
+          })), 10);
+          setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'finalizing', id: message.id },
+          })), 20);
+        }
+        terminate() {}
+      };
+    });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+    await page.click('#demo-clean');
+    await expect(page.locator('#scan-file')).toHaveText('sysdiagnose_demo_clean.tar.gz');
+    await expect(page.locator('#scan-heading')).toHaveText('Analyzing evidence…');
+    await expect(page.locator('#progress')).not.toHaveAttribute('value');
+    await page.click('#cancel-scan');
+
+    await expect(page.locator('#landing')).toBeVisible();
+    await expect(page.locator('#scanner-status')).toContainText('Scan canceled');
+    expect(await page.evaluate(() => window.__trace.lastReport)).toBeNull();
+  });
+
+  test('inline streaming cancellation discards the scan and report', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.Worker = class { constructor() { throw new Error('worker unavailable'); } };
+    });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+    await page.evaluate(() => {
+      const file = new File([new Uint8Array(4096)], 'slow-real-case.tar');
+      Object.defineProperty(file, 'stream', {
+        value: () => new ReadableStream({
+          start(controller) {
+            this.timer = setInterval(() => controller.enqueue(new Uint8Array(64)), 100);
+          },
+          cancel() {
+            clearInterval(this.timer);
+            window.__traceInlineStreamCanceled = true;
+          },
+        }),
+      });
+      window.__trace.handleFile(file);
+    });
+    await expect(page.locator('#scan-heading')).toHaveText('Reading archive…');
+    await expect(page.locator('#progress-text')).toContainText(
+      'Background isolation is unavailable'
+    );
+    await page.click('#cancel-scan');
+
+    await expect(page.locator('#landing')).toBeVisible();
+    await expect(page.locator('#scanner-status')).toContainText('Scan canceled');
+    expect(await page.evaluate(() => ({
+      report: window.__trace.lastReport,
+      streamCanceled: window.__traceInlineStreamCanceled,
+    }))).toEqual({ report: null, streamCanceled: true });
+  });
 });
 
 test.describe('worker failure boundaries', () => {
@@ -1196,6 +1482,82 @@ test.describe('worker failure boundaries', () => {
     ).state).toBe('partial');
   });
 
+  test('a coherent metadata-only crash report preserves inventory without claiming crash coverage', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for crash-surface validation');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              data.report.artifacts = [{
+                path: 'root/crashes_and_spins/metadata-only.ips',
+                kind: 'crash_log',
+                status: 'parsed',
+                details: {
+                  paired_device: false,
+                  detection_relevant: false,
+                  processes: 0,
+                },
+              }];
+              delete data.report.device;
+              data.report.findings = [];
+              data.report.stats.artifacts_found = 1;
+              data.report.scan_limits = [
+                'No primary process-bearing iPhone detection surface was available.',
+              ];
+              data.report.verdict = 'inconclusive';
+              data.report.assurance.complete = false;
+              data.report.assurance.surfaces_examined = 0;
+              for (const surface of data.report.assurance.surfaces) {
+                surface.state = 'absent';
+              }
+              data.report.missing_artifacts = data.report.assurance.surfaces.map(
+                (surface) => ({
+                  kind: surface.kind,
+                  note: surface.kind === 'crash_log'
+                    ? 'Metadata-only reports do not provide crash detection coverage.'
+                    : `No ${surface.kind} was found.`,
+                })
+              );
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) { this.nativeWorker.postMessage(...args); }
+        terminate() { this.nativeWorker.terminate(); }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+
+    await expect(page.locator('.verdict.inconclusive')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.error-box')).toHaveCount(0);
+    await expect(page.locator('.artifacts')).toContainText('metadata-only.ips');
+    await expect(page.locator('.artifacts')).toContainText(
+      'Metadata-only reports do not provide crash detection coverage.'
+    );
+    expect(await page.evaluate(() => ({
+      verdict: window.__trace.lastReport.verdict,
+      examined: window.__trace.lastReport.assurance.surfaces_examined,
+      crash: window.__trace.lastReport.assurance.surfaces.find(
+        (surface) => surface.kind === 'crash_log'
+      ).state,
+    }))).toEqual({ verdict: 'inconclusive', examined: 0, crash: 'absent' });
+  });
+
   test('required fields and partial-processing invariants on real worker reports fail closed', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'one engine is sufficient for complete-envelope invariants');
     await page.addInitScript(() => {
@@ -1283,6 +1645,37 @@ test.describe('worker failure boundaries', () => {
                 ).state = 'partial';
                 data.report.scan_limits = [];
                 data.report.assurance.complete = true;
+              } else if (variant === 'paired_only_clear_without_limit'
+                  || variant === 'metadata_only_clear_without_limit') {
+                const paired = variant === 'paired_only_clear_without_limit';
+                data.report.artifacts = [{
+                  path: paired
+                    ? 'root/logs/ProxiedDevice/watch.ips'
+                    : 'root/crashes_and_spins/metadata-only.ips',
+                  kind: 'crash_log',
+                  status: 'parsed',
+                  details: {
+                    paired_device: paired,
+                    detection_relevant: paired,
+                    processes: paired ? 1 : 0,
+                  },
+                }];
+                delete data.report.device;
+                data.report.findings = [];
+                data.report.stats.artifacts_found = 1;
+                data.report.scan_limits = [];
+                data.report.verdict = 'clear';
+                data.report.assurance.complete = true;
+                data.report.assurance.surfaces_examined = 0;
+                for (const surface of data.report.assurance.surfaces) {
+                  surface.state = 'absent';
+                }
+                data.report.missing_artifacts = data.report.assurance.surfaces.map(
+                  (surface) => ({
+                    kind: surface.kind,
+                    note: `Proxy forged missing ${surface.kind}.`,
+                  })
+                );
               }
             }
             this.dispatchEvent(new MessageEvent('message', { data }));
@@ -1317,6 +1710,8 @@ test.describe('worker failure boundaries', () => {
       'complete_unified_without_artifact',
       'relabel_primary_crash_as_paired',
       'partial_match_without_limit',
+      'paired_only_clear_without_limit',
+      'metadata_only_clear_without_limit',
     ];
     for (const [index, variant] of variants.entries()) {
       if (index > 0) {

@@ -54,6 +54,17 @@
 
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -120,6 +131,7 @@ dialog h2 { margin-top: 0; font-size: 1.15rem; }
 .report-preview .hash { overflow-wrap: anywhere; }
 .report-preview .notice, .report-preview .warning { background: var(--note-bg); border: 1px solid var(--note-line); border-radius: 7px; padding: 9px 10px; }
 .report-preview .warning { background: var(--susp-bg); border-color: var(--susp-line); color: var(--susp-ink); }
+.report-preview .example-notice { background: var(--clear-bg); color: var(--clear-ink); border: 1px solid var(--clear-line); border-radius: 7px; padding: 9px 10px; }
 .report-preview .empty { color: var(--muted); font-style: italic; }
 .report-preview pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .report-preview .severity { display: inline-block; border: 1px solid; border-radius: 99px; padding: 1px 8px; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; }
@@ -136,6 +148,18 @@ dialog h2 { margin-top: 0; font-size: 1.15rem; }
 }
 
 main { padding: 28px 0 8px; }
+
+.scanner-status {
+  background: var(--note-bg);
+  color: var(--note-ink);
+  border: 1px solid var(--note-line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 0 0 12px;
+  font-size: 0.92rem;
+}
+.scanner-status.ready { background: var(--clear-bg); color: var(--clear-ink); border-color: var(--clear-line); }
+.scanner-status.error { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
 
 .safety-note {
   background: var(--susp-bg);
@@ -161,6 +185,11 @@ main { padding: 28px 0 8px; }
 #dropzone:hover, #dropzone:focus-visible, #dropzone.dragover {
   border-color: var(--accent);
 }
+#dropzone[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+#dropzone[aria-disabled="true"]:hover { border-color: var(--line); }
 /* Keyboard focus needs its own indicator: without this, a focused dropzone
    looks identical to a hovered or drag-over one. */
 #dropzone:focus-visible {
@@ -180,6 +209,7 @@ main { padding: 28px 0 8px; }
   cursor: pointer;
 }
 .btn.secondary { background: var(--note-bg); color: var(--text); }
+.btn:disabled, .linklike:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .demo-row { color: var(--muted); font-size: 0.92rem; margin: 14px 2px; }
 
@@ -197,8 +227,13 @@ main { padding: 28px 0 8px; }
 .ioc-row .meta { color: var(--muted); font-size: 0.88rem; }
 .badge { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; padding: 2px 8px; border-radius: 99px; vertical-align: 1px; }
 .badge.bundled { background: var(--note-bg); color: var(--note-ink); }
+.badge.freshness-current { background: var(--clear-bg); color: var(--clear-ink); }
+.badge.freshness-update { background: var(--susp-bg); color: var(--susp-ink); }
+.badge.freshness-unknown { background: var(--note-bg); color: var(--note-ink); }
 
 #scanning progress { width: 100%; height: 10px; accent-color: var(--accent); }
+.scan-file { font-family: var(--mono); overflow-wrap: anywhere; }
+.scan-actions { margin-top: 12px; }
 
 /* Verdict banners */
 .verdict { border-radius: var(--radius); padding: 22px 24px; margin: 8px 0 22px; border: 1px solid; }
@@ -211,13 +246,23 @@ main { padding: 28px 0 8px; }
 .verdict.inconclusive { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
 .verdict.inconclusive ul { margin: 6px 0; padding-left: 20px; }
 
+.example-note {
+  background: var(--clear-bg);
+  color: var(--clear-ink);
+  border: 1px solid var(--clear-line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin: 8px 0 14px;
+}
+.example-note p { margin: 4px 0; }
+
 .help-block { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px 18px; margin: 0 0 22px; }
 .help-block h3 { margin: 0 0 8px; font-size: 1.02rem; }
 .help-block ul { margin: 8px 0; padding-left: 20px; }
 .help-block li { margin-bottom: 6px; }
 
 .finding { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; margin-bottom: 12px; }
-.finding .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.finding .finding-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 6px; font-size: 0.95rem; }
 .sev { font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; padding: 2px 9px; border-radius: 99px; border: 1px solid; flex: none; }
 .sev.match { background: var(--match-bg); color: var(--match-ink); border-color: var(--match-line); }
 .sev.suspicious { background: var(--susp-bg); color: var(--susp-ink); border-color: var(--susp-line); }
@@ -247,6 +292,9 @@ table.artifacts td.path { font-family: var(--mono); font-size: 0.78rem; overflow
 .coverage-cols li { margin-bottom: 5px; }
 
 .actions { display: flex; gap: 12px; margin: 20px 0; flex-wrap: wrap; }
+.report-actions { margin-bottom: 8px; }
+.report-export-note { margin-top: 0; }
+.source-meta { overflow-wrap: anywhere; }
 
 #about { margin-top: 40px; border-top: 1px solid var(--line); padding-top: 18px; }
 #about h2 { font-size: 1.1rem; }

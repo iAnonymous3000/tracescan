@@ -29,6 +29,13 @@ Especially relevant classes of issues:
 
 Trace reads a sysdiagnose produced by the device under investigation. A
 sufficiently compromised device can lie in its own diagnostics; that
-limitation is documented and out of scope. Reports about the inherent lag of
-public threat intelligence are likewise out of scope: that trade-off is
-deliberate and disclosed in the UI.
+limitation is documented and out of scope. The inherent publication and review
+lag of public threat intelligence is likewise a disclosed limitation, not by
+itself a vulnerability.
+
+Indicator-handling defects remain in scope when they can affect verdict or
+provenance integrity. Examples include unreviewed live upstream data entering
+matching, a bundled snapshot falling below the enforced review floor, a failed
+or incomplete snapshot load still permitting a reassuring result, and
+upstream-comparison, hash, or source metadata that materially misrepresents what
+was actually loaded.

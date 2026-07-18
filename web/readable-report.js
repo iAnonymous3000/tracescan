@@ -1,9 +1,10 @@
 const MAX_READABLE_FINDINGS = 200;
+const MAX_READABLE_ARTIFACTS = 200;
 
 const VERDICTS = {
   match: {
     label: 'Traces matching known spyware were found',
-    meaning: 'One or more artifacts exactly matched a published indicator. This is a serious signal that needs expert review, but it is not final proof on its own.',
+    meaning: 'One or more process-bearing entries matched a published indicator. Trace compares exact process names and full paths; a file-name indicator may also match an observed process basename, and a directory path ending in / may match a canonical descendant. This is a serious signal that needs expert review, but it is not final proof on its own.',
   },
   suspicious: {
     label: 'Anomalies worth expert review',
@@ -44,6 +45,7 @@ function normalizedOptions(options) {
     includeSourceName: options?.includeSourceName === true,
     includeDevice: options?.includeDevice === true,
     includeTechnical: options?.includeTechnical === true,
+    example: options?.example === true,
   };
 }
 
@@ -110,7 +112,8 @@ function artifactLabel(artifact) {
 function artifactsHtml(report, includeTechnical, includeDevice) {
   const artifacts = Array.isArray(report?.artifacts) ? report.artifacts : [];
   const missing = Array.isArray(report?.missing_artifacts) ? report.missing_artifacts : [];
-  const rows = artifacts.map((artifact) => `<tr>
+  const shown = artifacts.slice(0, MAX_READABLE_ARTIFACTS);
+  const rows = shown.map((artifact) => `<tr>
     <td>${esc(artifactLabel(artifact))}</td>
     <td>${esc(artifact.status)}</td>
     ${includeTechnical ? `<td><code>${esc(artifact.path)}</code></td><td><code>${esc(JSON.stringify(withoutDeviceKeys(artifact.details ?? {}, includeDevice)))}</code></td>` : ''}
@@ -124,7 +127,10 @@ function artifactsHtml(report, includeTechnical, includeDevice) {
   return `<div class="table-scroll" role="region" aria-label="Artifact processing details" tabindex="0"><table>
     <thead><tr><th>Artifact family</th><th>Status</th>${includeTechnical ? '<th>Path</th><th>Details</th>' : ''}</tr></thead>
     <tbody>${rows}${missingRows}</tbody>
-  </table></div>`;
+  </table></div>
+  ${artifacts.length > shown.length
+    ? `<p class="notice">This readable copy shows the first ${MAX_READABLE_ARTIFACTS} processed artifacts. ${artifacts.length - shown.length} additional artifacts remain in the JSON technical report.</p>`
+    : ''}`;
 }
 
 function provenanceHtml(report) {
@@ -199,8 +205,15 @@ export function readableReportFragment(report, options = {}) {
   const referenceWarning = !hasBuildCommit
     ? `<p class="notice"><strong>The links below do not identify the original build exactly.</strong> ${hasSafeVersion ? `The schema link uses the reported version tag v${esc(rawVersion)}, which is an unsigned repository name and must be independently verified.` : 'No strictly valid build commit or version was recorded, so both links use the current branch.'}</p>`
     : '';
+  const exampleNotice = opts.example
+    ? `<aside class="example-notice" role="note" aria-label="Example report">
+        <p><strong>Example report - no device was scanned.</strong></p>
+        <p>This report comes from a synthetic demonstration archive. It is for learning the handoff format, not for making a device-security decision.</p>
+      </aside>`
+    : '';
 
   return `<article class="readable-report" data-verdict="${verdict}">
+    ${exampleNotice}
     <header>
       <p class="eyebrow">Trace responder report</p>
       <h1>${esc(verdictCopy.label)}</h1>
@@ -290,6 +303,8 @@ const DOCUMENT_STYLE = `
   code.hash, .artifact { overflow-wrap: anywhere; }
   .notice, .warning { background: #eef1f4; border: 1px solid #d3dae1; border-radius: 8px; padding: 10px 12px; }
   .warning { background: #fdf3e0; border-color: #ecd3a2; }
+  .example-notice { margin-bottom: 20px; background: #e9f5f2; border: 2px solid #0f6b62; border-radius: 8px; padding: 10px 12px; }
+  .example-notice p { margin: 4px 0; }
   .empty { color: #5b6470; font-style: italic; }
   .finding { border: 1px solid #dfe2e5; border-radius: 8px; padding: 12px 14px; margin: 10px 0; break-inside: avoid; }
   .finding p { margin: 5px 0; }
@@ -309,6 +324,7 @@ const DOCUMENT_STYLE = `
 `;
 
 export function readableReportDocument(report, options = {}) {
+  const opts = normalizedOptions(options);
   const titleVerdict = Object.hasOwn(VERDICTS, report?.verdict)
     ? VERDICTS[report.verdict].label
     : VERDICTS.inconclusive.label;
@@ -319,7 +335,7 @@ export function readableReportDocument(report, options = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
-<title>${esc(`Trace report - ${titleVerdict}`)}</title>
+<title>${esc(`${opts.example ? 'Example ' : ''}Trace report - ${titleVerdict}`)}</title>
 <style>${DOCUMENT_STYLE}</style>
 </head>
 <body><main>${readableReportFragment(report, options)}</main></body>

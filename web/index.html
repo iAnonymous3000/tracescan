@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://raw.githubusercontent.com; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
-<meta name="description" content="Check an iPhone sysdiagnose for traces of Pegasus, Predator, and other mercenary spyware. Runs entirely in your browser; your file never leaves your device.">
+<meta name="description" content="Check an iPhone sysdiagnose for traces of Pegasus, Predator, and other mercenary spyware. Trace is designed to analyze the archive locally in your browser and has no upload endpoint.">
 <meta property="og:title" content="Trace: check an iPhone for spyware traces">
-<meta property="og:description" content="Scan an iPhone sysdiagnose for traces of known mercenary spyware. Free, open source, and nothing you scan ever leaves your computer.">
+<meta property="og:description" content="Scan an iPhone sysdiagnose for traces of known mercenary spyware. Free, open source, and designed to process the archive locally with no upload endpoint.">
 <meta property="og:url" content="https://tracescan.pages.dev/">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
@@ -20,14 +20,14 @@
 <header class="site-header">
   <div class="wrap">
     <h1 class="wordmark">Trace</h1>
-    <p class="tagline">Check an iPhone diagnostic file for traces of known mercenary spyware - Pegasus, Predator, and others. Free, open, and nothing you scan ever leaves your computer.</p>
+    <p class="tagline">Check an iPhone diagnostic file for traces of known mercenary spyware - Pegasus, Predator, and others. Free, open source, and designed to analyze the archive locally in this tab with no upload endpoint.</p>
   </div>
 </header>
 
 <div class="privacy-strip" id="privacy-strip">
   <div class="wrap">
     <span class="dot" id="offline-dot" aria-hidden="true"></span>
-    <span id="privacy-text">Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes.</span>
+    <span id="privacy-text" role="status" aria-live="polite" aria-atomic="true">Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes. The scanner is still preparing.</span>
     <button class="linklike" id="prove-it">How can I check that?</button>
   </div>
 </div>
@@ -54,6 +54,7 @@
       <label><input type="checkbox" id="readable-technical"> Raw evidence and dedicated source-artifact fields</label>
     </fieldset>
   </form>
+  <p id="readable-options-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
   <div class="actions">
     <button type="button" class="btn" id="download-readable">Download HTML</button>
     <button type="button" class="btn secondary" id="close-readable">Cancel</button>
@@ -70,18 +71,20 @@
       <p>If being noticed could put you at risk, use a trusted device and connection the other person cannot access, or contact <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's Digital Security Helpline</a> from a safer device before continuing. Leaving this page cannot erase records that already exist, so Trace does not present a quick-exit button as if it could.</p>
     </aside>
 
-    <div id="dropzone" tabindex="0" role="button" aria-label="Choose or drop a sysdiagnose archive to scan">
+    <p id="scanner-status" class="scanner-status preparing" role="status" aria-live="polite" aria-atomic="true"><strong>Preparing scanner…</strong> Loading and validating the bundled, reviewed indicators.</p>
+
+    <div id="dropzone" tabindex="0" role="button" aria-disabled="true" aria-label="Choose or drop a sysdiagnose archive to scan">
       <div class="dz-inner">
         <div class="dz-icon" aria-hidden="true">⇣</div>
         <p class="dz-title">Drop your sysdiagnose file here</p>
         <p class="dz-sub">a file named like <code>sysdiagnose_2026.07.07_…​.tar.gz</code></p>
         <label class="btn" for="file-input">Choose file</label>
-        <input type="file" id="file-input" accept=".gz,.tgz,.tar,application/gzip">
+        <input type="file" id="file-input" accept=".gz,.tgz,.tar,application/gzip" disabled>
       </div>
     </div>
     <p class="demo-row">No file yet? See what results look like:
-      <button class="linklike" id="demo-clean">example with no findings</button> ·
-      <button class="linklike" id="demo-infected">example with an infection</button>
+      <button class="linklike" id="demo-clean" disabled>example with no findings</button> ·
+      <button class="linklike" id="demo-infected" disabled>example with an infection</button>
     </p>
 
     <details class="guide" id="capture-guide">
@@ -103,25 +106,28 @@
   </section>
 
   <section id="scanning" tabindex="-1" hidden>
-    <h2>Scanning…</h2>
-    <progress id="progress" max="100" value="0" aria-label="Scan progress"></progress>
-    <p id="progress-text" class="fine" role="status"></p>
-    <p class="fine">Your file is being read locally, piece by piece. Nothing is uploaded.</p>
+    <h2 id="scan-heading">Preparing scanner…</h2>
+    <p id="scan-file" class="scan-file"></p>
+    <progress id="progress" max="100" aria-label="Preparing scan" aria-describedby="progress-text"></progress>
+    <p id="progress-text" class="fine"></p>
+    <p id="scan-live" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+    <p class="fine">The archive is read by the scanner in this tab. Trace has no upload endpoint.</p>
+    <div class="actions scan-actions"><button type="button" class="btn secondary" id="cancel-scan">Cancel scan</button></div>
   </section>
 
   <section id="results" tabindex="-1" hidden></section>
 
   <section id="about">
     <h2>What Trace is - and is not</h2>
-    <p>Trace inspects four artifact families inside an iPhone sysdiagnose - the shutdown log, crash and diagnostic .ips reports, process listings, and the unified system logs (every process that wrote a log entry over the archive window, typically days of history) - and compares process-bearing evidence against public indicators of compromise published by <a href="https://securitylab.amnesty.org/" rel="noopener noreferrer">Amnesty International's Security Lab</a> and the <a href="https://github.com/mvt-project/mvt-indicators" rel="noopener noreferrer">Mobile Verification Toolkit indicator collection</a> (Citizen Lab, Kaspersky, Google, Microsoft, and others). These artifacts are where several known implants, including Pegasus, have left visible traces.</p>
+    <p>Trace inspects four artifact families inside an iPhone sysdiagnose - the shutdown log, crash and diagnostic .ips reports, process listings, and process identities represented in parsed unified-log catalog data - and compares that process-bearing evidence against public indicators of compromise published by <a href="https://securitylab.amnesty.org/" rel="noopener noreferrer">Amnesty International's Security Lab</a> and the <a href="https://github.com/mvt-project/mvt-indicators" rel="noopener noreferrer">Mobile Verification Toolkit indicator collection</a> (Citizen Lab, Kaspersky, Google, Microsoft, and others). It does not read unified-log message contents or derive a precise time window from those catalogs. These artifacts are where several known implants, including Pegasus, have left visible traces.</p>
     <p><strong>A "no matches" result is not a clean bill of health.</strong> It means no <em>known</em> implant left <em>known</em> traces in the artifacts this tool reads. Spyware not yet publicly documented, or traces that live elsewhere (browsing history, message databases, network records), would not be found. If your risk is real - you are a journalist, activist, lawyer, or targeted person - treat this tool as a first look, not a verdict, and talk to the experts linked in every result.</p>
-    <p>Trace does not monitor in real time, cannot remove anything, and does not support Android yet. It inherits the time lag of public threat intelligence: commercial tools with private telemetry may know about newer indicators sooner. That is the honest trade for a tool you never have to trust with your data.</p>
+    <p>Trace does not monitor in real time, cannot remove anything, and does not support Android yet. It inherits the time lag of public threat intelligence: commercial tools with private telemetry may know about newer indicators sooner. The intended app keeps archive processing in this tab and has no upload endpoint, while the proof dialog explains what that claim does and does not establish.</p>
   </section>
 </main>
 
 <footer class="site-footer">
   <div class="wrap">
-    <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener noreferrer">open source</a> and runs entirely on your device. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener noreferrer">AmnestyTech/investigations</a> and <a href="https://github.com/mvt-project/mvt-indicators" rel="noopener noreferrer">mvt-project/mvt-indicators</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener noreferrer">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener noreferrer">iShutdown</a> research.</p>
+    <p>Trace is <a href="https://github.com/iAnonymous3000/tracescan" rel="noopener noreferrer">open source</a>; its intended scan path processes archives locally and has no upload endpoint. Indicators: <a href="https://github.com/AmnestyTech/investigations" rel="noopener noreferrer">AmnestyTech/investigations</a> and <a href="https://github.com/mvt-project/mvt-indicators" rel="noopener noreferrer">mvt-project/mvt-indicators</a>. Inspired by the <a href="https://github.com/mvt-project/mvt" rel="noopener noreferrer">Mobile Verification Toolkit</a> and <a href="https://github.com/KasperskyLab/iShutdown" rel="noopener noreferrer">iShutdown</a> research.</p>
     <p>For responders: <a href="https://github.com/iAnonymous3000/tracescan/blob/main/HELPLINE.md" rel="noopener noreferrer">understand and verify a Trace report</a>. Security model: <a href="https://github.com/iAnonymous3000/tracescan/blob/main/THREAT_MODEL.md" rel="noopener noreferrer">threats, trust boundaries, and residual risks</a>.</p>
     <p>If you believe you are in danger because of surveillance, contact <a href="https://www.accessnow.org/help/" rel="noopener noreferrer">Access Now's Digital Security Helpline</a>.</p>
   </div>

@@ -3,9 +3,9 @@
 //! Every tracev3 chunk carries a catalog listing the processes that emitted
 //! the entries in it (pid plus the UUID of the main binary), and each
 //! uuidtext file's footer stores that binary's full path. Joining the two
-//! yields every process that wrote a log entry during the archive window
-//! (typically days of device history) without rendering a single log
-//! message - so the 155 MB dsc shared-string cache is never loaded and peak
+//! yields process identities represented in the parsed catalog data without
+//! rendering a single log message or claiming a precise time window - so the
+//! 155 MB dsc shared-string cache is never loaded and peak
 //! memory stays at one file. Design: docs/design-unified-logs.md.
 //!
 //! Files are consumed as they stream out of the tar (see `tar_stream`):
@@ -348,7 +348,7 @@ impl Aggregator {
                 findings.push(Finding::ioc_match(
                     "system_logs.logarchive",
                     format!(
-                        "Process \u{2018}{}\u{2019} wrote unified log entries - its name matches a published {} indicator",
+                        "Process \u{2018}{}\u{2019} wrote unified log entries - its observed name or path matches a published {} indicator",
                         basename(path),
                         ind.campaign
                     ),
@@ -517,6 +517,32 @@ mod tests {
         );
         assert!(findings.iter().any(|f| f.severity == Severity::Suspicious));
         assert!(!findings.iter().any(|f| f.summary.contains("nfcd")));
+    }
+
+    #[test]
+    fn directory_path_match_summary_does_not_claim_a_name_match() {
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[file:path='/private/var/db/com.apple.xpc.roleaccountd.staging/']"}]}"#,
+        )
+        .unwrap();
+        let agg = agg_with(
+            &[("AAAA", 2143)],
+            &[(
+                "AAAA",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/bh",
+            )],
+        );
+        let mut findings = Findings::new();
+        agg.finalize(&db, &mut findings).unwrap();
+
+        let matched = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .unwrap();
+        assert!(matched.summary.contains("observed name or path matches"));
+        assert!(!matched.summary.contains("its name matches"));
     }
 
     #[test]

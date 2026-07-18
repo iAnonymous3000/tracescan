@@ -5,7 +5,7 @@ use crate::ioc::{IocDb, SetStats};
 use crate::report::*;
 use crate::tar_stream::{ArtifactKind, Limits, TarCollector};
 use crate::{crash_log, ps, shutdown_log};
-use flate2::write::GzDecoder;
+use flate2::write::MultiGzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -64,12 +64,14 @@ pub struct SetMeta {
 #[derive(Default, Deserialize)]
 pub struct ScanMeta {
     pub source_name: Option<String>,
+    /// Accepted for producer compatibility, but never trusted for report
+    /// integrity. `source_file.size` is derived from bytes pushed to Engine.
     pub source_size: Option<u64>,
     pub scanned_via: Option<String>,
 }
 
 enum Sink {
-    Gz(GzDecoder<TarCollector>),
+    Gz(MultiGzDecoder<TarCollector>),
     Plain(TarCollector),
 }
 
@@ -184,7 +186,7 @@ impl Engine {
             let collector = TarCollector::with_limits(self.limits);
             let is_gz = self.prelude[0] == 0x1f && self.prelude[1] == 0x8b;
             let mut sink = if is_gz {
-                Sink::Gz(GzDecoder::new(collector))
+                Sink::Gz(MultiGzDecoder::new(collector))
             } else {
                 Sink::Plain(collector)
             };
@@ -260,7 +262,10 @@ impl Engine {
                 if f.truncated {
                     last.status = "truncated".into();
                 }
-                if matches!(f.kind, ArtifactKind::CrashLog) && last.status != "parsed" {
+                if matches!(f.kind, ArtifactKind::CrashLog)
+                    && last.details["detection_relevant"].as_bool() == Some(true)
+                    && last.status != "parsed"
+                {
                     primary_crash_degraded = true;
                 }
             }
@@ -306,6 +311,27 @@ impl Engine {
 
         let found: std::collections::HashSet<ArtifactKind> =
             collector.files.iter().map(|f| f.kind).collect();
+        // Not every primary-device .ips file is a detection surface. Reports
+        // such as Siri feedback and reset counters are useful metadata, but
+        // deliberately expose no process identity or inventory to compare
+        // with process/file indicators. Keep those artifacts in the report
+        // without letting their mere presence stand in for phone coverage.
+        let primary_crash_relevant_seen = artifacts.iter().any(|artifact| {
+            artifact.kind == "crash_log"
+                && artifact.details["paired_device"].as_bool() == Some(false)
+                && artifact.details["detection_relevant"].as_bool() == Some(true)
+        });
+        let primary_crash_process_bearing = artifacts.iter().any(|artifact| {
+            artifact.kind == "crash_log"
+                && artifact.details["paired_device"].as_bool() == Some(false)
+                && artifact.details["detection_relevant"].as_bool() == Some(true)
+                && artifact.details["processes"].as_u64().unwrap_or(0) > 0
+        });
+        let primary_metadata_only_seen = artifacts.iter().any(|artifact| {
+            artifact.kind == "crash_log"
+                && artifact.details["paired_device"].as_bool() == Some(false)
+                && artifact.details["detection_relevant"].as_bool() == Some(false)
+        });
         // A kind whose files were all dropped after a retention cap was
         // present in the archive - it is not "missing". Reporting it as
         // not-found (with reassuring "this can be normal" wording) would
@@ -320,10 +346,16 @@ impl Engine {
                 note: "No shutdown.log was found in this archive. It normally exists once the device has been restarted at least once; without it, one of the four detection surfaces is unavailable for this scan.".into(),
             });
         }
-        if !present(ArtifactKind::CrashLog) {
+        let primary_crash_surface_present = primary_crash_relevant_seen
+            || collector.dropped_kinds.contains(&ArtifactKind::CrashLog);
+        if !primary_crash_surface_present {
             missing_artifacts.push(MissingArtifact {
                 kind: "crash_log".into(),
-                note: "No crash or diagnostic .ips reports were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into(),
+                note: if primary_metadata_only_seen {
+                    "iPhone crash or diagnostic .ips reports were present, but none contained a process identity or process inventory. Metadata-only reports do not provide the phone crash-report detection surface.".into()
+                } else {
+                    "No crash or diagnostic .ips reports were found in crashes_and_spins. This can be normal, especially on a new or recently erased device.".into()
+                },
             });
         }
         if !present(ArtifactKind::PsListing) {
@@ -335,7 +367,7 @@ impl Engine {
         if !unified_seen {
             missing_artifacts.push(MissingArtifact {
                 kind: "unified_log".into(),
-                note: "No unified log data (system_logs.logarchive tracev3 files) was found in this archive, so the process history across the log window could not be checked.".into(),
+                note: "No unified log data (system_logs.logarchive tracev3 files) was found in this archive, so process identities represented in unified-log catalogs could not be checked.".into(),
             });
         }
 
@@ -439,6 +471,16 @@ impl Engine {
                     && a.status == "parsed_partial"
             })
             .count();
+        let capped_crash_inventories = artifacts
+            .iter()
+            .filter(|artifact| artifact.details["candidate_cap_hit"] == true)
+            .count();
+        if capped_crash_inventories > 0 {
+            scan_limits.push(format!(
+                "{capped_crash_inventories} crash or diagnostic .ips process inventory file(s) exceeded the {}-candidate safety cap; later process candidates were not checked.",
+                crash_log::MAX_CRASH_CANDIDATES
+            ));
+        }
         if partial_crashes > 0 {
             scan_limits.push(format!(
                 "{partial_crashes} crash or diagnostic .ips file(s) could not be fully parsed; parts of their contents were not checked against indicators."
@@ -508,7 +550,7 @@ impl Engine {
         }
         if collector.malformed_paths > 0 {
             scan_limits.push(format!(
-                "{} archive member path(s) were absolute or contained ambiguous components; scanning stopped before classifying the affected files.",
+                "{} archive member path(s) were absolute, contained ambiguous components, or were not valid UTF-8; scanning stopped before classifying the affected files.",
                 collector.malformed_paths
             ));
         }
@@ -538,6 +580,21 @@ impl Engine {
         if self.db.applicable_total() == 0 && (!collector.files.is_empty() || unified_seen) {
             scan_limits.push(
                 "No process or file indicators were loaded, so nothing in this archive could be checked against known spyware.".into(),
+            );
+        }
+        // Paired-device diagnostics and process-free phone metadata are
+        // supplemental inputs. Without at least one primary iPhone surface
+        // capable of yielding process evidence, a no-match result would be
+        // vacuous and must not be presented as clear.
+        let primary_process_surface_seen = found.contains(&ArtifactKind::ShutdownLog)
+            || found.contains(&ArtifactKind::PsListing)
+            || unified_examined
+            || primary_crash_process_bearing;
+        if !primary_process_surface_seen
+            && (found.contains(&ArtifactKind::PairedCrashLog) || primary_metadata_only_seen)
+        {
+            scan_limits.push(
+                "No primary process-bearing iPhone detection surface was available. Paired-device and metadata-only diagnostic reports are supplemental, so Trace cannot produce a clear phone result from them alone.".into(),
             );
         }
 
@@ -601,7 +658,7 @@ impl Engine {
         // surfaces for which at least one file reached its parser.
         let surfaces_examined = [
             found.contains(&ArtifactKind::ShutdownLog),
-            found.contains(&ArtifactKind::CrashLog),
+            primary_crash_process_bearing,
             found.contains(&ArtifactKind::PsListing),
             unified_examined,
         ]
@@ -623,11 +680,11 @@ impl Engine {
         if found.contains(&ArtifactKind::ShutdownLog) {
             examined.push("shutdown.log (and rotated shutdown.N.log) - processes that delayed device shutdown, across reboots");
         }
-        if found.contains(&ArtifactKind::CrashLog) {
+        if primary_crash_process_bearing {
             examined.push("iOS crash and diagnostic reports (crashes_and_spins/*.ips) - target process names/paths and process inventories where the format contains them");
         }
         if found.contains(&ArtifactKind::PairedCrashLog) {
-            examined.push("Paired-device crash and diagnostic reports (logs/ProxiedDevice*/*.ips) - target process names/paths from the paired device; not counted as phone crash-report coverage");
+            examined.push("Paired-device crash and diagnostic reports (logs/ProxiedDevice*/*.ips) - process identities and inventories where the format contains them; metadata-only reports provide no process evidence, and none count as phone crash-report coverage");
         }
         if found.contains(&ArtifactKind::PsListing) {
             examined.push(
@@ -635,7 +692,7 @@ impl Engine {
             );
         }
         if unified_examined {
-            examined.push("Unified system logs (system_logs.logarchive) - every process that wrote a log entry during the archive window, typically days of history (process inventory; log message contents are not read)");
+            examined.push("Unified system logs (system_logs.logarchive) - process identities represented in parsed catalog data (log message contents are not read, and no precise time window is derived)");
         }
 
         // Duration closes here, after parsing, matching, and assembly - the
@@ -658,7 +715,10 @@ impl Engine {
             scanned_via: self.scan_meta.scanned_via,
             source_file: SourceFile {
                 name: self.scan_meta.source_name,
-                size: self.scan_meta.source_size,
+                // The engine counted the bytes it actually hashed and parsed.
+                // Producer metadata can supply the display name and route, but
+                // cannot override this integrity-relevant measurement.
+                size: Some(self.bytes_in),
                 sha256: hex(&self.input_hash.finalize()),
             },
             device,
@@ -680,14 +740,14 @@ impl Engine {
                 examined,
                 not_examined: vec![
                     "OTA update logs (logs/OTAUpdateLogs/*.ips) - an undocumented restore-time text format, not the crash-report schema, so their contents are not checked",
-                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file name and path indicators match only when a process was observed running from that file",
+                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file-name indicators are checked only against observed process basenames and file-path indicators only against observed canonical executable paths",
                     "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
                     "SMS/iMessage link payloads - device backups only",
                     "Per-process network usage (DataUsage) - device backups only",
                     "Installed apps and configuration profiles - device backups only",
                 ],
-                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts, and file indicators are checked only against observed process paths. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
+                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. Process and file indicators are checked only against observed process names and canonical paths; a directory-valued path indicator matches observed descendants of that directory. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
             },
         })
     }
@@ -785,6 +845,66 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.severity == Severity::Match));
+    }
+
+    #[test]
+    fn concatenated_gzip_members_match_single_member_scan() {
+        let tar = build_archive(true);
+        let split = tar.len() / 2;
+        let single_member = gzip(&tar);
+        let mut concatenated_members = gzip(&tar[..split]);
+        concatenated_members.extend_from_slice(&gzip(&tar[split..]));
+
+        let scan = |input: &[u8]| {
+            let mut engine = Engine::new();
+            engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+            for chunk in input.chunks(37) {
+                engine.push(chunk).unwrap();
+            }
+            engine.finish().unwrap()
+        };
+        let single = scan(&single_member);
+        let concatenated = scan(&concatenated_members);
+
+        assert_eq!(concatenated.verdict, single.verdict);
+        assert_eq!(
+            concatenated.stats.archive_entries,
+            single.stats.archive_entries
+        );
+        assert_eq!(
+            concatenated.stats.artifacts_found,
+            single.stats.artifacts_found
+        );
+        assert_eq!(
+            serde_json::to_value(&concatenated.artifacts).unwrap(),
+            serde_json::to_value(&single.artifacts).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&concatenated.findings).unwrap(),
+            serde_json::to_value(&single.findings).unwrap()
+        );
+        assert_eq!(concatenated.scan_limits, single.scan_limits);
+    }
+
+    #[test]
+    fn source_size_is_measured_from_scanned_bytes() {
+        let tar = build_archive(false);
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.set_scan_meta(ScanMeta {
+            source_name: Some("capture.tar".into()),
+            source_size: Some(1),
+            scanned_via: Some("native-test".into()),
+        });
+        for chunk in tar.chunks(113) {
+            engine.push(chunk).unwrap();
+        }
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.source_file.name.as_deref(), Some("capture.tar"));
+        assert_eq!(report.scanned_via.as_deref(), Some("native-test"));
+        assert_eq!(report.source_file.size, Some(tar.len() as u64));
+        assert_eq!(report.source_file.size, Some(report.stats.bytes_read));
     }
 
     #[test]
@@ -905,6 +1025,36 @@ mod tests {
         let report = engine.finish().unwrap();
         assert_ne!(report.verdict, Verdict::Invalid);
         assert_eq!(report.verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn nested_or_paired_logarchive_lookalikes_do_not_supply_phone_coverage() {
+        for path in [
+            "sysdiagnose_t/random/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            "sysdiagnose_t/logs/ProxiedDevice/system_logs.logarchive/Persist/0000000000000001.tracev3",
+        ] {
+            let tar = test_util::finish(test_util::entry(path, &[0xAB; 700]));
+            let mut engine = Engine::new();
+            engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+            engine.push(&tar).unwrap();
+            let report = engine.finish().unwrap();
+
+            assert_eq!(report.verdict, Verdict::Invalid, "path: {path}");
+            assert!(!report.assurance.complete, "path: {path}");
+            assert_eq!(report.assurance.surfaces_examined, 0, "path: {path}");
+            assert!(
+                report
+                    .missing_artifacts
+                    .iter()
+                    .any(|missing| missing.kind == "unified_log"),
+                "path: {path}"
+            );
+            assert!(!report
+                .coverage
+                .examined
+                .iter()
+                .any(|surface| surface.starts_with("Unified system logs")));
+        }
     }
 
     #[test]
@@ -1037,8 +1187,13 @@ mod tests {
         let report = engine.finish().unwrap();
 
         assert!(report.device.is_none());
-        assert_eq!(report.verdict, Verdict::Clear);
-        assert!(report.assurance.complete);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert_eq!(report.assurance.surfaces_examined, 0);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("No primary process-bearing iPhone detection surface")));
         assert!(report
             .missing_artifacts
             .iter()
@@ -1067,6 +1222,120 @@ mod tests {
         // device scope is explicit in details and coverage.
         assert_eq!(report.artifacts[0].kind, "crash_log");
         assert_eq!(report.artifacts[0].details["paired_device"], true);
+    }
+
+    #[test]
+    fn metadata_only_phone_report_cannot_produce_clear_or_crash_coverage() {
+        let siri = br#"{"bug_type":"313","timestamp":"2026-07-08 13:22:15.00 -0700","os_version":"iPhone OS 26.5.2 (23F84)"}
+{"agent":"opaque","country_code":"US","session_start":123,"user_guid":"opaque"}"#;
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/SiriSearchFeedback-2026.ips",
+            siri,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(!report.assurance.complete);
+        assert_eq!(report.assurance.surfaces_examined, 0);
+        assert_eq!(report.artifacts[0].status, "parsed");
+        assert_eq!(report.artifacts[0].details["processes"], 0);
+        assert_eq!(report.artifacts[0].details["detection_relevant"], false);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("No primary process-bearing iPhone detection surface")));
+        let missing = report
+            .missing_artifacts
+            .iter()
+            .find(|missing| missing.kind == "crash_log")
+            .unwrap();
+        assert!(missing.note.contains("Metadata-only reports"));
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "absent"
+        );
+        assert!(!report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("iOS crash")));
+    }
+
+    #[test]
+    fn paired_metadata_only_coverage_does_not_claim_process_evidence() {
+        let siri = br#"{"bug_type":"313"}
+{"agent":"opaque","country_code":"US","session_start":123,"user_guid":"opaque"}"#;
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/logs/ProxiedDevice/SiriSearchFeedback-2026.ips",
+            siri,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert_eq!(report.artifacts[0].details["detection_relevant"], false);
+        let paired_coverage = report
+            .coverage
+            .examined
+            .iter()
+            .find(|line| line.starts_with("Paired-device crash"))
+            .unwrap();
+        assert!(paired_coverage.contains("where the format contains them"));
+        assert!(paired_coverage.contains("metadata-only reports provide no process evidence"));
+    }
+
+    #[test]
+    fn metadata_only_report_does_not_degrade_process_bearing_phone_crash_surface() {
+        let siri = br#"{"bug_type":"313"}
+{"agent":"opaque","country_code":"US","session_start":123,"user_guid":"opaque"}"#;
+        let crash = br#"{"name":"safe","bug_type":"309"}
+{"procName":"safe","procPath":"/usr/libexec/safe"}"#;
+        let mut archive = test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/SiriSearchFeedback-2026.ips",
+            siri,
+        );
+        archive.extend_from_slice(&test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/safe-2026.ips",
+            crash,
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&test_util::finish(archive)).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Clear);
+        assert!(report.assurance.complete);
+        assert_eq!(report.assurance.surfaces_examined, 1);
+        assert!(!report
+            .missing_artifacts
+            .iter()
+            .any(|missing| missing.kind == "crash_log"));
+        assert_eq!(
+            report
+                .assurance
+                .surfaces
+                .iter()
+                .find(|surface| surface.kind == "crash_log")
+                .unwrap()
+                .state,
+            "complete"
+        );
+        assert!(report
+            .coverage
+            .examined
+            .iter()
+            .any(|line| line.starts_with("iOS crash")));
     }
 
     #[test]
@@ -1445,6 +1714,33 @@ this body is not json"#,
             .scan_limits
             .iter()
             .any(|limit| limit.contains("diagnostic .ips")));
+    }
+
+    #[test]
+    fn capped_ips_inventory_has_an_explicit_scan_limit() {
+        let processes: Vec<serde_json::Value> = (0..=crash_log::MAX_CRASH_CANDIDATES)
+            .map(|index| serde_json::json!({"name": format!("process-{index}"), "pid": index}))
+            .collect();
+        let jetsam = format!(
+            "{{\"bug_type\":\"298\"}}\n{}",
+            serde_json::json!({"bug_type": "298", "processes": processes})
+        );
+        let tar = test_util::finish(test_util::entry(
+            "sysdiagnose_t/crashes_and_spins/JetsamEvent-2026.ips",
+            jetsam.as_bytes(),
+        ));
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert_eq!(report.artifacts[0].status, "parsed_partial");
+        assert_eq!(report.artifacts[0].details["candidate_cap_hit"], true);
+        assert!(report
+            .scan_limits
+            .iter()
+            .any(|limit| limit.contains("candidate safety cap")));
     }
 
     #[test]

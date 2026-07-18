@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +47,9 @@ pub struct SetStats {
     pub campaign: String,
     pub stix_indicators: usize,
     pub extracted: usize,
-    pub by_kind: HashMap<String, usize>,
+    /// Lexically ordered so report JSON is stable across processes and
+    /// producers instead of inheriting `HashMap`'s randomized iteration order.
+    pub by_kind: BTreeMap<String, usize>,
     /// Indicators that can actually be checked against v1 artifacts
     /// (process names, file names/paths). Domains, URLs, emails cannot.
     pub applicable: usize,
@@ -269,9 +271,14 @@ impl IocDb {
             campaign: campaign.clone(),
             stix_indicators: 0,
             extracted: 0,
-            by_kind: HashMap::new(),
+            by_kind: BTreeMap::new(),
             applicable: 0,
         };
+        // A bundle can contain multiple STIX objects that encode the same
+        // observable. Count and index the unique published value once per
+        // set so duplicate objects cannot pad the reviewed floor or multiply
+        // identical findings in a report.
+        let mut extracted_in_set: HashSet<(String, Vec<String>, String)> = HashSet::new();
 
         for obj in objects {
             if obj.get("type").and_then(|t| t.as_str()) != Some("indicator") {
@@ -294,6 +301,9 @@ impl IocDb {
                 continue;
             };
             if value.trim().is_empty() {
+                continue;
+            }
+            if !extracted_in_set.insert((object_type.clone(), field.clone(), value.clone())) {
                 continue;
             }
             let kind = kind_of(&object_type, &field);
@@ -436,6 +446,36 @@ mod tests {
         assert_eq!(stats.by_kind["domain"], 1);
         assert_eq!(stats.by_kind["file_hash"], 1);
         assert_eq!(stats.applicable, 3); // 2 process names + 1 file name
+    }
+
+    #[test]
+    fn kind_counts_serialize_deterministically() {
+        let mut db = IocDb::new();
+        let stats = db.load_stix("test-set", MINI_STIX).unwrap();
+        assert_eq!(
+            serde_json::to_string(&stats.by_kind).unwrap(),
+            r#"{"domain":1,"file_hash":1,"file_name":1,"process_name":2}"#
+        );
+    }
+
+    #[test]
+    fn duplicate_stix_values_are_counted_and_matched_once_per_set() {
+        let mut db = IocDb::new();
+        let stats = db
+            .load_stix(
+                "t",
+                r#"{"objects":[
+                    {"type":"indicator","id":"indicator--one","pattern":"[process:name='bh']"},
+                    {"type":"indicator","id":"indicator--two","pattern":"[process:name='bh']"}
+                ]}"#,
+            )
+            .unwrap();
+
+        assert_eq!(stats.stix_indicators, 2, "raw STIX records stay auditable");
+        assert_eq!(stats.extracted, 1);
+        assert_eq!(stats.applicable, 1);
+        assert_eq!(db.total(), 1);
+        assert_eq!(db.match_process("bh").len(), 1);
     }
 
     #[test]

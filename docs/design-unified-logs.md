@@ -1,69 +1,94 @@
-# Design: unified log (tracev3) analysis
+# Design: unified-log process inventory
 
-Status: implemented in v0.5.0 (`crates/trace-core/src/unified_log.rs`),
-following the architecture below. This documents the spike results and the
-design rationale; it is kept as the record of why catalog-level analysis
-was chosen over full log reconstruction.
+Status: implemented in `crates/trace-core/src/unified_log.rs` and
+`crates/trace-core/src/tar_stream.rs`. This document describes the current
+architecture and the reason Trace performs catalog-level analysis instead of
+full unified-log reconstruction.
 
-## Spike results (2026-07-08)
+## Scope decision
 
-- `macos-unifiedlogs` 0.6.0 (Mandiant's parser, pure Rust) compiles to
-  `wasm32-unknown-unknown` unmodified.
-- Its `FileProvider` trait is explicitly designed for non-filesystem
-  sources: consumers supply `Read` implementations, and uuidtext/dsc reads
-  are on-demand by UUID, "avoiding having to read all UUIDText files into
-  memory".
-- `parse_log(reader, evidence)` parses a single `.tracev3` file to
-  `UnifiedLogData`, whose catalogs carry `catalog_process_info_entries`
-  (pid, `main_uuid`, effective UID) without any string resolution.
+An iOS `system_logs.logarchive` contains tracev3 catalogs that identify a
+process by PID and main-binary UUID. A corresponding uuidtext footer can map
+that UUID to the binary's path. Trace joins those two sources to create a
+process inventory and applies the same process-name, file-name, file-path, and
+path-location checks used by the other process-bearing surfaces.
 
-## Why not full log reconstruction
+Trace does not reconstruct or search unified-log messages. Message rendering
+would require substantially more supporting data, including large shared
+string caches, and would create a different resource and validation problem.
+Consequently, domain and URL values that might appear in message text are not
+checked. Trace also does not parse iPhone backups or reconstruct messages from
+backup databases; those are separate, out-of-scope acquisition and analysis
+paths.
 
-Rendering log *messages* requires the shared string caches (`dsc`, commonly
-100 MB+) and the full uuidtext tree. That budget does not exist in a browser
-tab, and messages are not where the v1 indicator value is: domains/URLs in
-message bodies are backup-artifact territory, already declared out of scope.
+The implementation uses the pure-Rust `macos-unifiedlogs` parser, which builds
+for `wasm32-unknown-unknown`. Trace consumes only the catalog and uuidtext
+structures needed for this bounded inventory and does not load the `dsc`
+shared-string cache.
 
-## Chosen architecture: catalog-level process inventory
+## Streaming and reduction
 
-The high-value slice is the **process inventory**: every process that
-emitted a log entry during the archive window (typically days of history),
-with pid and binary path - matched against exactly the same process/path
-indicators and location heuristics as the other three surfaces. This needs
-only the tracev3 catalogs plus the uuidtext footer (which stores the binary
-path), and never touches dsc.
+The gzip and tar layers are streamed. Unified-log members are handled one file
+at a time and dropped after their durable process facts have been retained:
 
-Streaming plan, single pass, bounded memory:
+1. A `.tracev3` member under the archive root's direct
+   `system_logs.logarchive` child is buffered only up to the outer 32 MiB member
+   cap. Nested or paired-device lookalikes are ignored. Trace validates complete
+   top-level chunk framing, recognized chunk types, and declared decompression
+   sizes before invoking the upstream parser. It then retains
+   `(main_uuid, pid)` observations and catalog-appearance counts.
+2. A canonical uuidtext member has a two-character uppercase-hex directory and
+   a 30-character uppercase-hex filename. Trace parses its footer, validates
+   its version and path, and retains a `uuid -> canonical binary path` mapping.
+3. At finalization, the two maps are joined by UUID. Correctness does not
+   depend on tar member ordering: tracev3 observations and uuidtext mappings
+   are both retained until the join.
+4. Each resolved path is checked against applicable indicators: exact,
+   case-sensitive process/file basenames and full paths, plus canonical
+   descendants of trailing-slash directory path indicators. Path heuristics are
+   applied separately. Report evidence includes the path, UUID, retained PID
+   count and sample, and catalog-appearance count.
 
-1. `tar_stream` learns two artifact kinds it does NOT retain:
-   - `*.tracev3` under `system_logs.logarchive/` - on file completion, hand
-     the bytes to a consumer callback, run `parse_log`, harvest
-     `(main_uuid, pid)` pairs from catalog process entries, drop the bytes.
-     Individual files are ~10 MB; only one is ever held.
-   - `uuidtext` files (`XX/YYYY…`, 32-hex layout) - parse the footer path
-     on completion (files are KB-sized), keep a `uuid -> path` map, drop the
-     bytes. Tar ordering conveniently delivers tracev3 (`Persist/`,
-     `Special/`) before `uuidtext/`, so needed UUIDs are known first; the
-     map can be filtered to them, capped, and any overflow surfaces in
-     `scan_limits`.
-2. At `finish()`, join the two: a deduplicated process inventory
-   `(path, pids, entry count, first/last timestamp)` feeds
-   `IocDb::match_process` and `heuristics::path_flag_finding`, emitting
-   findings with the same severity semantics as the other surfaces, plus an
-   `ArtifactSummary` (processes seen, files parsed, window covered).
-3. Missing-artifact handling: a sysdiagnose without a logarchive reports the
-   surface as unavailable, same as the other three.
+The resulting `ArtifactSummary` reports file, catalog, process, resolution,
+failure, truncation, and conflict counts, plus retained PID/path-byte counts and
+cap state. It does not claim first or last event timestamps or a precisely
+measured log window, because this catalog-only path does not derive those
+fields.
 
-## Open needs (both resolved in v0.5.0)
+## Bounds and fail-closed behavior
 
-- **Real test data.** Resolved: validated against the maintainer's real
-  iOS 26.5.2 sysdiagnose (617/617 catalog processes resolved to paths,
-  zero false positives; sanitized aggregates in VALIDATION.md). The
-  capture itself stays private; the repeatable gate is
-  `tests/real_capture.rs`, run locally via the `TRACE_REAL_SYSDIAGNOSE`
-  environment variable.
-- **Version bump and coverage copy.** Resolved: shipped as v0.5.0 with
-  the coverage line moved to `examined` and README/about copy updated.
-  v0.6.1 later tightened the surface's structural-success semantics (a
-  catalog inventory that resolves zero process paths is `parsed_partial`,
-  never silently complete).
+The unified-log path applies both archive-wide limits and its own reduction
+limits:
+
+- 32 MiB buffered per tracev3 or uuidtext member;
+- 64 MiB declared inner decompression per compressed tracev3 chunkset;
+- 256 MiB aggregate declared inner decompression per tracev3 file;
+- 65,536 tracked process UUIDs and 65,536 retained uuidtext mappings;
+- 4,096 retained PIDs per process and 262,144 retained PIDs in aggregate;
+- 4,096 bytes per retained path and 16 MiB of retained path bytes in
+  aggregate; and
+- the tar reader's 1,000,000-header and 8 GiB decompressed-stream ceilings.
+
+A tracev3 file cut short by the outer member cap or rejected by framing
+validation is not partially inventoried. Trace also degrades the surface when
+the parser drops or collapses catalog data, a UUID or uuidtext file is invalid,
+conflicting UUID mappings appear, an inventory cap is reached, no process is
+inventoried, or any inventoried process cannot be resolved to a path. Surviving
+findings from structurally usable catalogs remain visible, but a no-finding
+result with one of these conditions is inconclusive rather than reassuring.
+
+These limits close known single-declaration allocation hazards; they do not
+prove bounded aggregate CPU time or browser responsiveness for an archive with
+many individually valid hostile members. Availability loss remains a residual
+risk and must produce a visible error or incomplete result, never a trustworthy
+negative.
+
+## Validation status
+
+Public fixtures and CI cover framing, truncation, unsupported chunks, declared
+decompression limits, catalog integrity, UUID/path validation, conflicts,
+inventory caps, matching, and degraded-surface verdict behavior. Sanitized
+aggregates from private real captures and the command for an ignored local
+real-capture test are recorded in [`VALIDATION.md`](../VALIDATION.md). The
+private archives are not published, so those results are receipts rather than
+independently replayable public evidence.

@@ -2,16 +2,18 @@
    claim is verifiable - load once, go to Airplane Mode, scan. */
 
 // The production build replaces this exact string with a per-commit name
-// ('trace-<sha>') and then verifies the substitution took (see the deploy
-// command in README.md). Renaming or reformatting this line breaks that
+// ('trace-<sha>') and then verifies the substitution took (see the CI-gated
+// production workflow). Renaming or reformatting this line breaks that
 // verification on purpose: update both together.
 const CACHE = 'trace-v1';
+const TRACE_CACHE_PREFIX = 'trace-';
 const SHELL = [
   './',
   './index.html',
   './style.css',
   './main.js',
   './readable-report.js',
+  './report-validator.js',
   './indicator-floor.js',
   './worker.js',
   './report.schema.json',
@@ -31,16 +33,28 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (e) => {
+  // Do not call skipWaiting here. A new release must remain waiting while an
+  // older worker still controls an open page; activating immediately could
+  // replace that page's cached worker/WASM/indicator assets mid-session and
+  // produce a report assembled from two different releases.
   e.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())
+    caches.open(CACHE).then((c) => c.addAll(SHELL))
   );
 });
 
 self.addEventListener('activate', (e) => {
+  // Normal service-worker lifecycle reaches activation only after clients of
+  // the previous release have gone away. Remove only Trace-owned generations:
+  // caches are origin-wide, so deleting an unrelated app's cache would break a
+  // shared-origin/subpath deployment. Do not claim already-open clients; the
+  // new release takes control on a subsequent navigation instead.
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
+      .then((keys) => Promise.all(
+        keys
+          .filter((k) => k.startsWith(TRACE_CACHE_PREFIX) && k !== CACHE)
+          .map((k) => caches.delete(k))
+      ))
   );
 });
 

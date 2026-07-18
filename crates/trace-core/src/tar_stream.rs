@@ -65,17 +65,26 @@ pub(crate) fn is_paired_device_path(path: &str) -> bool {
 
 pub fn classify(path: &str) -> Option<ArtifactKind> {
     let p = canonical_member_path(path)?;
-    let base = p.rsplit('/').next().unwrap_or(p);
+    let components: Vec<&str> = p.split('/').collect();
+    let base = *components.last()?;
     // AppleDouble metadata companions ("._foo.ips") appear in archives that
     // passed through a Mac; they are resource forks, not artifacts.
     if base.starts_with("._") {
         return None;
     }
-    if is_shutdown_log(base) {
+
+    // Primary process artifacts have fixed locations in a sysdiagnose. Do
+    // not let an unrelated or paired-device file with a familiar basename
+    // substitute for phone evidence and earn a negative verdict.
+    if components.len() == 4
+        && components[1] == "system_logs.logarchive"
+        && components[2] == "Extra"
+        && is_shutdown_log(base)
+    {
         return Some(ArtifactKind::ShutdownLog);
     }
     if !base.ends_with(".ips") {
-        return if base == "ps.txt" || base == "ps_thread.txt" {
+        return if components.len() == 2 && (base == "ps.txt" || base == "ps_thread.txt") {
             Some(ArtifactKind::PsListing)
         } else {
             None
@@ -85,13 +94,15 @@ pub fn classify(path: &str) -> Option<ArtifactKind> {
     // ProxiedDevice directories under logs/ carry reports from a paired
     // device (normally Apple Watch). They are scanned, but must not substitute
     // for the phone's crash-report surface or supply phone device metadata.
-    let components: Vec<&str> = p.split('/').collect();
     if is_paired_device_path(p) {
         return Some(ArtifactKind::PairedCrashLog);
     }
 
-    // Component-wise match: "notcrashes_and_spins/x.ips" must not qualify.
-    if components.contains(&"crashes_and_spins") {
+    // Phone crash reports live under the archive root's direct
+    // `crashes_and_spins` child (optionally in nested categories such as
+    // `Panics`). A familiar directory name deeper in an unrelated subtree
+    // must not substitute for the primary crash surface.
+    if components.len() >= 3 && components[1] == "crashes_and_spins" {
         return Some(ArtifactKind::CrashLog);
     }
     None
@@ -117,10 +128,13 @@ fn is_upper_hex(s: &str) -> bool {
 fn classify_consume(path: &str) -> Option<ConsumeKind> {
     let p = canonical_member_path(path)?;
     let components: Vec<&str> = p.split('/').collect();
-    let logarchive = components
-        .iter()
-        .position(|component| *component == "system_logs.logarchive")?;
-    let rest = components.get(logarchive + 1..)?;
+    // The phone's unified logarchive is a direct child of the sysdiagnose
+    // root. A nested lookalike (especially beneath logs/ProxiedDevice*) is
+    // not primary iPhone evidence and must never earn unified-log coverage.
+    if components.get(1) != Some(&"system_logs.logarchive") {
+        return None;
+    }
+    let rest = components.get(2..)?;
     let base = *rest.last()?;
     if base.starts_with("._") {
         return None;
@@ -267,9 +281,9 @@ pub struct TarCollector {
     zero_blocks: u8,
 }
 
-fn cstr(bytes: &[u8]) -> String {
+fn cstr_utf8(bytes: &[u8]) -> Result<&str, ()> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    std::str::from_utf8(&bytes[..end]).map_err(|_| ())
 }
 
 /// Tar numeric field: octal text, or a non-negative GNU base-256 value when
@@ -478,12 +492,6 @@ impl TarCollector {
                         continue;
                     };
                     let typeflag = block[156];
-                    let name = cstr(&block[0..100]);
-                    let prefix = if &block[257..262] == b"ustar" {
-                        cstr(&block[345..500])
-                    } else {
-                        String::new()
-                    };
                     cur += 512;
 
                     // Local metadata applies to one ordinary member. A
@@ -498,13 +506,11 @@ impl TarCollector {
                         continue;
                     }
 
-                    let local = self.next_meta.take().unwrap_or_default();
-                    let size = local.size.unwrap_or(header_size);
-                    let path = match local.path {
-                        Some(p) => p,
-                        None if prefix.is_empty() => name,
-                        None => format!("{}/{}", prefix, name),
-                    };
+                    let LocalMeta {
+                        path: local_path,
+                        size: local_size,
+                    } = self.next_meta.take().unwrap_or_default();
+                    let size = local_size.unwrap_or(header_size);
                     // Saturate: a base-256 size field can encode u64::MAX,
                     // where rounding up to the 512 boundary would overflow
                     // (panic in debug, silent wrap to 0 and a misparse
@@ -516,6 +522,31 @@ impl TarCollector {
                     match typeflag {
                         b'0' | 0 | b'7' => {
                             self.entries += 1;
+                            let path = match local_path {
+                                Some(path) => path,
+                                None => {
+                                    let Ok(name) = cstr_utf8(&block[0..100]) else {
+                                        self.malformed_paths += 1;
+                                        self.state = State::Done;
+                                        continue;
+                                    };
+                                    let prefix = if &block[257..262] == b"ustar" {
+                                        let Ok(prefix) = cstr_utf8(&block[345..500]) else {
+                                            self.malformed_paths += 1;
+                                            self.state = State::Done;
+                                            continue;
+                                        };
+                                        prefix
+                                    } else {
+                                        ""
+                                    };
+                                    if prefix.is_empty() {
+                                        name.to_owned()
+                                    } else {
+                                        format!("{prefix}/{name}")
+                                    }
+                                }
+                            };
                             let Some(path) = canonical_member_path(&path).map(str::to_owned) else {
                                 self.malformed_paths += 1;
                                 self.state = State::Done;
@@ -1045,6 +1076,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_in_ustar_path_stops_before_classification() {
+        let mut header = test_util::header("root/ps.txt", 0, b'0');
+        header[0] = 0xff;
+        resign_header(&mut header);
+        let archive = test_util::finish(header.to_vec());
+
+        let mut col = TarCollector::with_limits(Limits::default());
+        col.write_all(&archive).unwrap();
+
+        assert_eq!(col.malformed_paths, 1);
+        assert!(col.files.is_empty());
+    }
+
+    #[test]
     fn ambiguous_regular_member_path_stops_instead_of_hiding_artifacts() {
         let mut archive = test_util::entry("root/crashes_and_spins/../other/bh.ips", b"ambiguous");
         archive.extend_from_slice(&test_util::entry("root/ps.txt", b"PS"));
@@ -1332,6 +1377,18 @@ mod tests {
             "root/not-system_logs.logarchive/Persist/0000000000000001.tracev3"
         )
         .is_none());
+        assert!(classify_consume(
+            "root/random/system_logs.logarchive/Persist/0000000000000001.tracev3"
+        )
+        .is_none());
+        assert!(classify_consume(
+            "root/logs/ProxiedDevice/system_logs.logarchive/Persist/0000000000000001.tracev3"
+        )
+        .is_none());
+        assert!(classify_consume(
+            "root/logs/ProxiedDevice/system_logs.logarchive/AB/CDEF01234567890123456789012345"
+        )
+        .is_none());
         assert!(
             classify_consume("root/system_logs.logarchive/../other/0000000000000001.tracev3")
                 .is_none()
@@ -1403,6 +1460,12 @@ mod tests {
         );
         assert_eq!(classify("root/Extra/shutdown.old.log"), None);
         assert_eq!(classify("root/Extra/preshutdown.log"), None);
+        assert_eq!(classify("root/Extra/shutdown.log"), None);
+        assert_eq!(classify("root/random/shutdown.log"), None);
+        assert_eq!(
+            classify("root/logs/ProxiedDevice/system_logs.logarchive/Extra/shutdown.log"),
+            None
+        );
         assert_eq!(
             classify("./root/crashes_and_spins/Panics/panic-full.ips"),
             Some(ArtifactKind::CrashLog)
@@ -1429,9 +1492,17 @@ mod tests {
         // deliberately out of scope and disclosed in coverage.not_examined
         assert_eq!(classify("root/logs/OTAUpdateLogs/OTAUpdate-2026.ips"), None);
         assert_eq!(classify("root/ps.txt"), Some(ArtifactKind::PsListing));
+        assert_eq!(
+            classify("root/ps_thread.txt"),
+            Some(ArtifactKind::PsListing)
+        );
+        assert_eq!(classify("ps.txt"), None);
+        assert_eq!(classify("root/random/ps.txt"), None);
+        assert_eq!(classify("root/logs/ProxiedDevice/ps.txt"), None);
         assert_eq!(classify("root/otherdir/x.ips"), None);
         // component boundary: a lookalike directory must not qualify
         assert_eq!(classify("root/notcrashes_and_spins/x.ips"), None);
+        assert_eq!(classify("root/random/crashes_and_spins/x.ips"), None);
         assert_eq!(classify("/root/crashes_and_spins/app-2026.ips"), None);
         assert_eq!(classify("../root/crashes_and_spins/app-2026.ips"), None);
         assert_eq!(classify("./../root/crashes_and_spins/app-2026.ips"), None);

@@ -4,12 +4,49 @@
 #   web/fixtures/sysdiagnose_demo_infected.tar.gz
 # The "infected" one seeds a real Pegasus process-name indicator taken from
 # the bundled Amnesty STIX2 file, so it exercises the genuine match path.
-# Requires: jq, bsdtar (macOS default tar).
+# Requires: jq and libarchive bsdtar. Set BSDTAR=/path/to/bsdtar to override
+# auto-detection (macOS /usr/bin/tar is accepted because it is bsdtar).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+is_bsdtar() {
+  local candidate="$1"
+  "$candidate" --version 2>&1 | grep -Eiq 'bsdtar|libarchive'
+}
+
+select_bsdtar() {
+  local candidate resolved
+
+  if [ -n "${BSDTAR:-}" ]; then
+    if ! resolved=$(command -v "$BSDTAR" 2>/dev/null); then
+      echo "BSDTAR does not name an executable: $BSDTAR" >&2
+      return 1
+    fi
+    if ! is_bsdtar "$resolved"; then
+      echo "BSDTAR is not libarchive bsdtar: $resolved" >&2
+      return 1
+    fi
+    printf '%s\n' "$resolved"
+    return
+  fi
+
+  for candidate in bsdtar /usr/bin/tar; do
+    if resolved=$(command -v "$candidate" 2>/dev/null) && is_bsdtar "$resolved"; then
+      printf '%s\n' "$resolved"
+      return
+    fi
+  done
+
+  echo "libarchive bsdtar is required (install libarchive-tools on Debian/Ubuntu)" >&2
+  return 1
+}
+
+BSDTAR_BIN=$(select_bsdtar)
+readonly BSDTAR_BIN
+
 IOC_PROC=$(jq -r '.objects[] | select(.type=="indicator") | .pattern' web/iocs/pegasus.stix2 \
-  | grep -oE "process:name\s*=?\s*'[^']+'" | head -1 | sed -E "s/.*'([^']+)'/\1/")
+  | grep -oE "process:name\s*=?\s*'[^']+'" \
+  | sed -E -n "1s/.*'([^']+)'/\1/p")
 [ -n "$IOC_PROC" ] || { echo "could not extract a process IOC from pegasus.stix2" >&2; exit 1; }
 echo "Seeding infected fixture with Pegasus process indicator: $IOC_PROC"
 
@@ -78,10 +115,13 @@ for kind in clean infected; do
   # ACLs and file flags are stripped too: macOS stamps new files with a
   # com.apple.provenance xattr whose value varies per creating process,
   # which silently broke byte-for-byte reproducibility.
-  find "$tmp" -exec touch -t 202607071900 {} +
+  # The absolute timestamp matches the checked-in fixtures. Expressing it in
+  # UTC avoids local-time differences between developer machines and CI.
+  TZ=UTC find "$tmp" -exec touch -t 202607080200 {} +
   (cd "$tmp" && find . -mindepth 1 -print | LC_ALL=C sort \
-    | COPYFILE_DISABLE=1 tar -cn --no-xattrs --no-acls --no-fflags \
-        --uid 0 --gid 0 -T - -f - | gzip -n) \
+    | COPYFILE_DISABLE=1 "$BSDTAR_BIN" -c -n --format ustar \
+        --no-xattrs --no-acls --no-fflags --uid 0 --gid 0 \
+        --uname root --gname wheel -T - -f - | gzip -n) \
     > "$OUT/sysdiagnose_demo_$kind.tar.gz"
   rm -rf "$tmp"
 done

@@ -250,7 +250,7 @@ pub fn analyze(path: &str, content: &str, db: &IocDb, findings: &mut Findings) -
             findings.push(Finding::ioc_match(
                 path,
                 format!(
-                    "Process \u{2018}{}\u{2019} held up device shutdown - its name matches a published {} indicator",
+                    "Process \u{2018}{}\u{2019} held up device shutdown - its observed name or path matches a published {} indicator",
                     basename(proc_path),
                     ind.campaign
                 ),
@@ -404,6 +404,25 @@ After 1.26s, these clients are still here:
         assert!(!findings
             .iter()
             .any(|f| f.summary.contains("filecoordinationd")));
+    }
+
+    #[test]
+    fn directory_path_match_summary_does_not_claim_a_name_match() {
+        let mut db = IocDb::new();
+        db.load_stix(
+            "t",
+            r#"{"objects":[{"type":"malware","name":"Pegasus"},{"type":"indicator","pattern":"[file:path='/private/var/db/com.apple.xpc.roleaccountd.staging/']"}]}"#,
+        )
+        .unwrap();
+        let mut findings = Findings::new();
+        analyze("shutdown.log", SAMPLE, &db, &mut findings);
+
+        let matched = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .unwrap();
+        assert!(matched.summary.contains("observed name or path matches"));
+        assert!(!matched.summary.contains("its name matches"));
     }
 
     #[test]

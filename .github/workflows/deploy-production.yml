@@ -96,7 +96,7 @@ jobs:
           # (tool.build_commit); version alone cannot identify an untagged
           # production build.
           export TRACE_BUILD_COMMIT="$HEAD_SHA"
-          wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg
+          wasm-pack build crates/trace-core --target web --release --out-dir ../../web/pkg -- --locked
           rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/*.d.ts
           sed -i "s/const CACHE = 'trace-v1'/const CACHE = 'trace-${HEAD_SHA}'/" web/sw.js
           grep -q "trace-${HEAD_SHA}" web/sw.js
@@ -157,6 +157,10 @@ jobs:
           # The report schema must resolve at its declared $id, not fall
           # back to the SPA's index.html.
           curl -fsS "https://tracescan.pages.dev/report.schema.json" > "$schema"
+          cmp -s "$schema" web/report.schema.json || {
+            echo "production report schema differs from the validated source file" >&2
+            exit 1
+          }
           jq -e --arg schema_id 'https://tracescan.pages.dev/report.schema.json' \
             '.["$id"] == $schema_id and .properties.schema_version.const == 3' \
             "$schema" > /dev/null

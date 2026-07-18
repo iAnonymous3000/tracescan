@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tracescan.pages.dev/report.schema.json",
   "title": "Trace scan report (schema_version 3)",
-  "description": "The complete report envelope, assembled entirely by the Rust engine. Producers (browser worker, inline browser, native CLI) supply only descriptive metadata; every producer emits the identical field set for identical input. Producer-supplied metadata is always present and nullable; content-derived fields (device, a finding's indicator) may be absent because their presence depends only on the archive.",
+  "description": "The complete report envelope, assembled entirely by the Rust engine. Producers (browser worker, inline browser, native CLI) supply only descriptive context such as the source name and scan route; the engine measures the source byte count, hashes the input, and emits the identical field set for identical input. Producer-supplied metadata is always present and nullable; content-derived fields (device, a finding's indicator) may be absent because their presence depends only on the archive.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -97,14 +97,16 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Descriptive source name supplied by the producer; not authenticated by the report."
         },
         "size": {
           "type": [
             "integer",
             "null"
           ],
-          "minimum": 0
+          "minimum": 0,
+          "description": "Number of archive bytes actually received, hashed, and parsed by the engine."
         },
         "sha256": {
           "type": "string",
@@ -404,7 +406,7 @@
       "properties": {
         "complete": {
           "type": "boolean",
-          "description": "Processing completeness, not surface coverage: true when the input was recognizably a sysdiagnose, no safety limit was hit, and every parser succeeded fully. A scan can be complete while surfaces are absent - absence is reported in surfaces[] and missing_artifacts, and weighs on the verdict separately."
+          "description": "Processing completeness, not comprehensive surface coverage: true when the input was recognizably a sysdiagnose, no safety limit was hit, and every parser that ran succeeded fully. A scan can be complete while primary surfaces are absent; absence is reported in surfaces[] and missing_artifacts. A no-match scan with no primary process-bearing phone surface is inconclusive rather than clear."
         },
         "surfaces": {
           "type": "array",

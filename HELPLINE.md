@@ -58,12 +58,13 @@ no upload endpoint: archive parsing, matching, verdict generation, and report
 assembly happen in the browser tab.
 
 The browser can make ordinary requests to load the site and its reviewed
-indicator snapshots, and it may contact public upstream indicator URLs to say
-whether a newer snapshot exists. Live upstream content does not enter the
-verdict. The archive and scan result are not intentionally sent in those
-requests. This privacy property still depends on the browser receiving the
-intended Trace code; a compromised host, service worker, browser, extension, or
-device can invalidate it.
+indicator snapshots, and it may compare them with public upstream indicator
+URLs. That advisory check can detect different plausible content; it cannot
+establish that the content is newer, safer, or appropriate to ship. Live
+upstream content does not enter matching. The archive and scan result are not
+intentionally sent in those requests. This privacy property still depends on
+the browser receiving the intended Trace code; a compromised host, service
+worker, browser, extension, or device can invalidate it.
 
 Trace is **not**:
 
@@ -98,23 +99,25 @@ not anonymization.
 When a report contains more than 200 findings, the readable copy shows the
 first 200 in engine severity order and says how many remain; the JSON retains
 the full report list, subject to the engine's 5,000-finding safety cap. Hitting
-that cap is disclosed in `scan_limits`. Both formats are unsigned and editable.
-For a consistency check or consequential decision, request the JSON and, when
-it is safe and necessary, the original archive. Do not treat the readable HTML
-alone as an authenticated or complete forensic record.
+that cap is disclosed in `scan_limits`. The readable copy separately shows at
+most 200 artifacts and states how many were omitted; the JSON retains the full
+artifact inventory that the engine retained. Both formats are unsigned and
+editable. For a consistency check or consequential decision, request the JSON
+and, when it is safe and necessary, the original archive. Do not treat the
+readable HTML alone as an authenticated or complete forensic record.
 
 ## Verdict semantics
 
 The Rust engine decides the verdict. The browser displays that value rather
-than deriving a new one from the findings. Verdict precedence matters: an exact
-match or suspicious finding remains visible even when another part of the scan
-was incomplete.
+than deriving a new one from the findings. Verdict precedence matters: an
+indicator match or suspicious finding remains visible even when another part
+of the scan was incomplete.
 
 | Verdict | Exact meaning | Responder action |
 | --- | --- | --- |
-| `match` | At least one observed value exactly matched a published indicator loaded for this scan. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
-| `suspicious` | No exact indicator match was found, but at least one anomaly documented in public spyware research was found. It can have a benign cause and can coexist with an incomplete scan. | Review the evidence in context. Escalate when the person's risk, other observations, or scan limits warrant it. |
-| `clear` | At least one supported artifact type was recognized; every **present** supported artifact parsed without a recorded limit; applicable indicators were loaded; and no exact or suspicious finding was found. Informational `note` findings may remain. Supported artifact types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
+| `match` | At least one observed process identity, executable basename, or canonical executable path matched a published indicator loaded for this scan. Names and full file paths use exact, case-sensitive equality; a trailing-slash directory path matches canonical descendants. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
+| `suspicious` | No published-indicator match was found, but at least one anomaly documented in public spyware research was found. It can have a benign cause and can coexist with an incomplete scan. | Review the evidence in context. Escalate when the person's risk, other observations, or scan limits warrant it. |
+| `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a recorded limit; applicable indicators were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings may remain, and other supported surface types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
 | `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap was hit, the archive was truncated or corrupt, or no applicable indicators were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
 | `invalid` | The input contained none of the supported artifacts needed to recognize it as a sysdiagnose. | Confirm that the correct, unmodified `sysdiagnose_….tar.gz` was selected. Do not describe this as a negative scan. |
 
@@ -127,7 +130,7 @@ actually available.
 
 Finding severities are similarly descriptive:
 
-- `match` is an exact published-indicator match;
+- `match` is a published-indicator match under the name/path rules above;
 - `suspicious` is a research-documented anomaly, not an indicator match;
 - `note` is context that is often benign and does not by itself control the
   verdict.
@@ -137,19 +140,36 @@ Finding severities are similarly descriptive:
 The report's `coverage.examined` list is the engine-generated declaration for
 that individual scan. Because a received report is unsigned and editable,
 confirm it through reproduction before consequential use. Trace currently
-knows how to examine four sysdiagnose surfaces:
+knows how to examine four primary iPhone sysdiagnose surfaces:
 
 | Surface | What Trace derives from it |
 | --- | --- |
 | `shutdown.log` and rotated `shutdown.N.log` files | Processes that delayed shutdown across recorded reboot events |
 | `crashes_and_spins/*.ips` | Target process names and paths, and process inventories in diagnostic formats that contain them |
 | `ps.txt` and `ps_thread.txt` | Processes running at capture time |
-| `system_logs.logarchive` tracev3 and uuidtext files | A process inventory for the recorded unified-log window; message contents are not read |
+| `system_logs.logarchive` tracev3 and uuidtext files | Process identities represented in successfully parsed catalog data and resolved through uuidtext; Trace derives no precise log window or event timestamps, and message contents are not read |
+
+Trace also scans crash and diagnostic reports under
+`logs/ProxiedDevice*/*.ips` as supplemental paired-device evidence. A report
+labels these artifacts with `details.paired_device: true` and identifies them
+separately in `coverage.examined`. They may describe an Apple Watch or another
+paired device. Only formats containing process identities or inventories
+contribute process evidence; metadata-only reports do not. Paired reports do not
+supply the iPhone's device metadata, do not count as the iPhone crash-report
+surface, and must not be interpreted as phone coverage.
+
+Files under `logs/OTAUpdateLogs/*.ips` are different. They use an undocumented
+update or restore text format, not the crash-report schema, so Trace does not
+parse or match their contents. The report always discloses that exclusion in
+`coverage.not_examined`; their presence must never be described as checked
+evidence.
 
 The report's `stats.applicable_indicators` is the number of loaded process-name,
-file-name, and file-path indicators that this scanner could apply. File
-indicators are checked only when a process was observed running from that name
-or path; a sysdiagnose does not provide a complete filesystem inventory.
+file-name, and file-path indicators that this scanner could apply. File-name
+indicators use observed process identities and executable basenames. File-path
+indicators use only canonical observed executable paths, with descendant
+matching for a trailing-slash directory indicator. A sysdiagnose does not
+provide a complete filesystem inventory.
 
 Trace does not currently examine, among other things:
 
@@ -241,9 +261,11 @@ jq -r '.source_file.sha256' trace-report-2026-07-14.json
 The independently calculated archive hash and `source_file.sha256` must be the
 same 64 hexadecimal characters. Windows commonly displays SHA-256 in uppercase;
 normalize both values to one case or compare them case-insensitively.
-`source_file.name` and `source_file.size` are descriptive metadata supplied by
-the report producer; the SHA-256 is calculated by the engine over every archive
-byte it receives.
+`source_file.name` is descriptive metadata supplied by the report producer.
+`source_file.size` and `source_file.sha256` are calculated by the engine over
+the archive bytes it actually receives and parses. As with every field in an
+unsigned report, a responder should confirm both by hashing and measuring the
+preserved archive independently.
 
 ### 2. Inspect the identity claims without executing them
 
@@ -286,9 +308,12 @@ PY
   not prove that the build was local, dirty, clean, official, or safe.
 - `tool.version` is descriptive context, not a safe shell value and not an
   exact build identity. Never paste a raw report value into a shell command.
-- Each `indicator_provenance[].sha256` claims the exact reviewed indicator text
-  used. `indicator_provenance[].upstream` is only a load-time freshness
-  observation and does not affect matching.
+- Each `indicator_provenance[].sha256` claims the exact loaded indicator text
+  used. Establish that it was the reviewed snapshot by resolving the claimed
+  source revision and comparing hashes; a custom producer can load different
+  STIX. `indicator_provenance[].upstream` is only an advisory upstream-
+  comparison observation; it does not prove recency and does not affect
+  matching.
 
 ### 3. Resolve the claimed revision and its pinned schema
 
@@ -431,21 +456,22 @@ This map explains how responders should use the top-level fields.
 | `tool` | Tool name, package version, and exact build commit when recorded |
 | `verdict` | Engine-owned outcome described above |
 | `generated_at`, `duration_ms`, `scanned_via` | Nullable host/time/producer metadata; useful context, not evidence of authenticity |
-| `source_file` | Producer-supplied name/size plus engine-computed SHA-256 of every archive byte received |
+| `source_file` | Producer-supplied name plus engine-computed size and SHA-256 of every archive byte received |
 | `device` | Optional OS metadata derived from an artifact in the archive, including its source and sometimes a timestamp |
 | `indicator_sets` | Counts for every loaded STIX set, including how many indicators were applicable here |
-| `indicator_provenance` | Source metadata and engine-computed SHA-256 for the exact indicator text used; `upstream` is informational only |
-| `artifacts` | Each supported archive artifact encountered, parser status, and parser-specific details |
-| `missing_artifacts` | Supported surface types absent from this archive and the consequence of each absence |
-| `findings` | Severity, kind, source artifact, summary, evidence, and an optional exact indicator reference |
-| `stats` | Content-derived byte, archive-entry, artifact, and indicator counts |
+| `indicator_provenance` | Source metadata and engine-computed SHA-256 for the exact loaded indicator text; `upstream` is informational only |
+| `artifacts` | Retained and processed artifacts plus the reduced unified-log summary, with parser status and details; artifacts dropped at a cap are disclosed through `scan_limits` rather than listed individually |
+| `missing_artifacts` | Primary detection surfaces unavailable to this scan and the consequence; a surface can be unavailable even when related metadata-only files exist |
+| `findings` | Severity, kind, source artifact, summary, evidence, and an optional matched-indicator reference |
+| `stats` | Content-derived byte, archive-entry, retained non-unified artifact, and indicator counts; `artifacts_found` excludes the synthesized unified-log summary |
 | `scan_limits` | Every parser, truncation, corruption, or resource condition that made processing incomplete; a match or suspicious verdict can still have entries here |
 | `assurance` | Processing completeness plus `absent`/`partial`/`complete` state for each of the four supported surfaces |
 | `coverage` | Plain-language lists of what this scan examined and did not examine, plus the non-cleanliness caveat |
 
 All top-level fields are required by schema version 3 except the content-derived
-`device` field. A finding's `indicator` is present only for an exact indicator
-match. Producer metadata is retained as explicit `null` when unavailable.
+`device` field. A finding's `indicator` is present only for an indicator-backed
+match under the rules above. Producer metadata is retained as explicit `null`
+when unavailable.
 Parser-specific `details` and finding-specific `evidence` intentionally have no
 fixed sub-schema.
 

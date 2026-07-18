@@ -2,15 +2,15 @@
 //! indicators scans ever use. The manifest's `min_indicators` /
 //! `min_applicable` gate two things: the browser's "upstream update
 //! available" notice (a hollow upstream file is not an update), and this
-//! test, which requires every bundled snapshot to meet its declared floor
-//! so a snapshot-update PR that regresses a set fails CI until the floor
-//! is consciously adjusted (`cargo run --example ioc_stats` prints the
-//! current numbers).
+//! test. Runtime update checks use the values as minimum plausibility floors;
+//! CI requires the reviewed bundled snapshot to match them exactly, so count
+//! inflation, substitution, and regression all require a conscious review
+//! and floor update (`cargo run --example ioc_stats` prints the numbers).
 
 use trace_core::ioc::IocDb;
 
 #[test]
-fn bundled_snapshots_meet_their_manifest_floors() {
+fn bundled_snapshots_match_reviewed_manifest_counts() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/iocs");
     let manifest: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(format!("{dir}/manifest.json")).expect("read manifest"),
@@ -32,20 +32,31 @@ fn bundled_snapshots_meet_their_manifest_floors() {
         let path = format!("{dir}/../{file}");
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{name}: cannot read {path}: {e}"));
+        let bundle: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("{name}: bundled snapshot must be JSON: {e}"));
+        let malware_objects = bundle["objects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|object| object["type"].as_str() == Some("malware"))
+            .count();
+        assert_eq!(
+            malware_objects, 1,
+            "{name}: each reviewed single-campaign snapshot must identify exactly one malware object"
+        );
+
         let mut db = IocDb::new();
         let stats = db
             .load_stix(name, &json)
             .unwrap_or_else(|e| panic!("{name}: bundled snapshot must parse: {e}"));
 
-        assert!(
-            stats.extracted as u64 >= min_indicators,
-            "{name}: bundled snapshot extracts {} indicators, below its floor of {min_indicators} - review the snapshot change, then regenerate floors",
-            stats.extracted
+        assert_eq!(
+            stats.extracted as u64, min_indicators,
+            "{name}: reviewed snapshot count changed - review the snapshot diff, then regenerate its floor"
         );
-        assert!(
-            stats.applicable as u64 >= min_applicable,
-            "{name}: bundled snapshot has {} applicable indicators, below its floor of {min_applicable}",
-            stats.applicable
+        assert_eq!(
+            stats.applicable as u64, min_applicable,
+            "{name}: reviewed applicable-indicator count changed - review the snapshot diff, then regenerate its floor"
         );
     }
 }

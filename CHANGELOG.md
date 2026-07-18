@@ -4,42 +4,63 @@ Forensic reports cite the tool version that produced them (`tool.version` in
 every exported report), so each release below is an annotated git tag whose
 tree is exactly what that version shipped.
 
-## Unreleased
+## v0.7.4 - 2026-07-17
 
-Scanner correctness and hardening. Verified end to end against a real iOS 26.5.2
-(23F84) capture, which now parses fully and reads clear with every surface
-complete. The report schema is unchanged.
+Scanner correctness and hardening. A pre-final candidate beginning at `8ff0208`
+was verified end to end against a real iOS 26.5.2 (23F84) capture, which parsed
+fully and read clear with every surface complete. That private receipt is not
+an exact final-tree release gate. The report envelope remains schema v3; within
+that version, `artifacts[].status` is tightened to its four defined values.
 
-- iOS 26 parser coverage. Three diagnostic .ips families are now understood
-  (security analytics bug_type 226, cpu_resource 202, proactive_event_tracker
-  303), so a genuine sysdiagnose no longer reports its crash and diagnostic
-  files as unparseable. ps.txt accepts the iOS "?" process state (previously
-  every row of a real listing was skipped), and unified-log support files for
-  firmware coprocessors (AOP, DCP, ...) and trailing-slash .dext bundles are
-  recognized instead of counted as parse failures.
-- Closed false-clear gaps. Crash .ips outside crashes_and_spins (paired-device
-  ProxiedDevice reports, OTA update logs) are scanned and disclosed;
-  directory-valued (trailing-slash) file:path indicators match by prefix rather
-  than never matching, and relative-path indicators are recorded but not
-  counted as checkable; unified-log catalogs with inconsistent internal counts
-  degrade the surface instead of silently dropping processes; a PAX header with
-  an undecodable record, a ps row whose numeric fields overflow their columns,
-  a crash body naming no process, and a shutdown delay header with no client
-  lines all keep the scan fail-closed.
+- iOS 26 parser coverage. Three diagnostic `.ips` families are now understood
+  (security analytics `bug_type` 226, CPU resource `202`, and proactive event
+  tracker `303`), so those files parse completely in the validated private iOS
+  26.5.2 capture; unknown or drifted formats still fail closed. `ps.txt` accepts
+  the iOS `?` process state (previously every row of a real listing was skipped),
+  and unified-log support files for firmware coprocessors (AOP, DCP, ...) and
+  trailing-slash `.dext` bundles are recognized instead of counted as parse
+  failures.
+- Closed false-clear gaps. Paired-device `.ips` reports under
+  `logs/ProxiedDevice*` are scanned, labeled, and kept separate from phone
+  coverage. OTA update logs remain outside the supported crash schema and are
+  disclosed under `coverage.not_examined`. Directory-valued (trailing-slash)
+  `file:path` indicators match canonical descendants by prefix rather than never
+  matching, while relative paths are recorded but not counted as checkable.
+  Unified-log catalogs with inconsistent internal counts degrade the surface
+  instead of silently dropping processes. An undecodable PAX record, an
+  overflowing numeric process-listing field, a crash body naming no process, or
+  a shutdown delay header with no client lines all keep the scan fail-closed.
 - Closed false-positive paths. Indicator matching is case-sensitive, so
   Amnesty's capitalized 'Diagnosticd' no longer matches Apple's legitimate
   'diagnosticd'; a compound STIX pattern can no longer be split into a matchable
   clause at a quote-adjacent AND.
-- Hardening. tracev3 chunkset sizes are validated before decompression so a
-  crafted file cannot force an unbounded allocation; a WASM trap retires and
-  replaces the background worker rather than reusing a poisoned instance; the
-  results banner treats any unrecognized verdict as inconclusive, never clear;
-  archives dropped at the retention cap and truncated process listings are
-  reported accurately instead of as absent or empty.
+- Tightened evidence scope and archive handling. Primary shutdown, process-list,
+  crash, and unified-log members must occur at their canonical sysdiagnose
+  locations; lookalike filenames or logarchives in unrelated or paired-device
+  subtrees cannot substitute for phone evidence. Metadata-only phone diagnostics
+  and paired-only evidence cannot earn a `clear` phone result. Concatenated gzip
+  members are all decoded, and an undecodable tar pathname stops classification
+  instead of being repaired with replacement characters.
+- Strengthened report and indicator integrity. `source_file.size` now comes from
+  the same engine-counted bytes that are hashed and parsed, never producer
+  metadata. Duplicate STIX values within one set are extracted and matched once
+  (while raw STIX-record counts remain auditable), indicator kind maps serialize
+  deterministically, and CI requires each bundled set's exact reviewed counts
+  and single malware object. A findings cap filled by repeated matches retains
+  the first later match for a distinct indicator.
+- Hardening. Tracev3 framing and declared decompression sizes are validated
+  before the upstream parser runs, with a 64 MiB per-chunkset and 256 MiB
+  per-file declared inner-decompression ceiling. Crash and diagnostic reports
+  retain at most 10,000 distinct process candidates per file and become partial
+  if that cap is reached. A WASM trap retires and replaces the background worker
+  rather than reusing a poisoned instance. The results banner treats any
+  unrecognized verdict as inconclusive, never clear; artifacts dropped at the
+  retention cap and truncated process listings are reported accurately instead
+  of as absent or empty.
 
-Review follow-ups. A multi-dimensional review confirmed the engine, parsers, and
-detection methodology are sound, and turned up a set of interface, accessibility,
-and maintainability fixes. None change verdict semantics or the report schema.
+Review follow-ups produced interface, accessibility, maintainability, and
+documentation fixes. These changes retain the schema-v3 envelope and the
+engine-owned verdict contract.
 
 - Restored a green build. A formatting slip in the iOS 26 uuidtext resolver was
   failing `cargo fmt --check`, which gates CI and the production deploy.
@@ -47,19 +68,51 @@ and maintainability fixes. None change verdict semantics or the report schema.
   when raw technical details are included: the OS build and capture timestamp
   are stripped from artifact details and finding evidence, not only from the
   device section.
+- Scanner readiness is explicit. File, drop, and demo controls remain disabled
+  until WASM and all bundled reviewed floors validate; the page distinguishes
+  preparing, ready, and error states. Optional upstream comparisons are
+  bounded, run in the background, never gate a scan, and report only that
+  plausible upstream content differs rather than claiming it is newer.
+- Scan control and progress are safer. The UI distinguishes preparing, reading,
+  analyzing, and indeterminate finalization; a cancelled worker or streaming
+  scan discards its result, and delayed demo intent cannot replace a later real
+  scan. Inline-WASM final analysis remains blocking and non-interruptible, so
+  cancel is disabled with an explanation during that phase.
+- Synthetic demonstrations are labeled above the verdict, in readable previews,
+  and in uniquely named example exports. Real exports also use collision-
+  resistant filenames, handoff actions sit beside the verdict, source, and
+  archive hash, and the JSON action warns that the technical record can contain
+  identifying metadata.
+- Browser rendering is bounded without hiding canonical data. Main and readable
+  artifact views show at most 200 retained rows with omission notices while the
+  JSON remains complete; zero-artifact invalid reports retain their missing-
+  surface inventory. The report validator distinguishes metadata-only and
+  paired `.ips` evidence from primary phone crash coverage and rejects a forged
+  supplemental-only `clear` report.
 - Accessibility. The scan verdict is announced to screen readers by focusing its
   heading; keyboard focus follows the view into the scanning screen instead of
   falling back to the page body; the drop target has a distinct keyboard-focus
-  ring; the local-processing dialog has an accessible name; and a declared color
-  scheme lets native form controls render correctly in dark mode.
+  ring; findings and provenance rows have unique labels; errors move focus to
+  their heading; the local-processing dialog has an accessible name; the narrow
+  layout no longer overflows at 320 px; and a declared color scheme lets native
+  form controls render correctly in dark mode.
 - Maintainability. The reviewed-floor guard (a false-clear safeguard enforced on
   both scan paths), the HTML escaper, and the canonical-path predicate each have
   a single definition again instead of drifting copies, and the background
   worker's finalization phase gets its own watchdog so a slow but healthy finish
   is not failed closed.
+- Documentation now distinguishes offline operation from code authentication,
+  separates CI, public-manual, and private-manual validation, states the exact
+  2,887/148 indicator scope and matching rules, and aligns paired-device and OTA
+  coverage with the report contract.
+- The v0.7.4 release-candidate tree passed the hash-pinned public
+  EC-DIGIT-CSIRC iOS 15 corpus: 27 tracev3 files, 659 catalogs, and 426 uuidtext
+  files parsed with zero failures; all 341 processes resolved; all eight sets
+  loaded at 2,887/148; and the report was `clear` with no scan limits or
+  match/suspicious finding.
 
-Responder-trust and operational-safety work. The report schema and engine-owned
-verdict semantics are unchanged.
+Responder-trust and operational-safety work. The schema-v3 envelope shape and
+engine-owned verdict semantics are unchanged.
 
 - Added a responder guide with a five-minute intake checklist, archive/report
   hashing, schema and build checks, exact-commit semantic reproduction, field
@@ -190,8 +243,8 @@ single Rust-owned contract; no field is appended by the UI.
   comparison tooling per-surface states (complete / partial / absent) and
   an overall completeness flag, derived from the same facts as the
   verdict. Indicator-set provenance (engine-hashed text, catalog date,
-  source, upstream freshness) moved inside the envelope, and scans record
-  wall-clock duration.
+  source, advisory upstream comparison) moved inside the envelope, and scans
+  record wall-clock duration.
 - **The contract is enforced three ways.** `docs/report.schema.json` is
   the checked-in JSON Schema; Rust tests validate real fixture reports
   against it and pin the field shape to a golden list; the browser E2E
@@ -253,10 +306,10 @@ remaining paths where a scan could overstate what it checked.
 - **Live indicator data no longer reaches scans at all.** A count-based
   floor cannot tell a legitimate update from a feed that swapped reviewed
   indicators for unreviewed ones while preserving counts, so scans now use
-  only the bundled, reviewed snapshots. The upstream fetch powers a
-  "newer data published upstream" notice (shown only for plausible
-  updates that meet the reviewed floor); updates ship through the weekly
-  reviewed-snapshot PR process.
+  only the bundled, reviewed snapshots. The upstream fetch powers a neutral
+  "different plausible upstream content" notice; a hash difference does not
+  establish ordering or safety. Changes ship only through the weekly reviewed-
+  snapshot PR process.
 - **Structural parse success is now defined per surface.** An empty or
   unrecognizable shutdown.log is `unparsed` (a real log with no delayed
   clients still counts as parsed); a crash log whose body JSON fails is
@@ -332,14 +385,14 @@ degraded scan could still render "No known spyware traces found" is closed.
 
 ## v0.5.0 - 2026-07-08
 
-- **Unified log analysis** - the fourth detection surface, and the largest:
-  every process that wrote a log entry during the archive window (typically
-  days of device history) is inventoried and checked against the process and
-  path indicators plus the location heuristics. Implementation is
-  catalog-level via Mandiant's `macos-unifiedlogs` (compiled to WASM):
-  tracev3 and uuidtext files are reduced to process facts as they stream by
-  and dropped, so the 155 MB dsc string cache is never loaded and peak
-  memory stays at one file. Log message contents are never rendered.
+- **Unified log analysis** - the fourth detection surface. Process identities
+  represented in parsed tracev3 catalog data are resolved through uuidtext and
+  checked against process/path indicators and location heuristics. This catalog-
+  level implementation derives neither a precise log window nor event
+  timestamps. It uses Mandiant's `macos-unifiedlogs` (compiled to WASM), reduces
+  tracev3 and uuidtext files to process facts as they stream by, and drops them,
+  so the 155 MB dsc string cache is never loaded and peak transient input memory
+  stays at one file. Log message contents are never rendered.
 - Validated against a real iOS 26.5.2 capture: 64 tracev3 files, 2,656
   catalogs, 689 uuidtext files, zero parse failures, 617/617 processes
   resolved to paths, zero false positives (see VALIDATION.md; repeatable via

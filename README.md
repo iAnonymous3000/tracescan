@@ -2,82 +2,259 @@
 
 [![CI](https://github.com/iAnonymous3000/tracescan/actions/workflows/ci.yml/badge.svg)](https://github.com/iAnonymous3000/tracescan/actions/workflows/ci.yml)
 
-**Check an iPhone sysdiagnose for traces of known mercenary spyware - entirely in your browser.**
+**Check an iPhone sysdiagnose for traces of known mercenary spyware, locally in
+your browser.**
 
 **Live: https://tracescan.pages.dev/**
 
-Trace makes credible spyware forensics accessible to people who have never opened a terminal, without asking them to trust anyone with their data. Parsing and indicator matching run as a Rust/WebAssembly module inside the browser tab. **There is no upload endpoint - the privacy claim is architectural, not a policy promise**, and you can verify it yourself: load the page, turn on Airplane Mode, and scan.
+Trace is a private, first-pass triage tool. It is not proof that a phone is
+clean, and it is not a replacement for expert mobile forensics. Archive parsing,
+indicator matching, verdict generation, and report assembly run in a
+Rust/WebAssembly module inside the browser tab. The intended application has no
+upload endpoint and sends neither archive bytes nor report contents to one.
+
+Loading the application and then scanning offline demonstrates that the loaded
+code has no scan-time server dependency. It does not authenticate code that was
+already served or prove what a different build would do. Reviewing the exact
+served build and observing the browser Network panel provide stronger audit
+evidence, but still depend on the browser and host being trustworthy. Ordinary
+site-resource requests occur while loading the page, and optional public-
+indicator comparison requests can continue while the page is online, including
+alongside a scan. Those requests do not contain archive or report data.
 
 ## How it works
 
-1. Capture a sysdiagnose on the iPhone (hold both volume buttons + side button ~1.5s, wait ~10 minutes, find it under *Settings → Privacy & Security → Analytics & Improvements → Analytics Data*).
-2. AirDrop the `sysdiagnose_….tar.gz` file to a computer.
-3. Drag it into the Trace page. Analysis takes well under two minutes.
+1. Capture a sysdiagnose on the iPhone. Hold both volume buttons and the side
+   button for about 1 to 1.5 seconds, then release. The archive commonly takes
+   10 to 15 minutes to appear under *Settings -> Privacy & Security -> Analytics
+   & Improvements -> Analytics Data*, but timing varies by device.
+2. Move the `sysdiagnose_....tar.gz` archive to a computer using a route that
+   fits the person's risk. AirDrop keeps the transfer local. The Windows path
+   described in the app uses iCloud Drive, creates another cloud copy, and can
+   expose account activity. Visiting Trace, triggering the capture, and moving
+   the archive can all be observable.
+3. Drop the archive into Trace. Scan time varies with archive size, browser, and
+   computer. Direct scanning on an iPhone has not been validated, so the current
+   workflow requires a computer.
 
-The archive is streamed chunk-by-chunk through a WASM pipeline (gzip → tar → parsers); only the few artifact files being analyzed are held in memory, with hard caps on retained bytes, per-file sizes, entry counts, findings, unified-log allocations, and total decompressed output, and nothing leaves the machine. A scan that hits a safety cap, or an archive that arrives truncated, is reported as incomplete - never as clean. Four primary detection surfaces are analyzed; paired-device reports are scanned as supplemental evidence and never substitute for phone coverage:
+The archive streams through a bounded WASM pipeline: gzip -> tar -> artifact
+parsers. Trace retains only selected artifact files and reduces unified-log
+files to process facts as they pass. Limits cover retained bytes, individual
+files, archive entries, findings, unified-log allocations, and total
+decompressed output. A parser failure, truncated archive, or reached safety cap
+is disclosed as incomplete and can never produce a `clear` verdict.
 
-| Artifact | Signal |
-|---|---|
-| `system_logs.logarchive/Extra/shutdown.log` (rotated `shutdown.0.log` on iOS 26) | Processes that delayed shutdown, per reboot - the [iShutdown](https://github.com/KasperskyLab/iShutdown) technique; Pegasus artifacts run from `roleaccountd.staging` |
-| `crashes_and_spins/*.ips` | Crash and diagnostic reports: target process names/paths and complete process inventories where the format contains them |
-| `logs/ProxiedDevice*/*.ips` | Crash and diagnostic reports proxied from a paired device (normally Apple Watch), labeled separately and excluded from the phone's device metadata and crash-surface completeness |
-| `ps.txt`, `ps_thread.txt` | Processes running at capture time vs. process indicators |
-| `system_logs.logarchive` tracev3 + uuidtext | Every process that wrote a unified-log entry during the archive window (typically days of history), via [Mandiant's parser](https://github.com/mandiant/macos-UnifiedLogs) at catalog level - process inventory only, log messages are never rendered, and each file is reduced and dropped so memory stays flat |
+The browser keeps file, drop, and demo controls disabled until WASM and every
+bundled indicator floor validate. A worker or streaming read can be cancelled
+and its result discarded. The inline fallback's final WASM analysis is still a
+blocking operation; once it starts, the UI disables cancel and explains that
+limitation.
 
-Both shutdown.log generations are handled and were verified against a real iOS 26.5.2 capture: the classic one-line format, and the iOS 26 format with rotated filenames, indented client lines, and a trailing binary-UUID path component (stripped before matching, or no name indicator could ever hit).
+Trace has four primary phone surfaces. Paired-device reports are supplemental;
+they can contribute evidence but never substitute for phone coverage.
 
-Indicators are STIX2 bundles from the open threat-intel ecosystem: [Amnesty International's Security Lab](https://github.com/AmnestyTech/investigations) publications plus the [MVT project's aggregated indicator collection](https://github.com/mvt-project/mvt-indicators) (Citizen Lab, Kaspersky, Google Threat Intelligence, Microsoft, iVerify, and others). Eight iOS-relevant campaigns are bundled: Pegasus, Predator, KingSpawn (QuaDream), Operation Triangulation, RCS Lab, Wintego Helios, Coruna, and DarkSword. Scans use only the bundled, reviewed snapshots, and every scan records the SHA-256 of the exact indicator files it used. Live upstream data never reaches a verdict - no runtime check can tell a legitimate update from a feed that swapped reviewed indicators for unreviewed ones - so the app fetches upstream at load solely to tell the user when newer data has been published. Updates ship through a scheduled workflow that PRs upstream changes into the snapshots weekly for review; a CI test pins each set's reviewed indicator floor so a regressing snapshot cannot merge silently.
+| Scope | Artifact | Signal |
+|---|---|---|
+| Primary | `system_logs.logarchive/Extra/shutdown.log` and rotated `shutdown.N.log` | Processes that delayed shutdown, per reboot: the [iShutdown](https://github.com/KasperskyLab/iShutdown) technique. Pegasus artifacts have run from `roleaccountd.staging`. |
+| Primary | `crashes_and_spins/**/*.ips` | Target process names and paths, plus complete process inventories in diagnostic formats that contain them. |
+| Supplemental | `logs/ProxiedDevice*/*.ips` | Process identities or inventories from paired-device diagnostic formats that contain them, normally from an Apple Watch. Metadata-only reports provide no process evidence; all paired reports are labeled separately and excluded from phone metadata and phone crash-surface completeness. |
+| Primary | `ps.txt`, `ps_thread.txt` | Processes running at capture time. |
+| Primary | `system_logs.logarchive` tracev3 and uuidtext | Process identities represented in successfully parsed catalog data, resolved to canonical paths through uuidtext. Trace derives no precise log window or event timestamps; messages are never rendered, and each input file is reduced and dropped. |
 
-## Honest epistemics - the part that matters
+The rotated iOS 26 shutdown format, including indented client lines and trailing
+binary-UUID path components, was validated against a private iOS 26.5.2
+capture. The classic one-line format is covered by published iShutdown examples,
+synthetic fixtures, and automated tests; Trace does not claim a public or private
+real-capture receipt for that older format.
 
-- **"No matches" is not "clean."** It means no *known* implant left *known* traces in the artifacts this tool reads. The UI says so, prominently, every time.
-- Two coverage gaps are stated in every report: the public-IOC time lag, and artifact coverage (domain/URL indicators live in backup artifacts - browsing history, messages - that this version does not read; roughly 2,700 of the ~2,900 loaded indicators are in that category and results never imply they were checked).
-- A hit routes to [Access Now's Digital Security Helpline](https://www.accessnow.org/help/) and [Amnesty's Security Lab](https://securitylab.amnesty.org/get-help/), with evidence-preservation guidance (don't wipe; keep the file; export the report for responders). Every result shows the archive's SHA-256 and offers two handoffs: the complete JSON technical report, and a redaction-previewed, self-contained HTML report that withholds filename, device metadata, and raw evidence by default.
-- A sufficiently compromised device can lie in its own sysdiagnose. Detection is best-effort starting at evidence collection.
-- [VALIDATION.md](VALIDATION.md) states exactly what each detection surface has been validated against, and what could not be validated because the data is not public.
-- [HELPLINE.md](HELPLINE.md) tells responders how to interpret, preserve, hash-bind, and independently reproduce a report. [THREAT_MODEL.md](THREAT_MODEL.md) documents the system and operational trust boundaries.
+## Indicator and matching policy
+
+Trace bundles reviewed STIX2 snapshots from [Amnesty International's Security
+Lab](https://github.com/AmnestyTech/investigations) and the [MVT indicator
+collection](https://github.com/mvt-project/mvt-indicators). The eight bundled
+campaign sets are Pegasus, Predator, KingSpawn (QuaDream), Operation
+Triangulation, RCS Lab, Wintego Helios, Coruna, and DarkSword.
+
+The snapshots dated 2026-07-08 contain 2,887 extracted indicators. Of those, 148
+are applicable to the process activity Trace observes: 83 process names, 15 file
+names, and 50 canonical file paths. The RCS Lab and Wintego Helios snapshots
+currently contribute no applicable process or file indicator, although their
+non-applicable indicators remain visible in per-set accounting. Each report
+records the actual counts and SHA-256 of every exact snapshot used, so report
+values take precedence over these dated README totals.
+
+Matching is deliberately narrow:
+
+- STIX extraction accepts one fully anchored equality clause. Compound,
+  qualified, malformed, or non-STIX patterns are rejected before extraction
+  rather than partially matched; the raw-versus-extracted source accounting
+  makes those rejections visible without presenting them as individual
+  non-applicable indicators.
+- Process and file names use exact, case-sensitive equality. This preserves
+  distinctions such as the published `Diagnosticd` indicator versus Apple's
+  legitimate `diagnosticd` process.
+- File paths must be canonical absolute paths. Directory-valued indicators with
+  a trailing slash match canonical descendants by prefix. Relative, dot-segment,
+  or slash-bearing name indicators remain in totals but are not called
+  checkable.
+- File-name indicators are compared with observed process identities and
+  executable basenames. File-path indicators are compared only with canonical
+  observed executable paths. A sysdiagnose is not a filesystem inventory, so
+  neither rule establishes that an arbitrary file exists on disk.
+
+Most bundled indicators are domains, URLs, email addresses, hashes, or other
+values that these surfaces cannot evaluate. Trace v1 neither parses iPhone
+backups nor reconstructs unified-log message contents, so it does not attempt
+domain or URL matching. Reports state this limit and never imply those values
+were checked.
+
+The official browser scanner matches only against its committed snapshots.
+Live upstream data never reaches matching; optional upstream requests can
+report only that different, plausible content exists and needs review. A hash
+difference does not establish that content is newer or safer, and the
+comparison does not gate scanner readiness. The browser refuses a bundled set
+below its reviewed minimum, while CI requires every committed snapshot to match
+the exact reviewed indicator/applicable counts and contain one malware object.
+A scheduled workflow proposes upstream changes in a pull request each week; a
+human still has to review the content before it ships. The native harness can
+instead be given explicit STIX paths, and its report hashes the exact supplied
+text.
+
+## Honest epistemics
+
+- **"No matches" is not "clean."** It means no known implant left a known
+  trace in the artifacts that this scan successfully examined.
+- Missing surface types can be normal, but they remain explicit in every report.
+  `assurance.complete` describes processing of available input, not comprehensive
+  device coverage.
+- Trace has no real infected-device sysdiagnose in its validation corpus. The
+  infected demo is synthetic from published patterns and a real published
+  process-name indicator.
+- A hit routes to [Access Now's Digital Security
+  Helpline](https://www.accessnow.org/help/) and [Amnesty's Security
+  Lab](https://securitylab.amnesty.org/get-help/), with evidence-preservation
+  guidance. Every result shows the archive SHA-256 and offers the complete JSON
+  report plus a self-contained HTML handoff with privacy redactions enabled by
+  default.
+- A sufficiently compromised device can lie in its own sysdiagnose. Detection
+  is best effort beginning at evidence collection.
+- [VALIDATION.md](VALIDATION.md) separates CI coverage, manual public-capture
+  checks, private-capture checks, and remaining validation gaps.
+- [HELPLINE.md](HELPLINE.md) explains responder interpretation and
+  reproduction. [THREAT_MODEL.md](THREAT_MODEL.md) documents system and
+  operational trust boundaries.
 
 ## Development
 
-```
-./build.sh                 # cargo test + wasm-pack build + regenerate demo fixtures
+The pinned Rust toolchain, including `wasm32-unknown-unknown`, is declared in
+`rust-toolchain.toml`. Local development also needs `wasm-pack` 0.14.0 and
+Python 3. Deterministic fixture generation additionally needs `jq`, gzip, and a
+compatible BSD tar/`bsdtar`, which the fixture script selects explicitly. macOS
+provides BSD tar by default. Browser tests require Node.js; CI uses Node 22.
+`cargo audit` additionally requires `cargo-audit`.
+
+Build and serve the WASM application:
+
+```sh
+./build.sh
 python3 -m http.server 8973 --directory web
-
-# native CLI harness (same engine the browser runs):
-cargo run --release --example scan -- <sysdiagnose.tar.gz> web/iocs/*.stix2
-
-# browser end-to-end tests (needs web/pkg built first):
-cd e2e && npm install && npx playwright install chromium && npm test
 ```
 
-Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `jq` and `bsdtar` (fixtures; bsdtar is the macOS default tar), and Node (E2E only). The demo fixtures are synthetic sysdiagnose archives, generated deterministically; the "infected" one seeds a real Pegasus process-name indicator so the genuine match path is exercised end-to-end.
+Regenerate the tracked synthetic fixtures only when their source definition or
+indicator seed changes:
 
-Layout:
+```sh
+./fixtures/make_fixtures.sh
+```
 
-- `crates/trace-core/` - Rust core: streaming tar/gzip, STIX2 extraction, the four artifact parsers, report assembly, and the verdict (computed in Rust, in one place - the UI renders it and never re-derives safety semantics). `cargo test` covers all of it natively, including proptest property tests over the hostile-input surface (`tests/properties.rs`).
-- `web/report.schema.json` - the exported report contract (schema_version 3). The whole envelope is assembled in Rust; every producer (browser worker, inline, native CLI) emits the same shape, pinned by a golden field list (`crates/trace-core/tests/report_v3.rs`) that the browser E2E suite checks too.
-- `web/` - the static site (framework-free JS + CSS, service worker for offline, strict CSP). This directory is the entire deployable artifact.
-- `e2e/` - Playwright browser tests: demo scans, verdict rendering, report export, scan-limit handling, and offline operation.
-- `fixtures/make_fixtures.sh` - synthetic demo archive generator.
+After the build, `web/` contains the static application for local use. A release
+deployment also needs a unique service-worker cache identity: the official
+production workflow substitutes the commit SHA, while a manual deployment must
+change `CACHE` in `web/sw.js` deliberately. The build script runs Rust tests but
+is not the full release gate. The remaining local checks are:
 
-CI runs fmt, clippy, tests, `cargo audit`, and the browser E2E suite on every push and PR. A weekly workflow PRs upstream indicator changes into the bundled snapshots (requires the "Allow GitHub Actions to create and approve pull requests" repo setting).
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo audit
 
-Deployment notes: production is **Cloudflare Pages** (`tracescan.pages.dev`), deployed by [`.github/workflows/deploy-production.yml`](.github/workflows/deploy-production.yml) only after CI succeeds. The workflow checks out the exact validated commit, builds `web/` with that commit embedded in `tool.build_commit`, gives the service worker a per-commit cache name, uploads through pinned wrangler dependencies, and verifies the per-commit service-worker marker, required security headers, schema identifier/version contract, and demo-fixture availability on production.
+./fixtures/make_fixtures.sh
+git diff --exit-code -- web/fixtures
 
-Cloudflare's repository link is retained, but automatic production and preview branch builds must remain disabled in the Pages dashboard so the CI-gated workflow is the only production writer. The repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` supply the deploy credentials; `PRODUCTION_DEPLOY_REQUIRED=true` makes either secret disappearing a hard failure instead of a green skip. These dashboard and repository settings are external configuration and must be re-checked after account or project changes.
+cd e2e
+npm ci
+npx playwright install chromium firefox webkit
+npm test
+```
 
-The default-branch ruleset blocks deletion and non-fast-forward updates to `main` while still allowing ordinary fast-forward direct pushes. This protects release and report provenance without imposing a pull-request-only workflow.
+CI adds Playwright's `--with-deps` option on Linux and runs the WASM build in
+separate jobs with the checked-out commit injected into the report metadata.
 
-Cloudflare enforces `web/_headers` automatically, so the CSP, COOP, and nosniff headers are real there; the `<meta>` CSP in `index.html` remains as defense in depth for any host that cannot send headers. The old GitHub Pages URL now serves only a redirect plus a service-worker kill switch (`redirect/`, published by `.github/workflows/deploy.yml`); leave it in place indefinitely so returning visitors with the old origin cached get moved over.
+The native CLI harness uses the same engine as the browser:
 
-Deploy runs refuse any commit that is no longer the tip of `main` (checked at preflight and again just before upload), queue rather than replace each other (`queue: max` - the default single pending slot would let an older commit's late CI completion evict the newest commit's queued deploy), install wrangler from a committed lockfile before credentials enter the environment, and expose the Cloudflare secrets only to the two steps that need them.
+```sh
+cargo run --release --example scan -- \
+  <sysdiagnose.tar.gz> web/iocs/*.stix2
+```
 
-**Hosting privacy note:** Cloudflare injects `NEL`/`Report-To` headers on this origin (Network Error Logging, `success_fraction: 0`), which asks browsers to report *network delivery failures* for the site to Cloudflare's collector. This is edge-level telemetry about connectivity errors, not page content - scanned files and results never leave the tab either way - but it is disclosed here because "no requests beyond indicator downloads" deserves the footnote.
+Repository layout:
 
-## Scope (v1)
+- `crates/trace-core/` - streaming archive reader, artifact parsers, indicator
+  matching, findings, report assembly, and the single Rust-owned verdict.
+- `web/report.schema.json` - report schema version 3. Browser worker, inline,
+  and native producers emit the same envelope, enforced by Rust and browser
+  golden-contract tests.
+- `web/` - framework-free static site, worker, service worker, styles,
+  snapshots, schema, and generated WASM package after a build.
+- `e2e/` - Playwright coverage across Chromium, Firefox, and WebKit, including
+  demo scans, report export, and limits. Cached offline scanning runs on
+  Chromium and Firefox; Playwright WebKit cannot reliably emulate an offline
+  service-worker navigation and is explicitly skipped for that case.
+- `fixtures/make_fixtures.sh` - explicit deterministic synthetic-fixture
+  generator. The infected fixture exercises a real Pegasus process-name
+  indicator; CI verifies that regeneration is byte-for-byte reproducible.
 
-Deliberate non-goals: real-time monitoring, removal claims, Android, backup parsing. Unified-log analysis is catalog-level by design (process inventory, no message rendering): message-content indicators are domains and URLs, which belong to the backup-artifact scope. See [docs/design-unified-logs.md](docs/design-unified-logs.md) for that trade-off.
+## CI and deployment
 
-## Acknowledgements
+CI runs formatting, clippy, Rust tests, `cargo audit`, fixture-reproducibility
+verification, a WASM build, and the three-browser Playwright suite for every
+pull request and every push to `main`.
+The active production path is Cloudflare Pages at `tracescan.pages.dev`.
+`.github/workflows/deploy-production.yml` deploys only a successful CI commit
+that is still the tip of `main`, embeds that commit in `tool.build_commit`, and
+verifies the service-worker marker, security headers, the deployed schema
+byte-for-byte plus its identity/version, and demo fixture availability after
+upload.
 
-Built on public research and data from Amnesty International's Security Lab, the [Mobile Verification Toolkit](https://github.com/mvt-project/mvt) project, Kaspersky's iShutdown research, and Citizen Lab's publications. Trace is a front-end to the open threat-intel ecosystem, not a replacement for it.
+Production safety also depends on external settings that source code cannot
+enforce. Operators must keep Cloudflare automatic production and preview builds
+disabled, configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and keep
+the repository variable `PRODUCTION_DEPLOY_REQUIRED=true`. These invariants and
+the default-branch ruleset must be rechecked after account, repository, or Pages
+project changes.
+
+Cloudflare applies `web/_headers`; the meta CSP remains defense in depth for
+hosts that cannot send headers. The retired GitHub Pages origin serves only the
+redirect and service-worker kill switch in `redirect/`. As last verified on
+2026-07-14, Cloudflare also injected `NEL`/`Report-To` headers for network
+delivery failures. That edge telemetry does not contain scan contents, but it
+means the fact of a visit or delivery failure is not purely local and should be
+rechecked rather than treated as a permanent platform guarantee.
+
+## Scope
+
+Deliberate v1 non-goals are real-time monitoring, removal claims, Android,
+iPhone-backup parsing, filesystem inventory, and unified-log message
+reconstruction. See [docs/design-unified-logs.md](docs/design-unified-logs.md)
+for the catalog-level trade-off.
+
+## Acknowledgements and license
+
+Trace builds on public research and data from Amnesty International's Security
+Lab, the [Mobile Verification Toolkit](https://github.com/mvt-project/mvt),
+Kaspersky's iShutdown research, Mandiant's unified-log parser, Citizen Lab, and
+other indicator publishers. It is a triage interface to that ecosystem, not a
+replacement for it.
+
+Licensed under the [MIT License](LICENSE).

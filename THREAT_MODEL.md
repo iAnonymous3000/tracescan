@@ -4,12 +4,13 @@
 
 Trace is a static browser application with a Rust/WebAssembly core. A person
 supplies an iPhone sysdiagnose archive; the engine streams gzip/tar content,
-parses four diagnostic surfaces, applies reviewed public spyware indicators,
-and emits a schema-versioned JSON report. There is no application upload
-endpoint. The primary runtime surfaces are the browser application under
-`web/`, the scanner and parsers under `crates/trace-core/`, the service worker,
-the bundled indicator snapshots, and the CI/deployment path that produces the
-served application.
+parses four primary phone diagnostic surfaces plus explicitly labeled
+paired-device diagnostics, applies reviewed public spyware indicators, and
+emits a schema-versioned JSON report. There is no application upload endpoint.
+The primary runtime surfaces are the browser application under `web/`, the
+scanner and parsers under `crates/trace-core/`, the service worker, the bundled
+indicator snapshots, and the CI/deployment path that produces the served
+application.
 
 The security goal is not “prove the phone is clean.” It is to produce a
 truthfully scoped, locally computed result without exposing the person's
@@ -80,8 +81,8 @@ questions for an adopting organization.
    matching, report serialization, and eventually DOM rendering.
 5. **Threat intelligence to reviewed snapshot.** Public upstream STIX is
    untrusted input to the review/update process. At runtime, the reviewed
-   bundled snapshots affect matching; live upstream fetches affect only the
-   freshness notice.
+   bundled snapshots affect matching; live upstream fetches affect only an
+   advisory different-content notice that does not establish recency.
 6. **Engine report to browser and filesystem.** Rust owns the report envelope
    and verdict, but JavaScript displays and exports it. Once downloaded or
    shared, the unsigned JSON and derived readable HTML can be edited and can
@@ -108,28 +109,29 @@ questions for an adopting organization.
 - **Developer-controlled:** scanner code, parser dependencies, schemas, tests,
   resource limits, build tooling, and release tags.
 - **Upstream-controlled but verdict-isolated at runtime:** live public indicator
-  URLs. Their response can change the `upstream` freshness status, but not the
-  indicators used for matching. Reviewed snapshot content becomes
+  URLs. Their response can change the advisory `upstream` comparison status, but
+  not the indicators used for matching. Reviewed snapshot content becomes
   developer/operator-controlled when committed.
-- **Producer-supplied descriptive metadata:** source file name/size and browser
+- **Producer-supplied descriptive metadata:** source filename and browser
   producer mode. These values must not affect the verdict. The engine computes
-  the archive and indicator hashes.
+  the archive size and hash from every byte received, and hashes the exact
+  indicator text used.
 
 ### Security invariants
 
 - Intended Trace code sends neither archive bytes nor report contents to an
-  application endpoint. Loading and freshness-check requests must never include
-  scan data.
+  application endpoint. Loading and upstream-comparison requests must never
+  include scan data.
 - The Rust engine is the only verdict authority. Browser rendering must not
   re-derive or soften it.
 - A clear verdict requires recognizable evidence, loaded applicable
-  indicators, no suspicious or exact finding, no parser degradation, and no
-  resource or integrity limit. Missing surface types remain explicitly absent
-  rather than implicitly examined.
+  indicators, no indicator-match or suspicious finding, no parser degradation,
+  and no resource or integrity limit. Missing surface types remain explicitly
+  absent rather than implicitly examined.
 - Every archive byte received by the engine contributes to
-  `source_file.sha256`; every exact indicator text used contributes to its
-  `indicator_provenance[].sha256`.
-- An exact match or suspicious anomaly must remain visible even when another
+  `source_file.sha256`; the exact loaded text for each indicator set contributes
+  to its `indicator_provenance[].sha256`.
+- An indicator match or suspicious anomaly must remain visible even when another
   part of the scan is incomplete. Findings caps must retain higher-severity
   evidence and disclose the cap.
 - Corrupt, truncated, oversized, unsupported, or adversarial inputs must fail
@@ -168,8 +170,8 @@ An observer can learn that the person resolved or connected to the distinctive
 Trace hostname through DNS, TLS/SNI or destination-IP metadata, browser or
 gateway logs, and hosting-edge records. Cloudflare can add network-error
 reporting headers for delivery failures. The browser also attempts public
-upstream indicator requests for a freshness notice. None of this should carry
-the archive or report, but the fact of use may itself be sensitive.
+upstream indicator requests for an advisory difference check. None of this
+should carry the archive or report, but the fact of use may itself be sensitive.
 
 Loading the page before disconnecting and scanning offline reduces scan-time
 network exposure and demonstrates the lack of an upload dependency. It does not
@@ -220,13 +222,22 @@ budget, a 5,000-finding cap, checked/saturating arithmetic, tar checksum
 validation, and explicit incomplete-scan reporting. Higher-severity findings
 can evict lower-severity entries at the cap.
 
-These controls bound several repository-owned paths; they do not guarantee
-that the browser tab remains responsive for every hostile file. The upstream
-unified-log parser can size a transient allocation from archive metadata, so a
-crafted tracev3 file may abort or exhaust its own scan before repository-level
-limits provide a graceful result. The expected security consequence is
-availability loss and an error/incomplete scan, not a trustworthy negative
-result. Repeated failure is itself a reason to preserve the file and escalate.
+Before bytes reach the upstream unified-log parser, Trace now validates the
+tracev3 framing and bounds declared inner decompression to 64 MiB per
+compressed chunkset and 256 MiB in aggregate per tracev3 file. That closes the
+known path in which one attacker-controlled declaration could request roughly
+4.3 GiB from the parser. These inner limits sit inside the outer archive and
+retained-member limits above.
+
+The controls do not prove bounded aggregate CPU use or browser-tab
+responsiveness for every hostile archive. An attacker can still supply many
+individually valid files that consume repeated parser work within the outer
+budgets. Process-candidate retention is capped at 10,000 per `.ips` file, and a
+hit makes that artifact partial, but a large diagnostic JSON structure can
+still amplify temporary parser state before reduction. The expected security
+consequence is availability loss and an error or incomplete scan, never a
+trustworthy negative result. Repeated failure is itself a reason to preserve
+the file and escalate.
 
 ### Parser and verdict-integrity attacks
 
@@ -241,11 +252,16 @@ formats remain a continuing false-negative risk.
 
 ### Indicator substitution, staleness, and scope
 
-Runtime matching uses committed, reviewed STIX snapshots. The engine hashes the
-exact loaded text into `indicator_provenance`; live upstream content is parsed
-only to decide whether to show an update notice and never replaces the
-snapshot. Review-floor tests reduce the chance that an empty or dramatically
-regressed snapshot ships unnoticed.
+The official browser's runtime matching uses committed, reviewed STIX
+snapshots. The engine hashes the exact loaded text into
+`indicator_provenance`; live upstream content is parsed only to detect a
+different plausible file and never replaces the snapshot. A difference is not
+proof that the upstream file is newer or safer. The browser rejects a bundled
+set below its reviewed floor, and CI requires exact reviewed
+indicator/applicable counts plus one malware object, so count regression or
+inflation cannot ship without an explicit reviewed metadata change. The native
+harness can be supplied explicit STIX paths; its provenance binds the report to
+the exact supplied text rather than asserting that the files were reviewed.
 
 Repository or review compromise can still alter a snapshot, and correct
 snapshots can still be stale or incomplete. Most domain, URL, email, browsing,
@@ -286,8 +302,8 @@ treat the recorded revision as an untrusted claim, review and build it only in
 a disposable no-credentials environment, disconnect before introducing an
 archive copy, confirm the indicator hashes, scan the exact archive, and compare
 verdict, findings, limits, assurance, coverage, artifacts, and provenance.
-Time, duration, browser producer, filename, and upstream freshness can
-legitimately differ. This detects ordinary report modification but does not
+Time, duration, browser producer, filename, and the advisory upstream comparison
+can legitimately differ. This detects ordinary report modification but does not
 provide a formal chain of custody, signed origin, acquisition attestation, or
 deployed-binary reproducibility. The full responder procedure is in
 [`HELPLINE.md`](HELPLINE.md).
@@ -312,9 +328,12 @@ confidential channels.
   classes do not apply. Compromise of a person's Apple account or of maintainer
   GitHub/Cloudflare accounts remains in scope at the acquisition and deployment
   trust boundaries described above.
-- A report that public threat intelligence lags reality is not by itself a
-  repository vulnerability; hiding that lag or presenting absence as
-  cleanliness would be.
+- A report that public threat intelligence inherently lags reality is not by
+  itself a repository vulnerability. Runtime influence from unreviewed live
+  data, a reviewed snapshot falling below the enforced floor, incomplete
+  snapshot loading that can still produce `clear`, or incorrect upstream-
+  comparison and provenance reporting can violate verdict integrity and remain
+  in scope.
 - The phone deliberately lying in its own diagnostics is an explicit evidence
   acquisition limitation. Trace remains responsible for describing it and for
   not overstating a negative result.
@@ -333,8 +352,8 @@ may be at risk.
   contents, or equivalent sensitive evidence to an unauthorized party for
   ordinary users.
 - A reachable parser, verdict, or findings-retention flaw reliably converts an
-  archive containing a known exact match into `clear` without disclosing the
-  failure.
+  archive containing a known applicable indicator match into `clear` without
+  disclosing the failure.
 - A production/dependency/service-worker compromise persistently substitutes a
   scanner that exfiltrates files or fabricates reassuring results at scale.
 
@@ -375,14 +394,3 @@ higher case-specific response even if the software-class severity is medium.
   alter release artifacts.
 - Benign metadata differences prevent byte-for-byte report comparison while the
   documented security-relevant semantic fields remain identical.
-
-Public repository: https://github.com/iAnonymous3000/tracescan
-Snapshot basis: uncommitted working tree derived from
-`c685cf64cb002880dcc56a6a821720ef37258f02`; the digest below identifies the
-reviewed working-tree contents, not a published commit. The cache footer is
-excluded from its own snapshot digest.
-
-Security-scan cache identity:
-
-Repository: target_sha256_d5111bb920065ff2b862e2f273a4ec094922d800b21cc87bc83014fe5c6b540b
-Version: codex-security-snapshot/v1:sha256:f0247a70addd781c2dbde3d66d30dd3150af2892db36e168b061c90d419dbf9d

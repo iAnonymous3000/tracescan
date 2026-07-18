@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
+pub(crate) const MAX_CRASH_CANDIDATES: usize = 10_000;
+
 fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
@@ -43,7 +45,7 @@ fn parent_process(value: &str) -> Option<&str> {
 }
 
 fn valid_process_name(name: &str) -> bool {
-    !name.trim().is_empty() && !name.contains('/')
+    !name.is_empty() && name == name.trim() && !name.contains('/')
 }
 
 fn panic_pid_re() -> &'static Regex {
@@ -52,7 +54,8 @@ fn panic_pid_re() -> &'static Regex {
 }
 
 fn valid_absolute_process_path(path: &str) -> bool {
-    path.starts_with('/')
+    path == path.trim()
+        && path.starts_with('/')
         && path[1..]
             .chars()
             .any(|character| !character.is_whitespace())
@@ -84,14 +87,20 @@ fn filename_process(fname: &str) -> Option<&str> {
 fn add_candidate(
     candidates: &mut BTreeSet<String>,
     candidate_sources: &mut BTreeMap<String, BTreeSet<&'static str>>,
+    candidate_cap_hit: &mut bool,
     value: &str,
     field: &'static str,
-) {
+) -> bool {
+    if !candidates.contains(value) && candidates.len() >= MAX_CRASH_CANDIDATES {
+        *candidate_cap_hit = true;
+        return false;
+    }
     candidates.insert(value.to_string());
     candidate_sources
         .entry(value.to_string())
         .or_default()
         .insert(field);
+    true
 }
 
 fn remove_header_candidates(
@@ -130,6 +139,7 @@ pub fn analyze(
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     let mut candidate_sources: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
     let mut candidate_pids: BTreeMap<String, u64> = BTreeMap::new();
+    let mut candidate_cap_hit = false;
     let mut proc_path: Option<String> = None;
     let mut proc_name: Option<String> = None;
     let mut bug_type: Option<String> = None;
@@ -149,7 +159,13 @@ pub fn analyze(
         for key in ["name", "app_name"] {
             match h.get(key) {
                 Some(Value::String(n)) if valid_process_name(n) => {
-                    add_candidate(&mut candidates, &mut candidate_sources, n, key);
+                    add_candidate(
+                        &mut candidates,
+                        &mut candidate_sources,
+                        &mut candidate_cap_hit,
+                        n,
+                        key,
+                    );
                     header_process_names.insert(n.to_string());
                     proc_name.get_or_insert_with(|| n.to_string());
                 }
@@ -169,7 +185,13 @@ pub fn analyze(
     if let Some(b) = &body {
         match b.get("procName") {
             Some(Value::String(n)) if valid_process_name(n) => {
-                add_candidate(&mut candidates, &mut candidate_sources, n, "procName");
+                add_candidate(
+                    &mut candidates,
+                    &mut candidate_sources,
+                    &mut candidate_cap_hit,
+                    n,
+                    "procName",
+                );
                 header_body_identity_mismatch = header_process_names
                     .iter()
                     .any(|header_name| header_name != n);
@@ -201,10 +223,17 @@ pub fn analyze(
                 }
                 // The full path must be a candidate too: file:path indicators
                 // (e.g. '/private/var/tmp/UserEventAgent') only match on it.
-                add_candidate(&mut candidates, &mut candidate_sources, p, "procPath");
                 add_candidate(
                     &mut candidates,
                     &mut candidate_sources,
+                    &mut candidate_cap_hit,
+                    p,
+                    "procPath",
+                );
+                add_candidate(
+                    &mut candidates,
+                    &mut candidate_sources,
+                    &mut candidate_cap_hit,
                     path_name,
                     "procPath",
                 );
@@ -218,6 +247,7 @@ pub fn analyze(
                 add_candidate(
                     &mut candidates,
                     &mut candidate_sources,
+                    &mut candidate_cap_hit,
                     parent,
                     "parentProc",
                 );
@@ -303,14 +333,19 @@ pub fn analyze(
                         continue;
                     }
                     let name = name.to_string();
-                    add_candidate(
+                    let retained = add_candidate(
                         &mut candidates,
                         &mut candidate_sources,
+                        &mut candidate_cap_hit,
                         &name,
                         "processByPid.procname",
                     );
-                    candidate_pids.entry(name).or_insert(pid);
-                    processes_seen += 1;
+                    if retained {
+                        candidate_pids.entry(name).or_insert(pid);
+                        processes_seen += 1;
+                    } else {
+                        skipped_processes += 1;
+                    }
                 }
                 special_complete = !inventory.is_empty() && skipped_processes == 0;
             }
@@ -345,14 +380,19 @@ pub fn analyze(
                         continue;
                     };
                     let name = name.to_string();
-                    add_candidate(
+                    let retained = add_candidate(
                         &mut candidates,
                         &mut candidate_sources,
+                        &mut candidate_cap_hit,
                         &name,
                         "processes.name",
                     );
-                    candidate_pids.entry(name).or_insert(pid);
-                    processes_seen += 1;
+                    if retained {
+                        candidate_pids.entry(name).or_insert(pid);
+                        processes_seen += 1;
+                    } else {
+                        skipped_processes += 1;
+                    }
                 }
                 special_complete = !inventory.is_empty() && skipped_processes == 0;
             }
@@ -499,16 +539,24 @@ pub fn analyze(
                 None
             };
             if let Some((command, process_path)) = identity {
-                add_candidate(&mut candidates, &mut candidate_sources, command, "Command");
                 add_candidate(
                     &mut candidates,
                     &mut candidate_sources,
+                    &mut candidate_cap_hit,
+                    command,
+                    "Command",
+                );
+                add_candidate(
+                    &mut candidates,
+                    &mut candidate_sources,
+                    &mut candidate_cap_hit,
                     process_path,
                     "Path",
                 );
                 add_candidate(
                     &mut candidates,
                     &mut candidate_sources,
+                    &mut candidate_cap_hit,
                     basename(process_path),
                     "Path",
                 );
@@ -517,7 +565,13 @@ pub fn analyze(
                 processes_seen = 1;
             }
             if let Some(Some(parent)) = parent {
-                add_candidate(&mut candidates, &mut candidate_sources, parent, "Parent");
+                add_candidate(
+                    &mut candidates,
+                    &mut candidate_sources,
+                    &mut candidate_cap_hit,
+                    parent,
+                    "Parent",
+                );
             }
 
             let valid = identity.is_some()
@@ -658,6 +712,7 @@ pub fn analyze(
                 add_candidate(
                     &mut candidates,
                     &mut candidate_sources,
+                    &mut candidate_cap_hit,
                     &cap[2],
                     "panicString",
                 );
@@ -682,7 +737,13 @@ pub fn analyze(
     let fname = basename(path);
     if !special_format && bug_type.as_deref() != Some("210") && !body_identified && !panic_signal {
         if let Some(name) = filename_process(fname) {
-            add_candidate(&mut candidates, &mut candidate_sources, name, "filename");
+            add_candidate(
+                &mut candidates,
+                &mut candidate_sources,
+                &mut candidate_cap_hit,
+                name,
+                "filename",
+            );
         }
     }
 
@@ -704,7 +765,7 @@ pub fn analyze(
             format = "kernel_panic";
         }
     }
-    let status = if if special_format {
+    let structurally_complete = if special_format {
         special_complete
     } else {
         header.as_ref().is_some_and(Value::is_object)
@@ -714,7 +775,8 @@ pub fn analyze(
             && !body_identity_malformed
             && !body_identity_mismatch
             && !header_body_identity_mismatch
-    } {
+    };
+    let status = if structurally_complete && !candidate_cap_hit {
         "parsed"
     } else {
         "parsed_partial"
@@ -830,6 +892,8 @@ pub fn analyze(
                 "format": format,
                 "processes": processes_seen,
                 "skipped_processes": skipped_processes,
+                "candidate_cap": MAX_CRASH_CANDIDATES,
+                "candidate_cap_hit": candidate_cap_hit,
                 "detection_relevant": detection_relevant,
                 "paired_device": paired_device,
             }),
@@ -1364,6 +1428,33 @@ not json"#;
     }
 
     #[test]
+    fn outer_whitespace_process_identities_are_partial_and_not_matched() {
+        for body in [
+            r#"{"procName":" bh"}"#,
+            r#"{"procName":"bh "}"#,
+            r#"{"procPath":" /usr/libexec/bh"}"#,
+            r#"{"procPath":"/usr/libexec/bh "}"#,
+        ] {
+            let sample = format!("{{\"bug_type\":\"309\"}}\n{body}");
+            let mut findings = Findings::new();
+            let (summary, _) = analyze(
+                "root/crashes_and_spins/safe-2026.ips",
+                &sample,
+                &db_with_bh(),
+                &mut findings,
+            );
+            assert_eq!(summary.status, "parsed_partial", "body: {body}");
+            assert_eq!(summary.details["processes"], 0, "body: {body}");
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.severity == Severity::Match),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn jetsam_inventory_checks_every_process() {
         let sample = r#"{"bug_type":"298","timestamp":"2026-07-08 13:32:34.00 -0700","os_version":"iPhone OS 26.5.2 (23F84)"}
 {"bug_type":"298","processes":[{"name":"launchd","pid":1},{"name":"bh","pid":2143}]}"#;
@@ -1401,6 +1492,41 @@ not json"#;
         assert_eq!(summary.details["processes"], 1);
         assert_eq!(summary.details["skipped_processes"], 1);
         assert!(findings.iter().any(|f| f.severity == Severity::Match));
+    }
+
+    #[test]
+    fn crash_candidate_inventory_is_bounded_and_fail_closed() {
+        let processes: Vec<Value> = (0..=MAX_CRASH_CANDIDATES)
+            .map(|index| json!({"name": format!("process-{index}"), "pid": index}))
+            .collect();
+        let sample = format!(
+            "{{\"bug_type\":\"298\"}}\n{}",
+            json!({"bug_type": "298", "processes": processes})
+        );
+        let mut db = IocDb::new();
+        db.load_stix(
+            "cap-test",
+            &format!(
+                r#"{{"objects":[{{"type":"indicator","pattern":"[process:name='process-{MAX_CRASH_CANDIDATES}']"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/JetsamEvent-2026.ips",
+            &sample,
+            &db,
+            &mut findings,
+        );
+
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["candidate_cap_hit"], true);
+        assert_eq!(summary.details["candidate_cap"], MAX_CRASH_CANDIDATES);
+        assert_eq!(summary.details["processes"], MAX_CRASH_CANDIDATES);
+        assert_eq!(summary.details["skipped_processes"], 1);
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Match));
     }
 
     #[test]

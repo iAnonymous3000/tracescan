@@ -1,17 +1,29 @@
 import init, { Scanner } from './pkg/trace_core.js';
 import { readableReportDocument, readableReportFragment, esc } from './readable-report.js';
 import { meetsReviewedFloor } from './indicator-floor.js';
+import {
+  isCompleteReportEnvelope,
+  isNonnegativeInteger,
+  isPairedDeviceArtifactPath,
+} from './report-validator.js';
 
 const $ = (sel) => document.querySelector(sel);
 
 const state = {
   stix: [],          // { name, source, url, text, loaded_from, date, stats }
-  scanner: null,     // pre-warmed Scanner with indicators loaded
-  ready: null,       // resolves once WASM + indicators are loaded
+  ready: null,       // resolves once WASM + bundled indicators are validated
+  freshnessReady: Promise.resolve(), // optional upstream check; never gates scanning
+  indicatorsReady: false,
+  cacheReady: false,
   lastReport: null,
+  lastReportContext: null, // UI-only context; never added to the report contract
   readableReport: null, // report snapshot currently owned by the readable-export dialog
+  readableContext: null,
   lastScanVia: null, // 'worker' | 'inline'
   scanning: false,   // a scan is in flight; new files are ignored until done
+  demoLoading: false,
+  activeScan: null,
+  scanIntent: 0,
 };
 
 /* ---------- utilities ---------- */
@@ -27,15 +39,41 @@ function fmtBytes(n) {
   return n + ' B';
 }
 
-// The timeout covers the body read too: a server that sends headers and
-// then stalls the body must not hang startup indefinitely.
-async function fetchTextWithTimeout(url, ms) {
+const UPSTREAM_BODY_LIMIT = Number.isSafeInteger(globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES)
+  && globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES > 0
+  ? globalThis.__TRACE_TEST_UPSTREAM_MAX_BYTES
+  : 8 * 1024 * 1024;
+const UPSTREAM_CONCURRENCY = 2;
+
+// The timeout covers the body read too, and the byte ceiling prevents an
+// optional freshness check from retaining an unbounded upstream response.
+async function fetchTextWithTimeout(url, ms, maxBytes = UPSTREAM_BODY_LIMIT) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
     const r = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
     if (!r.ok) return null;
-    return await r.text();
+    const declared = Number(r.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) return null;
+    if (!r.body) {
+      const text = await r.text();
+      return new TextEncoder().encode(text).byteLength <= maxBytes ? text : null;
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
   } catch {
     return null; // offline, blocked, or timed out
   } finally {
@@ -46,9 +84,26 @@ async function fetchTextWithTimeout(url, ms) {
 // Identifies the exact indicator revision a scan used; "live" plus a date is
 // not provenance. Null only in non-secure contexts, where subtle is absent.
 async function sha256hex(text) {
-  if (!crypto?.subtle) return null;
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  if (!globalThis.crypto?.subtle) return null;
+  const digest = await globalThis.crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(text)
+  );
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
 }
 
 function showSection(name) {
@@ -58,26 +113,68 @@ function showSection(name) {
   $('#about').hidden = name === 'scanning';
 }
 
+function updateLandingControls() {
+  const enabled = state.indicatorsReady && !state.scanning && !state.demoLoading;
+  $('#file-input').disabled = !enabled;
+  $('#demo-clean').disabled = !enabled;
+  $('#demo-infected').disabled = !enabled;
+  $('#dropzone').setAttribute('aria-disabled', String(!enabled));
+}
+
+function setScannerStatus(kind, message) {
+  const status = $('#scanner-status');
+  status.classList.remove('preparing', 'ready', 'error');
+  status.classList.add(kind);
+  status.textContent = message;
+  status.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  updateLandingControls();
+  setOnlineState();
+}
+
+function setOnlineState() {
+  const text = $('#privacy-text');
+  if (!text) return;
+  const offline = !navigator.onLine;
+  $('#offline-dot').classList.toggle('offline', offline);
+  if (offline && state.indicatorsReady) {
+    text.textContent = state.cacheReady
+      ? 'You are offline. The scanner and reviewed indicators are loaded in this tab, and the app shell is ready for an offline reload. This does not authenticate code already loaded.'
+      : 'You are offline. The scanner and reviewed indicators are loaded in this tab, so this open page can scan locally. Offline reload readiness has not been confirmed, and offline status does not authenticate loaded code.';
+  } else if (offline) {
+    text.textContent = 'You are offline before the scanner and reviewed indicators finished loading. Scanning is unavailable until those bundled assets load.';
+  } else {
+    const readiness = state.indicatorsReady
+      ? 'The scanner and reviewed indicators are ready.'
+      : 'The scanner is still preparing.';
+    const cache = state.cacheReady
+      ? ' The app shell is ready for an offline reload.'
+      : ' Offline reload readiness has not yet been confirmed.';
+    text.textContent = `Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes. ${readiness}${cache}`;
+  }
+}
+
 // Returning from results, keyboard focus lands on the next action instead
 // of being lost on the removed button.
 function backToLanding() {
   // Results can contain sensitive case metadata. Once the person leaves the
   // result view, do not retain an exportable report behind the landing page.
   state.lastReport = null;
+  state.lastReportContext = null;
   $('#results').replaceChildren();
   showSection('landing');
+  if (state.indicatorsReady) {
+    setScannerStatus('ready', 'Scanner ready. Bundled, reviewed indicators passed their integrity floors.');
+  }
   $('#dropzone').focus();
 }
 
 /* ---------- indicator loading ---------- */
 
 // Scans use only the bundled, reviewed indicator snapshots. Live upstream
-// data never reaches a verdict: a count-based check cannot tell a
-// legitimate update from a feed that swapped reviewed indicators for
-// unreviewed ones, so the upstream fetch is used solely to announce that
-// an update has been published (it ships here through the weekly reviewed
-// snapshot process). A live file only counts as a real update when it is
-// a plausible bundle that still meets the set's reviewed floor.
+// data never reaches a verdict: a count-based check cannot tell a legitimate
+// change from a rollback or lateral rewrite. The upstream fetch therefore
+// reports only whether plausible content differs from the reviewed snapshot;
+// it never claims that the different content is chronologically newer.
 function isPlausibleUpdate(set, text) {
   try {
     if (!Array.isArray(JSON.parse(text).objects)) return false;
@@ -93,40 +190,60 @@ function isPlausibleUpdate(set, text) {
   }
 }
 
-async function loadIndicators() {
+async function loadBundledIndicators() {
   // 'no-cache' forces revalidation: dev servers without Cache-Control
   // otherwise leave heuristically cached stale copies in play. In
   // production the service worker answers these before HTTP caching
   // matters, so this only costs a conditional request on first load.
   const manifest = await (await fetch('./iocs/manifest.json', { cache: 'no-cache' })).json();
-  // Upstream checks run in parallel: on a network that silently drops the
-  // requests, sequential 6-second timeouts would stall the panel.
   state.stix = await Promise.all(manifest.sets.map(async (set) => {
     const text = await (await fetch(set.file, { cache: 'no-cache' })).text();
     const sha256 = await sha256hex(text);
-    // 'current' | 'update-available' | 'unknown' (offline or unreachable)
-    let upstream = 'unknown';
-    const live = await fetchTextWithTimeout(set.url, 6000);
-    if (live !== null) {
-      const liveSha = await sha256hex(live);
-      upstream = liveSha !== sha256 && isPlausibleUpdate(set, live)
-        ? 'update-available'
-        : 'current';
-    }
     // Catalog metadata recorded as provenance in the report envelope; the
     // engine hashes the set text itself, so nothing here is trusted.
     const meta = {
       date: manifest.bundled_date, url: set.url, source: set.source,
-      loaded_from: 'bundled', upstream,
+      loaded_from: 'bundled', upstream: 'unknown',
     };
-    return { ...set, text, loaded_from: 'bundled', date: manifest.bundled_date, sha256, upstream, meta };
+    return {
+      ...set,
+      text,
+      loaded_from: 'bundled',
+      date: manifest.bundled_date,
+      sha256,
+      upstream: 'unknown',
+      meta,
+    };
   }));
 }
 
-function newScanner() {
+// Freshness is advisory and must never delay or weaken a scan. Responses are
+// fetched with bounded concurrency and a byte ceiling, then statuses are
+// committed together so a scan snapshots one coherent provenance state.
+async function refreshIndicatorFreshness() {
+  const statuses = await mapWithConcurrency(
+    state.stix,
+    UPSTREAM_CONCURRENCY,
+    async (set) => {
+      const live = await fetchTextWithTimeout(set.url, 6000);
+      if (live === null || set.sha256 === null) return 'unknown';
+      const liveSha = await sha256hex(live);
+      if (liveSha === null) return 'unknown';
+      if (liveSha === set.sha256) return 'current';
+      return isPlausibleUpdate(set, live) ? 'update-available' : 'unknown';
+    }
+  );
+  for (let i = 0; i < state.stix.length; i++) {
+    state.stix[i].upstream = statuses[i];
+    state.stix[i].meta = { ...state.stix[i].meta, upstream: statuses[i] };
+  }
+  renderIocPanel();
+}
+
+function newScanner(sets = state.stix) {
   const s = new Scanner();
   try {
-    for (const set of state.stix) {
+    for (const set of sets) {
       const stats = JSON.parse(
         s.load_stix_with_meta(set.name, set.text, JSON.stringify(set.meta))
       );
@@ -151,23 +268,35 @@ function newScanner() {
 }
 
 function renderIocPanel() {
-  const rows = state.stix.map((s) => `
+  const rows = state.stix.map((s) => {
+    const freshnessClass = s.upstream === 'current'
+      ? 'freshness-current'
+      : s.upstream === 'update-available' ? 'freshness-update' : 'freshness-unknown';
+    const freshnessLabel = s.upstream === 'current'
+      ? 'upstream matched'
+      : s.upstream === 'update-available' ? 'upstream content differs' : 'freshness unchecked';
+    return `
     <div class="ioc-row">
       <span><span class="campaign">${esc(s.stats.campaign)}</span>
-        <span class="badge bundled">reviewed snapshot · ${esc(s.date)}</span></span>
+        <span class="badge bundled">reviewed snapshot · ${esc(s.date)}</span>
+        <span class="badge ${freshnessClass}">${freshnessLabel}</span></span>
       <span class="meta">${s.stats.extracted} indicators, ${s.stats.applicable} checkable here · ${esc(s.source)}${s.sha256 ? ` · <code title="SHA-256 of the indicator file used: ${esc(s.sha256)}">sha256:${esc(s.sha256.slice(0, 12))}…</code>` : ''}</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   $('#ioc-list').innerHTML = rows;
   const total = state.stix.reduce((a, s) => a + s.stats.extracted, 0);
   const applicable = state.stix.reduce((a, s) => a + s.stats.applicable, 0);
-  const updates = state.stix.filter((s) => s.upstream === 'update-available').length;
-  const updateNote = updates
-    ? ` Upstream has published newer data for ${updates} indicator set${updates > 1 ? 's' : ''}; scans use the reviewed snapshots, and updates ship here after review (typically within a week).`
-    : '';
+  const differences = state.stix.filter((s) => s.upstream === 'update-available').length;
+  const unknown = state.stix.filter((s) => s.upstream === 'unknown').length;
+  const freshnessNote = differences
+    ? ` Different plausible upstream content was detected for ${differences} indicator set${differences > 1 ? 's' : ''}. This does not prove that the upstream content is newer; it may be a rollback or rewrite and requires review. Scans continue to use the dated, reviewed snapshots.`
+    : unknown
+      ? ` Upstream freshness is currently unknown for ${unknown} indicator set${unknown > 1 ? 's' : ''}; scans still use the dated, reviewed snapshots shown above.`
+      : ' The published upstream files matched all reviewed snapshots at this check.';
   $('#ioc-note').textContent =
-    `${applicable} of ${total} loaded indicators are process and file names or paths that can be checked against the process activity in sysdiagnose artifacts (file indicators match only when a process ran from that file - there is no filesystem listing to check). ` +
+    `${applicable} of ${total} loaded indicators are process names, file names, or paths that can be checked against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths (and canonical descendants when an indicator is a directory ending in /). Trace does not inspect a filesystem listing. ` +
     `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.` +
-    updateNote;
+    freshnessNote;
   $('#ioc-panel').hidden = false;
 }
 
@@ -190,343 +319,6 @@ const WORKER_SCAN_INACTIVITY_TIMEOUT_MS = Number.isSafeInteger(
 const WORKER_SCAN_FINALIZE_TIMEOUT_MS = 120_000;
 const WORKER_SCAN_FAILURE =
   'The background scanner stopped while reading this file. Trace did not retry it on the main page because doing so could freeze or crash the tab. Keep the original file, reload this page, and contact a digital security helpline if the problem repeats.';
-
-function isRecord(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isNonnegativeInteger(value) {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-
-function hasExactKeys(value, required, optional = []) {
-  if (!isRecord(value)) return false;
-  const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key))
-    && Object.keys(value).every((key) => allowed.has(key));
-}
-
-function isNullableString(value) {
-  return value === null || typeof value === 'string';
-}
-
-function sameIntegerMap(actual, expected) {
-  if (!isRecord(actual) || !isRecord(expected)) return false;
-  const actualKeys = Object.keys(actual);
-  const expectedKeys = Object.keys(expected);
-  return actualKeys.length === expectedKeys.length
-    && actualKeys.every((key) => (
-      Object.hasOwn(expected, key)
-      && isNonnegativeInteger(actual[key])
-      && actual[key] === expected[key]
-    ));
-}
-
-function isPairedDeviceArtifactPath(path) {
-  if (typeof path !== 'string') return false;
-  const normalized = path.startsWith('./') ? path.slice(2) : path;
-  if (!normalized || normalized.startsWith('/')) return false;
-  const components = normalized.split('/');
-  if (components.some((component) => (
-    !component || component === '.' || component === '..'
-  ))) return false;
-  return components.some((component, index) => {
-    if (index === 0 || components[index - 1] !== 'logs') return false;
-    return component === 'ProxiedDevice'
-      || (component.startsWith('ProxiedDevice-')
-        && component.length > 'ProxiedDevice-'.length);
-  });
-}
-
-// A worker success message crosses a separate JS/WASM execution boundary.
-// Validate the report envelope and its loaded-set provenance before allowing
-// any verdict (especially `clear`) onto the page. This checks transport and
-// producer integrity; verdict semantics remain owned by Rust.
-function isCompleteReportEnvelope(report, file, expectedVia) {
-  const topLevelKeys = [
-    'schema_version', 'tool', 'verdict', 'generated_at', 'duration_ms',
-    'scanned_via', 'source_file', 'indicator_sets', 'indicator_provenance',
-    'artifacts', 'missing_artifacts', 'findings', 'stats', 'scan_limits',
-    'assurance', 'coverage',
-  ];
-  if (!hasExactKeys(report, topLevelKeys, ['device'])
-      || report.schema_version !== 3
-      || !hasExactKeys(report.tool, ['name', 'version', 'build_commit'])
-      || report.tool.name !== 'Trace'
-      || typeof report.tool.version !== 'string'
-      || !(report.tool.build_commit === null
-        || (typeof report.tool.build_commit === 'string'
-          && /^[0-9a-f]{40}$/.test(report.tool.build_commit)))
-      || typeof report.verdict !== 'string'
-      || !isNullableString(report.generated_at)
-      || !(report.duration_ms === null || isNonnegativeInteger(report.duration_ms))
-      || report.scanned_via !== expectedVia
-      || !hasExactKeys(report.source_file, ['name', 'size', 'sha256'])
-      || report.source_file.name !== file.name
-      || report.source_file.size !== file.size
-      || typeof report.source_file.sha256 !== 'string'
-      || !/^[0-9a-f]{64}$/.test(report.source_file.sha256)
-      || !Array.isArray(report.indicator_sets)
-      || !Array.isArray(report.indicator_provenance)
-      || !Array.isArray(report.artifacts)
-      || !Array.isArray(report.missing_artifacts)
-      || !Array.isArray(report.findings)
-      || !Array.isArray(report.scan_limits)
-      || !hasExactKeys(report.stats, [
-        'bytes_read', 'archive_entries', 'artifacts_found',
-        'total_indicators', 'applicable_indicators',
-      ])
-      || !hasExactKeys(report.assurance, [
-        'complete', 'surfaces', 'surfaces_examined', 'surfaces_total',
-      ])
-      || !hasExactKeys(report.coverage, ['examined', 'not_examined', 'note'])
-      || !Array.isArray(report.assurance.surfaces)
-      || !Array.isArray(report.coverage.examined)
-      || !Array.isArray(report.coverage.not_examined)
-      || !report.coverage.examined.every((item) => typeof item === 'string')
-      || !report.coverage.not_examined.every((item) => typeof item === 'string')
-      || typeof report.coverage.note !== 'string'
-      || (Object.hasOwn(report, 'device')
-        && (!hasExactKeys(report.device, ['os_version', 'source'], ['timestamp'])
-          || typeof report.device.os_version !== 'string'
-          || typeof report.device.source !== 'string'
-          || (Object.hasOwn(report.device, 'timestamp')
-            && typeof report.device.timestamp !== 'string')))) {
-    return false;
-  }
-  if (!report.scan_limits.every((limit) => typeof limit === 'string')) return false;
-
-  const expectedStats = new Map(state.stix.map((set) => [set.name, set.stats]));
-  const expectedTotal = state.stix.reduce((total, set) => total + set.stats.extracted, 0);
-  const expectedApplicable = state.stix.reduce(
-    (total, set) => total + set.stats.applicable,
-    0
-  );
-  if (report.indicator_sets.length !== expectedStats.size
-      || report.stats.total_indicators !== expectedTotal
-      || report.stats.applicable_indicators !== expectedApplicable
-      || report.stats.bytes_read !== file.size
-      || !isNonnegativeInteger(report.stats.archive_entries)
-      || !isNonnegativeInteger(report.stats.artifacts_found)) {
-    return false;
-  }
-  const reportedSetNames = new Set();
-  for (const set of report.indicator_sets) {
-    const expected = isRecord(set) ? expectedStats.get(set.name) : null;
-    if (!hasExactKeys(set, [
-      'name', 'campaign', 'stix_indicators', 'extracted', 'by_kind', 'applicable',
-    ])
-        || !expected
-        || reportedSetNames.has(set.name)
-        || set.campaign !== expected.campaign
-        || set.stix_indicators !== expected.stix_indicators
-        || set.extracted !== expected.extracted
-        || set.applicable !== expected.applicable
-        || !sameIntegerMap(set.by_kind, expected.by_kind)) {
-      return false;
-    }
-    reportedSetNames.add(set.name);
-  }
-
-  if (report.indicator_provenance.length !== state.stix.length) return false;
-  const provenanceNames = new Set();
-  for (const provenance of report.indicator_provenance) {
-    const bundled = isRecord(provenance)
-      ? state.stix.find((set) => set.name === provenance.name)
-      : null;
-    if (!hasExactKeys(provenance, [
-      'name', 'campaign', 'sha256', 'loaded_from', 'date', 'url', 'source', 'upstream',
-    ])
-        || !bundled
-        || provenanceNames.has(provenance.name)
-        || provenance.loaded_from !== 'bundled'
-        || !isNullableString(provenance.date)
-        || !isNullableString(provenance.url)
-        || !isNullableString(provenance.source)
-        || !['current', 'update-available', 'unknown', null].includes(provenance.upstream)
-        || typeof provenance.sha256 !== 'string'
-        || !/^[0-9a-f]{64}$/.test(provenance.sha256)
-        || (bundled.sha256 !== null && provenance.sha256 !== bundled.sha256)
-        || provenance.campaign !== bundled.stats.campaign
-        || provenance.date !== bundled.meta.date
-        || provenance.url !== bundled.meta.url
-        || provenance.source !== bundled.meta.source
-        || provenance.upstream !== bundled.meta.upstream) {
-      return false;
-    }
-    provenanceNames.add(provenance.name);
-  }
-
-  const primaryArtifactKinds = new Set();
-  for (const artifact of report.artifacts) {
-    if (!hasExactKeys(artifact, ['path', 'kind', 'status', 'details'])
-        || typeof artifact.path !== 'string'
-        || artifact.path.length === 0
-        || !['shutdown_log', 'crash_log', 'ps_listing', 'unified_log'].includes(artifact.kind)
-        || !['parsed', 'parsed_partial', 'unparsed', 'truncated'].includes(artifact.status)
-        || !isRecord(artifact.details)) {
-      return false;
-    }
-    const paired = artifact.kind === 'crash_log'
-      && isPairedDeviceArtifactPath(artifact.path);
-    if (artifact.kind === 'crash_log'
-        && (typeof artifact.details.paired_device !== 'boolean'
-          || artifact.details.paired_device !== paired)) {
-      return false;
-    }
-    if (!paired) primaryArtifactKinds.add(artifact.kind);
-  }
-  const retainedArtifactCount = report.artifacts.filter(
-    (artifact) => artifact.kind !== 'unified_log'
-  ).length;
-  if (report.stats.artifacts_found !== retainedArtifactCount) return false;
-  const artifactPaths = new Set(report.artifacts.map((artifact) => artifact.path));
-
-  const phoneMetadataArtifacts = report.artifacts.filter((artifact) => (
-    artifact.kind === 'crash_log'
-    && artifact.details.paired_device === false
-    && typeof artifact.details.os_version === 'string'
-  ));
-  if (Object.hasOwn(report, 'device')) {
-    const source = phoneMetadataArtifacts.find(
-      (artifact) => artifact.path === report.device.source
-    );
-    const timestampMatches = source && (Object.hasOwn(report.device, 'timestamp')
-      ? source.details.timestamp === report.device.timestamp
-      : source.details.timestamp === null);
-    if (!source
-        || source.details.os_version !== report.device.os_version
-        || !timestampMatches) {
-      return false;
-    }
-  } else if (phoneMetadataArtifacts.length > 0) {
-    return false;
-  }
-
-  for (const finding of report.findings) {
-    const hasIndicator = isRecord(finding) && Object.hasOwn(finding, 'indicator');
-    if (!hasExactKeys(
-      finding,
-      ['severity', 'kind', 'artifact', 'summary', 'evidence'],
-      ['indicator']
-    )
-        || !['note', 'suspicious', 'match'].includes(finding.severity)
-        || typeof finding.kind !== 'string'
-        || typeof finding.artifact !== 'string'
-        || !artifactPaths.has(finding.artifact)
-        || typeof finding.summary !== 'string'
-        || hasIndicator !== (finding.severity === 'match')
-        || finding.kind !== (hasIndicator ? 'ioc_match' : 'heuristic')
-        || (hasIndicator
-          && (!hasExactKeys(finding.indicator, ['value', 'kind', 'set', 'campaign'])
-            || !Object.values(finding.indicator).every(
-              (value) => typeof value === 'string'
-            )
-            || finding.indicator.value.length === 0
-            || !['process_name', 'file_name', 'file_path'].includes(
-              finding.indicator.kind
-            )
-            || !expectedStats.has(finding.indicator.set)
-            || finding.indicator.campaign
-              !== expectedStats.get(finding.indicator.set)?.campaign))) {
-      return false;
-    }
-  }
-
-  const surfaceKinds = new Set();
-  for (const surface of report.assurance.surfaces) {
-    if (!hasExactKeys(surface, ['kind', 'state'])
-        || !['shutdown_log', 'crash_log', 'ps_listing', 'unified_log'].includes(surface.kind)
-        || !['complete', 'partial', 'absent'].includes(surface.state)
-        || surfaceKinds.has(surface.kind)) {
-      return false;
-    }
-    surfaceKinds.add(surface.kind);
-  }
-  if (report.assurance.surfaces_total !== 4
-      || surfaceKinds.size !== 4
-      || !isNonnegativeInteger(report.assurance.surfaces_examined)
-      || report.assurance.surfaces_examined > 4
-      || typeof report.assurance.complete !== 'boolean') {
-    return false;
-  }
-
-  const absentSurfaceKinds = new Set(
-    report.assurance.surfaces
-      .filter((surface) => surface.state === 'absent')
-      .map((surface) => surface.kind)
-  );
-  if ([...primaryArtifactKinds].some((kind) => absentSurfaceKinds.has(kind))) {
-    return false;
-  }
-  const surfaceStates = new Map(
-    report.assurance.surfaces.map((surface) => [surface.kind, surface.state])
-  );
-  const completeSurfaceKinds = new Set(
-    report.assurance.surfaces
-      .filter((surface) => surface.state === 'complete')
-      .map((surface) => surface.kind)
-  );
-  if ([...completeSurfaceKinds].some((kind) => !primaryArtifactKinds.has(kind))
-      || report.assurance.surfaces_examined < completeSurfaceKinds.size
-      || report.assurance.surfaces_examined > 4 - absentSurfaceKinds.size) {
-    return false;
-  }
-  if (report.artifacts.some((artifact) => {
-    const paired = artifact.kind === 'crash_log'
-      && artifact.details.paired_device === true;
-    return !paired
-      && artifact.status !== 'parsed'
-      && surfaceStates.get(artifact.kind) === 'complete';
-  })) {
-    return false;
-  }
-  const missingKinds = new Set();
-  for (const missing of report.missing_artifacts) {
-    if (!hasExactKeys(missing, ['kind', 'note'])
-        || !absentSurfaceKinds.has(missing.kind)
-        || missingKinds.has(missing.kind)
-        || typeof missing.note !== 'string') {
-      return false;
-    }
-    missingKinds.add(missing.kind);
-  }
-  if (missingKinds.size !== absentSurfaceKinds.size) return false;
-
-  const hasPartialProcessing = report.artifacts.some(
-    (artifact) => artifact.status !== 'parsed'
-  ) || report.assurance.surfaces.some((surface) => surface.state === 'partial');
-  if (hasPartialProcessing && report.scan_limits.length === 0) return false;
-
-  const expectedVerdict = report.findings.some((finding) => finding.severity === 'match')
-    ? 'match'
-    : report.findings.some((finding) => finding.severity === 'suspicious')
-      ? 'suspicious'
-      : report.scan_limits.length > 0
-        ? 'inconclusive'
-        : report.artifacts.length === 0
-          ? 'invalid'
-          : 'clear';
-  const expectedComplete = report.scan_limits.length === 0 && expectedVerdict !== 'invalid';
-  if (report.verdict !== expectedVerdict
-      || report.assurance.complete !== expectedComplete) {
-    return false;
-  }
-
-  if (report.verdict === 'clear'
-      && (!report.assurance.complete
-        || report.scan_limits.length !== 0
-        || report.assurance.surfaces.some((surface) => surface.state === 'partial')
-        || report.assurance.surfaces_examined !== 4 - absentSurfaceKinds.size
-        || report.artifacts.length === 0
-        || report.artifacts.some((artifact) => artifact.status !== 'parsed')
-        || report.findings.some((finding) => finding.severity !== 'note')
-        || primaryArtifactKinds.size !== 4 - absentSurfaceKinds.size
-        || [...primaryArtifactKinds].some((kind) => absentSurfaceKinds.has(kind)))) {
-    return false;
-  }
-  return true;
-}
 
 function initWorker() {
   try {
@@ -584,9 +376,76 @@ function recycleWorker(expected) {
   initWorker();
 }
 
-function updateProgress(processed, total) {
-  $('#progress').value = total ? Math.round((processed / total) * 100) : 0;
-  $('#progress-text').textContent = `${fmtBytes(processed)} of ${fmtBytes(total)} read`;
+class ScanCancelledError extends Error {
+  constructor() {
+    super('Scan canceled.');
+    this.name = 'ScanCancelledError';
+  }
+}
+
+function snapshotIndicatorSets() {
+  return state.stix.map((set) => ({
+    ...set,
+    meta: { ...set.meta },
+    stats: { ...set.stats, by_kind: { ...set.stats.by_kind } },
+  }));
+}
+
+function setScanPhase(phase, file, control) {
+  const heading = $('#scan-heading');
+  const progress = $('#progress');
+  const progressText = $('#progress-text');
+  const cancel = $('#cancel-scan');
+  $('#scan-file').textContent = file.name;
+  if (phase === 'preparing') {
+    heading.textContent = 'Preparing scanner…';
+    progress.removeAttribute('value');
+    progress.setAttribute('aria-label', 'Preparing scanner');
+    progressText.textContent = 'Waiting for the validated scanner and indicator snapshots.';
+    cancel.disabled = false;
+  } else if (phase === 'reading') {
+    heading.textContent = 'Reading archive…';
+    progress.value = 0;
+    progress.setAttribute('aria-label', 'Archive read progress');
+    progressText.textContent = control.via === 'inline'
+      ? 'Background isolation is unavailable, so this fallback scan is reading in the page. The tab may pause during analysis.'
+      : `0 B of ${fmtBytes(file.size)} read`;
+    cancel.disabled = false;
+  } else if (phase === 'analyzing') {
+    heading.textContent = 'Analyzing evidence…';
+    progress.removeAttribute('value');
+    progress.setAttribute('aria-label', 'Analyzing evidence');
+    progressText.textContent = control.via === 'inline'
+      ? 'The archive is read. Trace is analyzing artifacts in the page; this blocking fallback phase cannot be interrupted safely.'
+      : 'The archive is read. Trace is matching indicators and preparing the report.';
+    cancel.disabled = control.via === 'inline';
+  } else {
+    heading.textContent = 'Canceling scan…';
+    progress.removeAttribute('value');
+    progress.setAttribute('aria-label', 'Canceling scan');
+    progressText.textContent = 'Discarding this scan. No report will be created.';
+    cancel.disabled = true;
+  }
+  if (control.phase !== phase) {
+    control.phase = phase;
+    $('#scan-live').textContent = `${heading.textContent} ${progressText.textContent}`;
+  }
+}
+
+function updateProgress(processed, total, control) {
+  const percent = total ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  $('#progress').value = percent;
+  const fallback = control.via === 'inline'
+    ? ' Background isolation is unavailable; analysis will run in this page and may briefly pause the tab.'
+    : '';
+  $('#progress-text').textContent =
+    `${fmtBytes(processed)} of ${fmtBytes(total)} read (${percent}%).${fallback}`;
+  const announcement = Math.floor(percent / 25) * 25;
+  if (announcement >= 25 && announcement < 100
+      && announcement > control.lastAnnouncedProgress) {
+    control.lastAnnouncedProgress = announcement;
+    $('#scan-live').textContent = `Reading archive: ${announcement}% complete.`;
+  }
 }
 
 // Monotonic scan id: every worker message carries the id of the scan it
@@ -595,7 +454,7 @@ function updateProgress(processed, total) {
 // to the wrong file - an evidence-provenance failure.
 let scanSeq = 0;
 
-function scanWithWorker(file) {
+function scanWithWorker(file, expectedSets, control) {
   return new Promise((resolve, reject) => {
     const w = worker;
     if (!w || workerState !== 'ready') {
@@ -604,13 +463,38 @@ function scanWithWorker(file) {
     }
     const id = ++scanSeq;
     let inactivityTimeout;
+    let settled = false;
+    function cleanup() {
+      w.removeEventListener('message', onMsg);
+      w.removeEventListener('error', onErr);
+      w.removeEventListener('messageerror', onMessageError);
+      clearTimeout(inactivityTimeout);
+      if (control.cancel === cancel) control.cancel = null;
+    }
     const restoreReady = () => {
       if (worker === w && workerState === 'scanning') workerState = 'ready';
     };
-    const failClosed = () => {
+    const finishReject = (error, disposition = 'restore') => {
+      if (settled) return;
+      settled = true;
       cleanup();
-      recycleWorker(w);
-      reject(new Error(WORKER_SCAN_FAILURE));
+      if (disposition === 'recycle') recycleWorker(w);
+      else if (disposition === 'failed') {
+        if (worker === w) worker = null;
+        workerState = 'failed';
+        w.terminate();
+      } else restoreReady();
+      reject(error);
+    };
+    const finishResolve = (report) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      restoreReady();
+      resolve(report);
+    };
+    const failClosed = () => {
+      finishReject(new Error(WORKER_SCAN_FAILURE), 'recycle');
     };
     const armInactivityTimeout = () => {
       clearTimeout(inactivityTimeout);
@@ -625,7 +509,7 @@ function scanWithWorker(file) {
           return;
         }
         armInactivityTimeout();
-        updateProgress(m.processed, file.size);
+        updateProgress(m.processed, file.size, control);
       } else if (m.type === 'finalizing') {
         // Streaming is done and the worker is now inside the blocking finish()
         // call, which cannot post progress until it returns. Swap the
@@ -633,43 +517,34 @@ function scanWithWorker(file) {
         // slow finish is not failed closed as if the worker had hung.
         clearTimeout(inactivityTimeout);
         inactivityTimeout = setTimeout(failClosed, WORKER_SCAN_FINALIZE_TIMEOUT_MS);
+        setScanPhase('analyzing', file, control);
       } else if (m.type === 'report') {
-        cleanup();
-        if (!isCompleteReportEnvelope(m.report, file, 'worker')) {
+        if (!isCompleteReportEnvelope(m.report, file, 'worker', expectedSets)) {
           // A malformed success message is not permission to replay a
           // potentially hostile archive on the main thread. Treat the worker
           // as unreliable, replace it, and keep this scan failed closed.
-          recycleWorker(w);
-          reject(new Error(WORKER_SCAN_FAILURE));
-          return;
+          finishReject(new Error(WORKER_SCAN_FAILURE), 'recycle');
+        } else {
+          finishResolve(m.report);
         }
-        restoreReady();
-        resolve(m.report);
       } else if (m.type === 'error') {
-        cleanup();
         // A scan error may be a clean rejection (not an archive) or a WASM
         // trap that left the instance's memory in an undefined state - and
         // the two are indistinguishable from here. Reusing a trapped
         // instance for the next scan could silently corrupt its result, so
         // the worker is discarded and a fresh one spun up. Fail closed.
-        recycleWorker(w);
-        reject(new Error(m.message));
+        finishReject(new Error(m.message), 'recycle');
       }
     };
     const onErr = () => {
-      cleanup();
-      if (worker === w) worker = null;
-      workerState = 'failed';
-      w.terminate();
-      reject(new Error(WORKER_SCAN_FAILURE));
+      finishReject(new Error(WORKER_SCAN_FAILURE), 'failed');
     };
     const onMessageError = () => failClosed();
-    const cleanup = () => {
-      w.removeEventListener('message', onMsg);
-      w.removeEventListener('error', onErr);
-      w.removeEventListener('messageerror', onMessageError);
-      clearTimeout(inactivityTimeout);
+    const cancel = () => {
+      control.cancelled = true;
+      finishReject(new ScanCancelledError(), 'recycle');
     };
+    control.cancel = cancel;
     w.addEventListener('message', onMsg);
     w.addEventListener('error', onErr);
     w.addEventListener('messageerror', onMessageError);
@@ -679,7 +554,7 @@ function scanWithWorker(file) {
         type: 'scan',
         id,
         file,
-        sets: state.stix.map((s) => ({
+        sets: expectedSets.map((s) => ({
           name: s.name,
           text: s.text,
           meta: s.meta,
@@ -689,28 +564,36 @@ function scanWithWorker(file) {
       });
       armInactivityTimeout();
     } catch (err) {
-      cleanup();
-      restoreReady();
-      reject(err);
+      finishReject(err);
     }
   });
 }
 
-async function scanInline(file) {
-  const scanner = state.scanner ?? newScanner();
-  state.scanner = null;
+async function scanInline(file, expectedSets, control) {
+  const scanner = newScanner(expectedSets);
   try {
     const reader = file.stream().getReader();
+    control.cancel = () => {
+      control.cancelled = true;
+      Promise.resolve(reader.cancel()).catch(() => { /* cancellation is best-effort */ });
+    };
     let processed = 0;
     let n = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (control.cancelled) throw new ScanCancelledError();
       scanner.push(value);
       processed += value.byteLength;
-      updateProgress(processed, file.size);
+      updateProgress(processed, file.size, control);
       if (++n % 2 === 0) await new Promise((r) => setTimeout(r, 0));
     }
+    if (control.cancelled) throw new ScanCancelledError();
+    setScanPhase('analyzing', file, control);
+    control.cancel = null;
+    // Let the distinct phase paint before the main-thread fallback enters the
+    // blocking WASM finish call.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     // The report envelope is assembled entirely in Rust; the producer only
     // supplies the file's declared identity. Timing comes from the engine
     // itself (its injected clock runs through parsing and assembly inside
@@ -721,21 +604,42 @@ async function scanInline(file) {
       scanned_via: 'inline',
     }));
     const report = JSON.parse(scanner.finish());
-    if (!isCompleteReportEnvelope(report, file, 'inline')) {
+    if (!isCompleteReportEnvelope(report, file, 'inline', expectedSets)) {
       throw new Error('The scanner returned an incomplete report. No verdict was shown.');
     }
     return report;
   } finally {
+    control.cancel = null;
     try { scanner.free(); } catch { /* already released */ }
-    try { state.scanner = newScanner(); } catch { /* keep last error visible */ }
   }
 }
 
-async function handleFile(file) {
+function cancelCurrentScan() {
+  const control = state.activeScan;
+  if (!control || control.cancelled) return;
+  control.cancelled = true;
+  setScanPhase('canceling', control.file, control);
+  control.cancel?.();
+}
+
+async function handleFile(file, context = {}, intent = null) {
+  const resolvedIntent = intent ?? ++state.scanIntent;
+  if (resolvedIntent !== state.scanIntent) return;
   // One scan at a time: a second file racing the first (double-clicked
   // demo button, scripted calls) must not interleave results.
   if (state.scanning) return;
   state.scanning = true;
+  state.demoLoading = false;
+  updateLandingControls();
+  const control = {
+    file,
+    phase: null,
+    via: null,
+    cancelled: false,
+    cancel: null,
+    lastAnnouncedProgress: 0,
+  };
+  state.activeScan = control;
   // A modal preview must never remain visible over a different scan. Its
   // close handler also releases the report snapshot owned by that dialog.
   const readableDialog = $('#readable-dialog');
@@ -744,6 +648,7 @@ async function handleFile(file) {
   // starts. Clearing it prevents an error from leaving stale provenance in
   // state even though no report is being shown.
   state.lastReport = null;
+  state.lastReportContext = null;
   // Results may contain sensitive case data and event listeners that close
   // over it. Remove the old tree immediately rather than retaining it, hidden,
   // for the duration of a new scan.
@@ -752,28 +657,50 @@ async function handleFile(file) {
   // The control that had focus lives inside the now-hidden landing section, so
   // move focus to the scanning view instead of letting it fall back to <body>.
   $('#scanning').focus();
-  updateProgress(0, file.size);
+  setScanPhase('preparing', file, control);
+  let cancelled = false;
   try {
     // A file dropped before the indicator sets finish loading must wait:
     // scanning with an empty set would produce a hollow "clear".
     await state.ready;
+    if (control.cancelled) throw new ScanCancelledError();
     if (workerState === 'starting') await workerReady;
+    if (control.cancelled) throw new ScanCancelledError();
     if (workerState === 'failed') throw new Error(WORKER_SCAN_FAILURE);
+    const expectedSets = snapshotIndicatorSets();
     let report;
     if (worker && workerState === 'ready') {
       state.lastScanVia = 'worker';
-      report = await scanWithWorker(file);
+      control.via = 'worker';
+      setScanPhase('reading', file, control);
+      report = await scanWithWorker(file, expectedSets, control);
     } else {
       state.lastScanVia = 'inline';
-      report = await scanInline(file);
+      control.via = 'inline';
+      setScanPhase('reading', file, control);
+      report = await scanInline(file, expectedSets, control);
     }
     // Schema v3: the report arrives complete from Rust - no fields are
     // appended here. What the UI renders is exactly what exports.
-    renderReport(report);
+    renderReport(report, { example: context.example === true });
   } catch (err) {
-    renderError(err);
+    if (err instanceof ScanCancelledError || control.cancelled) cancelled = true;
+    else renderError(err);
   } finally {
     state.scanning = false;
+    if (state.activeScan === control) state.activeScan = null;
+    updateLandingControls();
+    if (cancelled) {
+      state.lastReport = null;
+      state.lastReportContext = null;
+      $('#results').replaceChildren();
+      showSection('landing');
+      setScannerStatus(
+        'ready',
+        'Scan canceled. No report was created. Scanner ready with bundled, reviewed indicators.'
+      );
+      $('#dropzone').focus();
+    }
   }
 }
 
@@ -784,7 +711,7 @@ async function handleFile(file) {
 // Rendering must never re-derive safety semantics from other report fields.
 // A report without a verdict we recognize is from an unknown or newer
 // source; treat it as inconclusive, never clear. Only 'clear' earns the
-// reassuring banner, and only by exact match.
+// reassuring banner, and only when the report carries that exact verdict value.
 const KNOWN_VERDICTS = new Set([
   'match',
   'suspicious',
@@ -824,7 +751,7 @@ function verdictHtml(report) {
   if (v === 'match') {
     return `<div class="verdict match">
       <h2>Traces matching known spyware were found</h2>
-      <p>This file contains entries that exactly match published indicators of mercenary spyware. That is a serious signal, and it deserves expert eyes - but it is not final proof on its own.</p>
+      <p>This file contains process-bearing entries that matched published indicators of mercenary spyware. Trace compares exact process names and full paths; a file-name indicator may also match an observed process basename, and a directory path ending in <code>/</code> may match a canonical descendant. This is a serious signal that deserves expert review, but it is not final proof on its own.</p>
       ${limitNote}
       <p>Please follow the steps below. You are not alone in this, and help is free.</p>
     </div>` + HELP_BLOCK;
@@ -882,22 +809,25 @@ function verdictHtml(report) {
 // thousands, and rendering them all would hang the tab. The exported JSON
 // always carries the full list.
 const MAX_RENDERED_FINDINGS = 200;
+const MAX_RENDERED_ARTIFACTS = 200;
 
 function findingsHtml(report) {
   if (!report.findings.length) return '';
-  const cards = report.findings.slice(0, MAX_RENDERED_FINDINGS).map((f) => {
+  const cards = report.findings.slice(0, MAX_RENDERED_FINDINGS).map((f, index) => {
+    const number = index + 1;
+    const headingId = `finding-${number}-heading`;
     const ind = f.indicator
       ? `<div><span class="ind-chip">indicator: <code>${esc(f.indicator.value)}</code></span>
          <span class="ind-chip">campaign: ${esc(f.indicator.campaign)}</span>
          <span class="ind-chip">source: ${esc(f.indicator.set)}</span></div>`
       : '';
-    return `<div class="finding">
-      <div class="head"><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span>
-      <span class="artifact">${esc(f.artifact)}</span></div>
+    return `<section class="finding" aria-labelledby="${headingId}">
+      <h3 class="finding-title" id="${headingId}">Finding ${number}: <span class="sev ${esc(f.severity)}">${esc(f.severity)}</span></h3>
+      <p class="artifact">${esc(f.artifact)}</p>
       <p class="summary">${esc(f.summary)}</p>
       ${ind}
-      <details><summary>Technical evidence</summary><pre>${esc(JSON.stringify(f.evidence, null, 2))}</pre></details>
-    </div>`;
+      <details><summary>Technical evidence for finding ${number}</summary><pre>${esc(JSON.stringify(f.evidence, null, 2))}</pre></details>
+    </section>`;
   }).join('');
   const omitted = report.findings.length - Math.min(report.findings.length, MAX_RENDERED_FINDINGS);
   const more = omitted > 0
@@ -907,8 +837,10 @@ function findingsHtml(report) {
 }
 
 function artifactsHtml(report) {
-  if (!report.artifacts.length) return '';
-  const rows = report.artifacts.map((a) => {
+  const artifacts = report.artifacts || [];
+  const missing = report.missing_artifacts || [];
+  if (!artifacts.length && !missing.length) return '';
+  const rows = artifacts.slice(0, MAX_RENDERED_ARTIFACTS).map((a) => {
     const kind = a.kind === 'crash_log'
       && a.details?.paired_device === true
       && isPairedDeviceArtifactPath(a.path)
@@ -924,16 +856,20 @@ function artifactsHtml(report) {
         .map(([k, v]) => `${k}: ${v}`).join(', '))}</td>
     </tr>`;
   }).join('');
-  const missingRows = (report.missing_artifacts || []).map((m) => `
+  const missingRows = missing.map((m) => `
     <tr>
       <td>${esc(m.kind)}</td>
       <td class="path">–</td>
       <td>not found</td>
       <td>${esc(m.note)}</td>
     </tr>`).join('');
-  return `<div class="panel"><h2>What was examined (${report.artifacts.length} artifacts, ${report.stats.archive_entries} files in archive)</h2>
+  const omitted = Math.max(0, artifacts.length - MAX_RENDERED_ARTIFACTS);
+  const omissionNote = omitted
+    ? `<p class="fine">Showing the first ${MAX_RENDERED_ARTIFACTS} processed artifacts; ${omitted} more remain in the full technical JSON report.</p>`
+    : '';
+  return `<div class="panel"><h2>What was examined (${artifacts.length} artifacts, ${report.stats.archive_entries} files in archive)</h2>
     <div class="table-scroll" role="region" aria-label="Examined artifacts" tabindex="0"><table class="artifacts"><thead><tr><th>Kind</th><th>Path</th><th>Status</th><th>Details</th></tr></thead>
-    <tbody>${rows}${missingRows}</tbody></table></div></div>`;
+    <tbody>${rows}${missingRows}</tbody></table></div>${omissionNote}</div>`;
 }
 
 function limitsHtml(report) {
@@ -963,7 +899,7 @@ function provenanceHtml(report) {
     <div class="ioc-row">
       <span><span class="campaign">${esc(p.campaign)}</span>
         <span class="badge bundled">reviewed snapshot · ${esc(p.date)}</span></span>
-      <span class="meta">${p.sha256 ? `<code title="SHA-256 of the indicator file used: ${esc(p.sha256)}">sha256:${esc(p.sha256.slice(0, 12))}…</code> · ` : ''}<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">source</a></span>
+      <span class="meta">${p.sha256 ? `<code title="SHA-256 of the indicator file used: ${esc(p.sha256)}">sha256:${esc(p.sha256.slice(0, 12))}…</code> · ` : ''}<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer" aria-label="Indicator source for ${esc(p.campaign)}">source</a></span>
     </div>`).join('');
   return `<div class="panel"><h2>Indicators used</h2>${rows}
     <p class="fine">Scans use only reviewed snapshot indicators; the hash identifies the exact revision this scan used and is recorded in the exported report. Public indicators inherit a time lag: new campaigns appear here only after researchers publish them and the snapshots are reviewed. A scan can only be as current as the open ecosystem.</p></div>`;
@@ -991,34 +927,48 @@ function sourceHashHtml(source) {
   </p>`;
 }
 
-function renderReport(report) {
+function exampleNoticeHtml(context) {
+  if (context.example !== true) return '';
+  return `<aside class="example-note" role="note" aria-label="Example result">
+    <p><strong>Example result - no device was scanned.</strong></p>
+    <p>This report comes from a synthetic demonstration archive. Use “Scan another file” to analyze your own sysdiagnose.</p>
+  </aside>`;
+}
+
+function reportActionsHtml() {
+  return `<div class="actions report-actions">
+    <button class="btn" id="readable-btn">Prepare readable report</button>
+    <button class="btn secondary" id="export-btn">Export technical report (JSON - includes identifying metadata)</button>
+    <button class="btn secondary" id="rescan-btn">Scan another file</button>
+  </div>
+  <p class="fine report-export-note"><strong>Readable HTML:</strong> previews privacy redactions before download. <strong>Technical JSON:</strong> includes the source filename, device metadata when present, artifact paths, and raw evidence. Neither export contains the archive itself. Results exist only in this tab until you export them.</p>`;
+}
+
+function renderReport(report, context = {}) {
   // The report displayed on screen is the report the export controls own.
   // Keep this binding here so no caller can render A while exporting B.
   state.lastReport = report;
+  state.lastReportContext = { example: context.example === true };
   const source = report.source_file || {};
   const sourceName = source.name == null || source.name === ''
     ? 'Unknown source file'
     : source.name;
   const sourceLabel = `${esc(sourceName)} (${fmtBytes(source.size)})`;
   const device = report.device
-    ? `<p class="fine">Device: ${esc(report.device.os_version)} (from ${esc(report.device.source)}) · file: ${sourceLabel}</p>`
-    : `<p class="fine">File: ${sourceLabel}</p>`;
+    ? `<p class="fine source-meta">Device: ${esc(report.device.os_version)} (from ${esc(report.device.source)}) · file: ${sourceLabel}</p>`
+    : `<p class="fine source-meta">File: ${sourceLabel}</p>`;
   const sourceHash = sourceHashHtml(source);
   $('#results').innerHTML =
+    exampleNoticeHtml(state.lastReportContext) +
     verdictHtml(report) +
     device +
     sourceHash +
+    reportActionsHtml() +
     findingsHtml(report) +
     limitsHtml(report) +
     artifactsHtml(report) +
     coverageHtml(report) +
-    provenanceHtml(report) +
-    `<div class="actions">
-      <button class="btn" id="readable-btn">Prepare readable report</button>
-      <button class="btn secondary" id="export-btn">Export technical report (JSON)</button>
-      <button class="btn secondary" id="rescan-btn">Scan another file</button>
-    </div>
-    <p class="fine">The readable HTML export previews privacy redactions before download. The JSON report preserves the complete technical record. Neither contains the archive itself.</p>`;
+    provenanceHtml(report);
   const copyHash = $('#copy-source-sha256');
   if (copyHash) {
     copyHash.addEventListener('click', async () => {
@@ -1050,8 +1000,9 @@ function renderReport(report) {
 
 function renderError(err) {
   state.lastReport = null;
+  state.lastReportContext = null;
   $('#results').innerHTML = `<div class="error-box" role="alert">
-    <h2>Couldn't scan that file</h2>
+    <h2 id="scan-error-heading" tabindex="-1">Couldn't scan that file</h2>
     <p>${esc(err?.message || err)}</p>
     <p>Make sure you're choosing the original <code>sysdiagnose_….tar.gz</code> file, not an unpacked folder or a renamed copy. Nothing was uploaded; you can simply try again.</p>
   </div>
@@ -1060,7 +1011,31 @@ function renderError(err) {
   showSection('results');
   // Same focus treatment as a successful scan, so screen readers announce
   // the failure instead of leaving focus stranded on <body>.
-  $('#results').focus();
+  $('#scan-error-heading').focus();
+}
+
+let exportSequence = 0;
+
+function exportToken() {
+  const timestamp = new Date().toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\.\d{3}Z$/, 'Z');
+  let nonce;
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    nonce = globalThis.crypto.randomUUID().slice(0, 8);
+  } else if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    const value = new Uint32Array(1);
+    globalThis.crypto.getRandomValues(value);
+    nonce = value[0].toString(16).padStart(8, '0');
+  } else {
+    nonce = (++exportSequence).toString(36).padStart(4, '0');
+  }
+  return `${timestamp}-${nonce}`;
+}
+
+function reportFilename(kind, extension, context) {
+  const example = context?.example === true ? 'example-' : '';
+  return `trace-${example}${kind}-${exportToken()}.${extension}`;
 }
 
 function exportReport() {
@@ -1069,7 +1044,7 @@ function exportReport() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `trace-report-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = reportFilename('technical-report', 'json', state.lastReportContext);
   a.click();
   // Revoking synchronously can cancel the download in some browsers.
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
@@ -1080,15 +1055,24 @@ function readableOptions() {
     includeSourceName: $('#readable-source-name').checked,
     includeDevice: $('#readable-device').checked,
     includeTechnical: $('#readable-technical').checked,
+    example: state.readableContext?.example === true,
   };
 }
 
 function updateReadablePreview() {
   if (!state.readableReport) return;
+  const options = readableOptions();
   $('#readable-preview').innerHTML = readableReportFragment(
     state.readableReport,
-    readableOptions()
+    options
   );
+  const included = [];
+  if (options.includeSourceName) included.push('source filename');
+  if (options.includeDevice) included.push('device metadata');
+  if (options.includeTechnical) included.push('technical evidence and artifact fields');
+  $('#readable-options-status').textContent = included.length
+    ? `Preview updated. Included: ${included.join(', ')}.`
+    : 'Preview updated. Identifying metadata and technical evidence remain redacted.';
 }
 
 function openReadableDialog() {
@@ -1097,6 +1081,7 @@ function openReadableDialog() {
   // A new scan replaces state.lastReport; it must never change what an open
   // handoff dialog exports underneath the person reviewing it.
   state.readableReport = state.lastReport;
+  state.readableContext = { example: state.lastReportContext?.example === true };
   for (const id of ['readable-source-name', 'readable-device', 'readable-technical']) {
     $('#' + id).checked = false;
   }
@@ -1112,7 +1097,7 @@ function downloadReadableReport() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `trace-readable-report-${new Date().toISOString().slice(0, 10)}.html`;
+  a.download = reportFilename('readable-report', 'html', state.readableContext);
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
@@ -1124,10 +1109,16 @@ function wireUi() {
   const input = $('#file-input');
 
   dz.addEventListener('click', (e) => {
-    if (e.target.tagName !== 'LABEL') input.click();
+    if (dz.getAttribute('aria-disabled') !== 'true' && e.target.tagName !== 'LABEL') {
+      input.click();
+    }
   });
   dz.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+    if ((e.key === 'Enter' || e.key === ' ')
+        && dz.getAttribute('aria-disabled') !== 'true') {
+      e.preventDefault();
+      input.click();
+    }
   });
   // The dropzone only handles its highlight; the actual drop (anywhere on
   // the page) is handled once, at the document level below.
@@ -1135,7 +1126,9 @@ function wireUi() {
   dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
   dz.addEventListener('drop', () => dz.classList.remove('dragover'));
   input.addEventListener('change', () => {
-    if (input.files?.[0]) handleFile(input.files[0]);
+    if (input.files?.[0] && state.indicatorsReady && !state.scanning) {
+      handleFile(input.files[0]);
+    }
     input.value = '';
   });
 
@@ -1149,7 +1142,10 @@ function wireUi() {
     // Native dialogs make the page inert, but a bubbled drop still reaches
     // this document listener. Ignore it: starting a hidden background scan
     // beneath a report preview can bind the person's handoff to the wrong file.
-    if (file && $('#scanning').hidden && !$('dialog[open]')) handleFile(file);
+    if (file && state.indicatorsReady && !state.scanning
+        && $('#scanning').hidden && !$('dialog[open]')) {
+      handleFile(file);
+    }
   });
 
   const dialog = $('#prove-dialog');
@@ -1162,22 +1158,46 @@ function wireUi() {
   $('#readable-options').addEventListener('change', updateReadablePreview);
   $('#download-readable').addEventListener('click', downloadReadableReport);
   $('#close-readable').addEventListener('click', () => readableDialog.close());
+  $('#cancel-scan').addEventListener('click', cancelCurrentScan);
   // Close only through Cancel or Escape. Treating any click on dialog padding
   // as a backdrop click loses redaction choices and preview position.
   readableDialog.addEventListener('close', () => {
     state.readableReport = null;
+    state.readableContext = null;
+    $('#readable-options-status').textContent = '';
     $('#readable-preview').replaceChildren();
   });
 
-  // A failed fixture fetch must surface, not die as a silent rejection
-  // leaving the button apparently dead.
+  // Loading a demonstration and scanning a real file are separate intents.
+  // A delayed demo response must never replace a later real-file result.
   const demo = (path, name) => async () => {
+    if (!state.indicatorsReady || state.scanning || state.demoLoading) return;
+    const intent = ++state.scanIntent;
+    state.demoLoading = true;
+    setScannerStatus('preparing', 'Loading the synthetic example archive…');
     try {
       const r = await fetch(path);
       if (!r.ok) throw new Error(`the demo file could not be loaded (HTTP ${r.status})`);
-      handleFile(new File([await r.blob()], name));
+      const blob = await r.blob();
+      if (intent !== state.scanIntent) return;
+      await handleFile(new File([blob], name), { example: true }, intent);
     } catch (err) {
-      renderError(err);
+      if (intent === state.scanIntent) {
+        state.demoLoading = false;
+        updateLandingControls();
+        renderError(err);
+      }
+    } finally {
+      if (intent === state.scanIntent && state.demoLoading) {
+        state.demoLoading = false;
+        updateLandingControls();
+        if (!$('#landing').hidden) {
+          setScannerStatus(
+            'ready',
+            'Scanner ready. Bundled, reviewed indicators passed their integrity floors.'
+          );
+        }
+      }
     }
   };
   $('#demo-clean').addEventListener('click',
@@ -1185,13 +1205,6 @@ function wireUi() {
   $('#demo-infected').addEventListener('click',
     demo('./fixtures/sysdiagnose_demo_infected.tar.gz', 'sysdiagnose_demo_infected.tar.gz'));
 
-  const setOnlineState = () => {
-    const off = !navigator.onLine;
-    $('#offline-dot').classList.toggle('offline', off);
-    $('#privacy-text').textContent = off
-      ? 'You are offline, and scanning still works. This demonstrates that the loaded app has no scan-time server dependency; it does not authenticate code already loaded.'
-      : 'Analysis is designed to run entirely in this browser tab. Trace has no upload endpoint, and its intended code sends no archive bytes.';
-  };
   window.addEventListener('online', setOnlineState);
   window.addEventListener('offline', setOnlineState);
   setOnlineState();
@@ -1200,24 +1213,50 @@ function wireUi() {
 async function boot() {
   wireUi();
   initWorker();
-  // The service worker only caches the app shell; it does not depend on the
-  // indicator sets, so register it regardless of how the rest of boot goes.
+  setScannerStatus('preparing', 'Preparing scanner… Loading and validating the bundled, reviewed indicators.');
+  // Register cache support independently of scan readiness. navigator.onLine
+  // and successful scanner initialization do not prove that a reload can work
+  // offline; only a ready service worker establishes that separate state.
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => { /* non-fatal */ });
+    navigator.serviceWorker.register('./sw.js')
+      .then(() => navigator.serviceWorker.ready)
+      .then(() => {
+        state.cacheReady = true;
+        setOnlineState();
+      })
+      .catch(() => { /* cache readiness is useful but non-fatal */ });
   }
   state.ready = (async () => {
     await init();
-    await loadIndicators();
-    state.scanner = newScanner();
+    await loadBundledIndicators();
+    // Validate every reviewed floor in a short-lived scanner. Actual scans
+    // get their own instance, avoiding a duplicate pre-warmed WASM scanner.
+    const validationScanner = newScanner();
+    validationScanner.free();
+    state.indicatorsReady = true;
     renderIocPanel();
+    setScannerStatus(
+      'ready',
+      'Scanner ready. Bundled, reviewed indicators passed their integrity floors.'
+    );
+    // Optional public-feed freshness is advisory and may time out. It never
+    // delays or disables scanning with the reviewed snapshots.
+    state.freshnessReady = refreshIndicatorFreshness().catch(() => {
+      renderIocPanel();
+    });
   })();
   try {
     await state.ready;
   } catch (err) {
-    // Scans awaiting state.ready will surface the same failure; this makes
-    // it visible before anyone drops a file.
+    state.indicatorsReady = false;
+    const message = err?.message || String(err);
+    setScannerStatus(
+      'error',
+      `Scanner unavailable. ${message} Reload the page to try again.`
+    );
+    $('#ioc-list').replaceChildren();
     $('#ioc-note').textContent =
-      `The scanner failed to start (${err?.message || err}). Reload the page to try again; scanning is unavailable until this succeeds.`;
+      `The scanner failed to start (${message}). Reload the page to try again; scanning is unavailable until this succeeds.`;
     $('#ioc-panel').hidden = false;
   }
 }
@@ -1227,7 +1266,9 @@ window.__trace = {
   handleFile,
   get lastReport() { return state.lastReport; },
   get lastScanVia() { return state.lastScanVia; },
-  get ready() { return state.scanner !== null; },
+  get ready() { return state.indicatorsReady; },
+  get freshnessReady() { return state.freshnessReady; },
+  get cacheReady() { return state.cacheReady; },
   renderReport,
   // For producer-parity tests: forces the inline path, exactly what a
   // browser without worker support gets.

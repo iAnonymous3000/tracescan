@@ -2,7 +2,9 @@ use crate::ioc::{kind_label, Indicator};
 use serde::Serialize;
 
 /// Severity is epistemically descriptive, not a fear scale:
-/// - `Match`: an exact match against a published indicator of compromise.
+/// - `Match`: a deterministic match against a published indicator: exact for
+///   process names, file names, and file paths; canonical descendant matching
+///   for directory-valued file-path indicators that end in `/`.
 /// - `Suspicious`: an anomaly documented in public research as associated
 ///   with spyware infections, but not an IOC match by itself.
 /// - `Note`: unusual but frequently benign; context for an expert reviewer.
@@ -14,7 +16,7 @@ pub enum Severity {
     Match,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, PartialEq, Eq, Hash)]
 pub struct IndicatorRef {
     pub value: String,
     pub kind: String,
@@ -35,8 +37,9 @@ pub struct Finding {
 
 /// Hard cap on accumulated findings. Real scans produce well under a
 /// hundred; only a crafted archive (e.g. a ps.txt whose every line raises a
-/// heuristic) approaches this. Each finding is duplicated into report JSON
-/// and a DOM card, so unbounded growth is a memory exhaustion vector.
+/// heuristic) approaches this. Findings are retained in WASM memory and
+/// serialized into the canonical JSON report (the browser separately caps
+/// visible cards), so unbounded growth is a memory exhaustion vector.
 pub const MAX_FINDINGS: usize = 5_000;
 
 /// Findings accumulator enforcing [`MAX_FINDINGS`]. Retention is
@@ -78,7 +81,10 @@ impl Findings {
         if self.len() >= MAX_FINDINGS {
             self.capped = true;
             let evicted = match f.severity {
-                Severity::Match => self.notes.pop().or_else(|| self.suspicious.pop()).is_some(),
+                Severity::Match => {
+                    self.notes.pop().or_else(|| self.suspicious.pop()).is_some()
+                        || self.make_room_for_distinct_match(&f)
+                }
                 Severity::Suspicious => self.notes.pop().is_some(),
                 Severity::Note => false,
             };
@@ -93,11 +99,96 @@ impl Findings {
         }
     }
 
+    /// Once the cap is occupied entirely by matches, preserve indicator
+    /// diversity: a crafted archive can repeat one published indicator
+    /// thousands of times, but those duplicates must not crowd out the first
+    /// observation of a different indicator encountered later in the scan.
+    fn make_room_for_distinct_match(&mut self, incoming: &Finding) -> bool {
+        let Some(incoming_indicator) = incoming.indicator.as_ref() else {
+            return false;
+        };
+        if self
+            .matches
+            .iter()
+            .any(|finding| finding.indicator.as_ref() == Some(incoming_indicator))
+        {
+            return false;
+        }
+
+        let mut seen = std::collections::HashSet::with_capacity(self.matches.len());
+        let mut duplicate_index = None;
+        for (index, finding) in self.matches.iter().enumerate() {
+            if let Some(indicator) = finding.indicator.as_ref() {
+                if !seen.insert(indicator) {
+                    duplicate_index = Some(index);
+                }
+            }
+        }
+        if let Some(index) = duplicate_index {
+            self.matches.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn into_vec(self) -> Vec<Finding> {
         let mut v = self.matches;
         v.extend(self.suspicious);
         v.extend(self.notes);
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn match_finding(value: &str, artifact: &str) -> Finding {
+        Finding {
+            severity: Severity::Match,
+            kind: "ioc_match".into(),
+            artifact: artifact.into(),
+            summary: format!("matched {value}"),
+            evidence: serde_json::json!({ "process": value }),
+            indicator: Some(IndicatorRef {
+                value: value.into(),
+                kind: "process_name".into(),
+                set: "test-set".into(),
+                campaign: "Test Campaign".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn distinct_match_survives_a_cap_filled_with_duplicate_matches() {
+        let mut findings = Findings::new();
+        for n in 0..MAX_FINDINGS {
+            findings.push(match_finding("duplicate", &format!("artifact-{n}")));
+        }
+        assert_eq!(findings.len(), MAX_FINDINGS);
+        assert!(!findings.capped);
+
+        findings.push(match_finding("later-distinct", "last-artifact"));
+
+        assert!(findings.capped);
+        assert_eq!(findings.len(), MAX_FINDINGS);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding
+                    .indicator
+                    .as_ref()
+                    .is_some_and(|indicator| { indicator.value == "duplicate" }))
+                .count(),
+            MAX_FINDINGS - 1
+        );
+        assert!(findings.iter().any(|finding| {
+            finding
+                .indicator
+                .as_ref()
+                .is_some_and(|indicator| indicator.value == "later-distinct")
+        }));
     }
 }
 
@@ -190,9 +281,10 @@ pub struct ToolInfo {
     pub build_commit: Option<&'static str>,
 }
 
-/// What was scanned, as declared by the producer (file name and size) and
-/// as measured by the engine (SHA-256 of every byte actually pushed). The
-/// hash lets a responder confirm which exact archive a report describes.
+/// What was scanned: the producer supplies only the display name, while the
+/// engine measures both byte count and SHA-256 from every byte actually
+/// pushed. The hash lets a responder confirm which exact archive a report
+/// describes.
 #[derive(Serialize)]
 pub struct SourceFile {
     pub name: Option<String>,
@@ -279,7 +371,8 @@ pub struct Coverage {
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// At least one exact match against a published indicator.
+    /// At least one deterministic match against a published indicator under
+    /// the matching rules documented on [`Severity::Match`].
     Match,
     /// No indicator match, but research-documented anomalies present.
     Suspicious,
@@ -293,11 +386,12 @@ pub enum Verdict {
 }
 
 /// Field policy: producer-supplied metadata (`generated_at`, `scanned_via`,
-/// `duration_ms`, `source_file.name/size`, provenance details) is always
+/// `duration_ms`, `source_file.name`, provenance details) is always
 /// serialized, null when unknown, so every producer emits the identical
 /// field set for identical input - the producer-parity golden test depends
-/// on this. Content-derived fields (`device`, a finding's `indicator`) may
-/// be omitted, because their presence depends only on the archive.
+/// on this. `source_file.size` and SHA-256 are engine-derived. Other
+/// content-derived fields (`device`, a finding's `indicator`) may be omitted,
+/// because their presence depends only on the archive.
 #[derive(Serialize)]
 pub struct Report {
     /// Bumped when the report shape changes incompatibly. Consumers
