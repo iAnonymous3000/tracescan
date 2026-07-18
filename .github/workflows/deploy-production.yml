@@ -37,8 +37,8 @@ jobs:
     # one arrives - an older commit's late CI completion would evict the
     # newest commit's queued deploy, and with the stale-guard below the
     # evictor then skips itself, leaving the newest green commit
-    # undeployed forever. A real queue preserves every run; stale ones
-    # drain as fast no-op skips.
+    # undeployed forever. The extended queue preserves admitted runs (up
+    # to GitHub's 100-run limit); stale ones drain as fast no-op skips.
     concurrency:
       group: production-deploy
       cancel-in-progress: false
@@ -147,8 +147,11 @@ jobs:
           trap 'rm -f "$headers" "$schema"' EXIT
           curl -fsSI "https://tracescan.pages.dev/" > "$headers"
           expected_csp=$(sed -n 's/^  Content-Security-Policy: //p' web/_headers)
+          expected_permissions_policy=$(sed -n 's/^  Permissions-Policy: //p' web/_headers)
           [ -n "$expected_csp" ]
+          [ -n "$expected_permissions_policy" ]
           grep -Fqi "content-security-policy: ${expected_csp}" "$headers"
+          grep -Fqi "permissions-policy: ${expected_permissions_policy}" "$headers"
           grep -Eqi '^cross-origin-opener-policy:[[:space:]]*same-origin([[:space:]]|$)' "$headers"
           grep -Eqi '^x-content-type-options:[[:space:]]*nosniff([[:space:]]|$)' "$headers"
           grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers"

@@ -56,7 +56,7 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
 
       - name: Audit dependencies
         run: cargo audit

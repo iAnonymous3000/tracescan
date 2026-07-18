@@ -48,6 +48,29 @@ test('pre-scan safety guidance discloses observable use and the iCloud trade-off
   await expect(page.locator('#capture-guide')).toContainText('phone-only scan');
 });
 
+test('reduced-motion preference makes nonessential scanner motion static', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+
+  const styles = await page.evaluate(() => {
+    const dropzone = getComputedStyle(document.querySelector('#dropzone'));
+    const progress = getComputedStyle(document.querySelector('#progress'));
+    return {
+      reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+      dropzoneTransition: dropzone.transitionDuration,
+      progressAppearance: progress.appearance,
+      progressAnimation: progress.animationName,
+    };
+  });
+
+  expect(styles).toEqual({
+    reducedMotion: true,
+    dropzoneTransition: '0s',
+    progressAppearance: 'none',
+    progressAnimation: 'none',
+  });
+});
+
 test('clean demo produces the clear verdict', async ({ page }) => {
   await page.goto('/');
   await page.click('#demo-clean');
@@ -418,6 +441,59 @@ test('readable report labels unpinned references and surfaces result limits earl
     text: 'Version-tag machine-readable contract (v0.7.3)',
     href: 'https://github.com/iAnonymous3000/tracescan/blob/v0.7.3/web/report.schema.json',
   });
+});
+
+test('readable provenance reports partial and zero-applicable campaign coverage', async ({ page }) => {
+  await page.goto('/');
+  const result = await page.evaluate(async () => {
+    const { readableReportFragment } = await import('./readable-report.js');
+    const report = {
+      indicator_sets: [
+        {
+          name: 'pegasus', campaign: 'Pegasus (NSO Group)',
+          extracted: 1549, applicable: 82,
+        },
+        {
+          name: 'wintego_helios', campaign: 'Wintego Helios',
+          extracted: 175, applicable: 0,
+        },
+      ],
+      // Deliberately reverse provenance order: coverage must join by stable
+      // set identity, not by array position.
+      indicator_provenance: [
+        {
+          name: 'wintego_helios', campaign: 'Wintego Helios',
+          date: '2024-05-02', sha256: 'b'.repeat(64),
+        },
+        {
+          name: 'pegasus', campaign: 'Pegasus (NSO Group)',
+          date: '2021-07-18', sha256: 'a'.repeat(64),
+        },
+      ],
+    };
+    const parsed = new DOMParser().parseFromString(
+      readableReportFragment(report),
+      'text/html'
+    );
+    const provenance = parsed.querySelector('[aria-label="Indicator provenance"]');
+    return {
+      headers: [...provenance.querySelectorAll('th')].map((cell) => cell.textContent),
+      rows: [...provenance.querySelectorAll('tbody tr')].map((row) =>
+        [...row.cells].map((cell) => cell.textContent.trim())),
+      note: provenance.nextElementSibling.textContent,
+    };
+  });
+
+  expect(result.headers).toEqual([
+    'Campaign', 'Applicable to current matching', 'Snapshot date', 'Indicator SHA-256',
+  ]);
+  expect(result.rows).toEqual([
+    ['Wintego Helios', '0 of 175', '2024-05-02', 'b'.repeat(64)],
+    ['Pegasus (NSO Group)', '82 of 1549', '2021-07-18', 'a'.repeat(64)],
+  ]);
+  expect(result.note).toContain(
+    'A count of 0 means none are classified as applicable'
+  );
 });
 
 test('readable report choices survive a click on dialog padding', async ({ page }) => {
@@ -1556,6 +1632,73 @@ test.describe('worker failure boundaries', () => {
         (surface) => surface.kind === 'crash_log'
       ).state,
     }))).toEqual({ verdict: 'inconclusive', examined: 0, crash: 'absent' });
+  });
+
+  test('a parsed-partial metadata-only report does not degrade complete crash coverage', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'one engine is sufficient for crash-surface validation');
+    await page.addInitScript(() => {
+      const NativeWorker = window.Worker;
+      window.Worker = class extends EventTarget {
+        constructor(...args) {
+          super();
+          this.nativeWorker = new NativeWorker(...args);
+          this.nativeWorker.addEventListener('message', (event) => {
+            const data = structuredClone(event.data);
+            if (data?.type === 'report') {
+              data.report.artifacts.push({
+                path: 'root/crashes_and_spins/metadata-only-partial.ips',
+                kind: 'crash_log',
+                status: 'parsed_partial',
+                details: {
+                  paired_device: false,
+                  detection_relevant: false,
+                  processes: 0,
+                },
+              });
+              data.report.stats.artifacts_found += 1;
+              data.report.scan_limits = [
+                '1 crash or diagnostic .ips file(s) could not be fully parsed; parts of their contents were not checked against indicators.',
+              ];
+              data.report.verdict = 'inconclusive';
+              data.report.assurance.complete = false;
+            }
+            this.dispatchEvent(new MessageEvent('message', { data }));
+          });
+          this.nativeWorker.addEventListener('error', (event) => {
+            this.dispatchEvent(new ErrorEvent('error', {
+              message: event.message,
+              error: event.error,
+            }));
+          });
+          this.nativeWorker.addEventListener('messageerror', () => {
+            this.dispatchEvent(new MessageEvent('messageerror'));
+          });
+        }
+        postMessage(...args) { this.nativeWorker.postMessage(...args); }
+        terminate() { this.nativeWorker.terminate(); }
+      };
+    });
+    await page.goto('/');
+    await page.click('#demo-clean');
+
+    await expect(page.locator('.verdict.inconclusive')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.error-box')).toHaveCount(0);
+    await expect(page.locator('.artifacts')).toContainText('metadata-only-partial.ips');
+    expect(await page.evaluate(() => ({
+      verdict: window.__trace.lastReport.verdict,
+      complete: window.__trace.lastReport.assurance.complete,
+      crash: window.__trace.lastReport.assurance.surfaces.find(
+        (surface) => surface.kind === 'crash_log'
+      ).state,
+      metadataStatus: window.__trace.lastReport.artifacts.find(
+        (artifact) => artifact.path.endsWith('metadata-only-partial.ips')
+      ).status,
+    }))).toEqual({
+      verdict: 'inconclusive',
+      complete: false,
+      crash: 'complete',
+      metadataStatus: 'parsed_partial',
+    });
   });
 
   test('required fields and partial-processing invariants on real worker reports fail closed', async ({ page, browserName }) => {

@@ -309,10 +309,15 @@ export function isCompleteReportEnvelope(report, file, expectedVia, expectedSets
     return false;
   }
   if (report.artifacts.some((artifact) => {
-    const paired = artifact.kind === 'crash_log'
-      && artifact.details.paired_device === true;
-    return !paired
-      && artifact.status !== 'parsed'
+    // Match the engine's primary_crash_degraded predicate: supplemental
+    // paired-device and metadata-only reports can be partially parsed without
+    // downgrading an otherwise complete primary crash surface.
+    const degradesSurface = artifact.kind === 'crash_log'
+      ? artifact.details.paired_device === false
+        && artifact.details.detection_relevant === true
+        && artifact.status !== 'parsed'
+      : artifact.status !== 'parsed';
+    return degradesSurface
       && surfaceStates.get(artifact.kind) === 'complete';
   })) {
     return false;

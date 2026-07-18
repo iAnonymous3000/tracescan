@@ -134,18 +134,38 @@ function artifactsHtml(report, includeTechnical, includeDevice) {
 }
 
 function provenanceHtml(report) {
-  const sets = Array.isArray(report?.indicator_provenance)
+  const provenanceSets = Array.isArray(report?.indicator_provenance)
     ? report.indicator_provenance
     : [];
-  if (sets.length === 0) return '<p class="empty">No indicator provenance was recorded.</p>';
+  const indicatorSets = Array.isArray(report?.indicator_sets)
+    ? report.indicator_sets
+    : [];
+  if (provenanceSets.length === 0) {
+    return '<p class="empty">No indicator provenance was recorded.</p>';
+  }
+
+  const coverageFor = (provenance) => {
+    const matches = indicatorSets.filter((set) => set?.name === provenance?.name
+      && set?.campaign === provenance?.campaign);
+    if (matches.length !== 1) return 'unavailable';
+    const { applicable, extracted } = matches[0];
+    if (!Number.isSafeInteger(applicable) || applicable < 0
+        || !Number.isSafeInteger(extracted) || extracted < applicable) {
+      return 'unavailable';
+    }
+    return `${applicable} of ${extracted}`;
+  };
+
   return `<div class="table-scroll" role="region" aria-label="Indicator provenance" tabindex="0"><table>
-    <thead><tr><th>Campaign</th><th>Snapshot date</th><th>Indicator SHA-256</th></tr></thead>
-    <tbody>${sets.map((set) => `<tr>
+    <thead><tr><th>Campaign</th><th>Applicable to current matching</th><th>Snapshot date</th><th>Indicator SHA-256</th></tr></thead>
+    <tbody>${provenanceSets.map((set) => `<tr>
       <td>${esc(set.campaign || set.name)}</td>
+      <td>${esc(coverageFor(set))}</td>
       <td>${esc(set.date || 'unavailable')}</td>
       <td><code class="hash">${esc(set.sha256 || 'unavailable')}</code></td>
     </tr>`).join('')}</tbody>
-  </table></div>`;
+  </table></div>
+  <p class="notice">Applicable counts show how many extracted indicators Trace's current matcher treats as process names, file names, or paths checkable against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths. Trace does not inspect a filesystem listing. A count of 0 means none are classified as applicable.</p>`;
 }
 
 export function readableReportFragment(report, options = {}) {

@@ -848,6 +848,28 @@ mod tests {
     }
 
     #[test]
+    fn truncated_gzip_before_trailer_fails_finalization() {
+        let mut gz = gzip(&build_archive(false));
+        // A gzip trailer is eight bytes: CRC32 followed by the uncompressed
+        // size. Removing it models an interrupted transfer after all tar and
+        // DEFLATE bytes arrived, so only decoder finalization can catch it.
+        gz.truncate(gz.len() - 8);
+
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&gz).unwrap();
+
+        let error = match engine.finish() {
+            Ok(report) => panic!(
+                "a gzip stream truncated before its trailer produced a {:?} verdict",
+                report.verdict
+            ),
+            Err(error) => error,
+        };
+        assert!(error.contains("archive ended unexpectedly"), "{error}");
+    }
+
+    #[test]
     fn concatenated_gzip_members_match_single_member_scan() {
         let tar = build_archive(true);
         let split = tar.len() / 2;

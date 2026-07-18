@@ -232,6 +232,28 @@ main { padding: 28px 0 8px; }
 .badge.freshness-unknown { background: var(--note-bg); color: var(--note-ink); }
 
 #scanning progress { width: 100%; height: 10px; accent-color: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  #dropzone { transition: none; }
+
+  /* Native indeterminate progress bars animate inside the browser's controls.
+     Replace only that state with a static track; determinate progress still
+     communicates how much of the archive has been read. */
+  #scanning progress:not([value]) {
+    -webkit-appearance: none;
+    appearance: none;
+    animation: none;
+    background: var(--note-bg);
+    border: 1px solid var(--note-line);
+    border-radius: 99px;
+  }
+  #scanning progress:not([value])::-webkit-progress-bar {
+    background: var(--note-bg);
+    border-radius: inherit;
+  }
+  #scanning progress:not([value])::-moz-progress-bar { background: transparent; }
+}
+
 .scan-file { font-family: var(--mono); overflow-wrap: anywhere; }
 .scan-actions { margin-top: 12px; }
 
