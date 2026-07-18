@@ -23,7 +23,9 @@ const VERDICTS = {
   },
 };
 
-function esc(value) {
+// Single-sourced HTML escaper, imported by main.js too: an escaping helper on
+// the XSS surface is worth exactly one definition.
+export function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[char]));
@@ -52,7 +54,20 @@ function list(items, emptyText) {
   return `<ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>`;
 }
 
-function findingHtml(finding, includeTechnical, index) {
+// The exact OS build and capture timestamp identify the device, and they also
+// travel inside crash artifact `details` and finding `evidence`. When the
+// reader withholds device metadata, strip those keys wherever they surface -
+// otherwise enabling the separate technical toggle would silently re-expose
+// what the "Device metadata redacted" notice promised to hide.
+const DEVICE_KEYS = ['os_version', 'timestamp'];
+function withoutDeviceKeys(value, includeDevice) {
+  if (includeDevice || value === null || typeof value !== 'object') return value;
+  const clone = Array.isArray(value) ? [...value] : { ...value };
+  for (const key of DEVICE_KEYS) delete clone[key];
+  return clone;
+}
+
+function findingHtml(finding, includeTechnical, index, includeDevice) {
   const number = index + 1;
   const headingId = `readable-finding-${number}`;
   const severity = ['match', 'suspicious', 'note'].includes(finding?.severity)
@@ -64,7 +79,7 @@ function findingHtml(finding, includeTechnical, index) {
        <strong>Indicator set:</strong> ${esc(finding.indicator.set || 'unavailable')}</p>`
     : '';
   const evidence = includeTechnical
-    ? `<details open><summary>Technical evidence for finding ${number}</summary><pre>${esc(JSON.stringify(finding?.evidence ?? null, null, 2))}</pre></details>`
+    ? `<details open><summary>Technical evidence for finding ${number}</summary><pre>${esc(JSON.stringify(withoutDeviceKeys(finding?.evidence ?? null, includeDevice), null, 2))}</pre></details>`
     : '';
   const artifact = includeTechnical
     ? (finding?.artifact || 'artifact unavailable')
@@ -77,12 +92,12 @@ function findingHtml(finding, includeTechnical, index) {
   </section>`;
 }
 
-function findingsHtml(report, includeTechnical) {
+function findingsHtml(report, includeTechnical, includeDevice) {
   const findings = Array.isArray(report?.findings) ? report.findings : [];
   if (findings.length === 0) return '<p class="empty">No findings were recorded.</p>';
   const shown = findings.slice(0, MAX_READABLE_FINDINGS);
   const omitted = findings.length - shown.length;
-  return `${shown.map((finding, index) => findingHtml(finding, includeTechnical, index)).join('')}
+  return `${shown.map((finding, index) => findingHtml(finding, includeTechnical, index, includeDevice)).join('')}
     ${omitted > 0 ? `<p class="notice">This readable copy shows the first ${MAX_READABLE_FINDINGS} severity-ordered findings. ${omitted} additional findings remain in the JSON report.</p>` : ''}`;
 }
 
@@ -92,13 +107,13 @@ function artifactLabel(artifact) {
     : artifact?.kind;
 }
 
-function artifactsHtml(report, includeTechnical) {
+function artifactsHtml(report, includeTechnical, includeDevice) {
   const artifacts = Array.isArray(report?.artifacts) ? report.artifacts : [];
   const missing = Array.isArray(report?.missing_artifacts) ? report.missing_artifacts : [];
   const rows = artifacts.map((artifact) => `<tr>
     <td>${esc(artifactLabel(artifact))}</td>
     <td>${esc(artifact.status)}</td>
-    ${includeTechnical ? `<td><code>${esc(artifact.path)}</code></td><td><code>${esc(JSON.stringify(artifact.details ?? {}))}</code></td>` : ''}
+    ${includeTechnical ? `<td><code>${esc(artifact.path)}</code></td><td><code>${esc(JSON.stringify(withoutDeviceKeys(artifact.details ?? {}, includeDevice)))}</code></td>` : ''}
   </tr>`).join('');
   const missingRows = missing.map((artifact) => `<tr>
     <td>${esc(artifact.kind)}</td>
@@ -215,12 +230,12 @@ export function readableReportFragment(report, options = {}) {
 
     <section class="report-section">
       <h2>Findings (${esc(Array.isArray(report?.findings) ? report.findings.length : 0)})</h2>
-      ${findingsHtml(report, opts.includeTechnical)}
+      ${findingsHtml(report, opts.includeTechnical, opts.includeDevice)}
     </section>
 
     <section class="report-section">
       <h2>What Trace examined</h2>
-      ${artifactsHtml(report, opts.includeTechnical)}
+      ${artifactsHtml(report, opts.includeTechnical, opts.includeDevice)}
     </section>
 
     <section class="report-section two-column">

@@ -37,6 +37,27 @@ complete. The report schema is unchanged.
   archives dropped at the retention cap and truncated process listings are
   reported accurately instead of as absent or empty.
 
+Review follow-ups. A multi-dimensional review confirmed the engine, parsers, and
+detection methodology are sound, and turned up a set of interface, accessibility,
+and maintainability fixes. None change verdict semantics or the report schema.
+
+- Restored a green build. A formatting slip in the iOS 26 uuidtext resolver was
+  failing `cargo fmt --check`, which gates CI and the production deploy.
+- The readable HTML export's "Device metadata redacted" promise now holds even
+  when raw technical details are included: the OS build and capture timestamp
+  are stripped from artifact details and finding evidence, not only from the
+  device section.
+- Accessibility. The scan verdict is announced to screen readers by focusing its
+  heading; keyboard focus follows the view into the scanning screen instead of
+  falling back to the page body; the drop target has a distinct keyboard-focus
+  ring; the local-processing dialog has an accessible name; and a declared color
+  scheme lets native form controls render correctly in dark mode.
+- Maintainability. The reviewed-floor guard (a false-clear safeguard enforced on
+  both scan paths), the HTML escaper, and the canonical-path predicate each have
+  a single definition again instead of drifting copies, and the background
+  worker's finalization phase gets its own watchdog so a slow but healthy finish
+  is not failed closed.
+
 Responder-trust and operational-safety work. The report schema and engine-owned
 verdict semantics are unchanged.
 

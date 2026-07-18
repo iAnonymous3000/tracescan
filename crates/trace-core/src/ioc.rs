@@ -223,7 +223,11 @@ fn kind_of(object_type: &str, field: &[String]) -> IocKind {
     }
 }
 
-fn is_canonical_observed_path(path: &str) -> bool {
+/// True for an absolute path whose components are all non-empty and free of
+/// `.`/`..` segments - the shape safe to compare against path indicators.
+/// Shared with the unified-log resolver so the matching-safety predicate has
+/// one definition.
+pub(crate) fn is_canonical_observed_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && path[1..]

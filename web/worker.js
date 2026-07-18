@@ -4,23 +4,13 @@
    progress and the final report back. Nothing here touches the network. */
 
 import init, { Scanner } from './pkg/trace_core.js';
+import { meetsReviewedFloor } from './indicator-floor.js';
 
 const ready = init();
 ready.then(
   () => self.postMessage({ type: 'ready' }),
   (err) => self.postMessage({ type: 'init-error', message: err?.message || String(err) })
 );
-
-function meetsReviewedFloor(set, stats) {
-  return Number.isSafeInteger(set.min_indicators)
-    && set.min_indicators >= 0
-    && Number.isSafeInteger(set.min_applicable)
-    && set.min_applicable >= 0
-    && Number.isSafeInteger(stats?.extracted)
-    && stats.extracted >= set.min_indicators
-    && Number.isSafeInteger(stats?.applicable)
-    && stats.applicable >= set.min_applicable;
-}
 
 self.onmessage = async (e) => {
   const msg = e.data;
@@ -61,6 +51,11 @@ self.onmessage = async (e) => {
       }
     }
     self.postMessage({ type: 'progress', id, processed });
+    // Streaming is complete; the next call blocks in WASM through parsing,
+    // matching, and verdict assembly without emitting progress. Tell the page
+    // so its watchdog switches from the inter-progress inactivity window to a
+    // deadline sized for finalization.
+    self.postMessage({ type: 'finalizing', id });
     // The report envelope is assembled entirely in Rust; the producer only
     // supplies the file's declared identity. Timing comes from the engine
     // itself (its injected clock runs through parsing and assembly inside

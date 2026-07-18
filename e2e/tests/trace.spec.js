@@ -55,6 +55,9 @@ test('clean demo produces the clear verdict', async ({ page }) => {
   await expect(page.locator('.verdict h2')).toHaveText('No known spyware traces found');
   // the honest-epistemics disclaimer must always accompany a clear verdict
   await expect(page.locator('.verdict.clear')).toContainText('not the same as "your phone is clean."');
+  // The verdict heading takes focus so a screen reader announces the outcome
+  // rather than leaving it on an unnamed container.
+  await expect(page.locator('.verdict h2')).toBeFocused();
 });
 
 test('a paired-device-only clear report describes its narrow evidence without saying only 0', async ({ page }) => {
@@ -294,6 +297,47 @@ test('readable report previews redactions and downloads self-contained HTML', as
   expect(html).toContain('This readable HTML is a reduced convenience copy');
   expect(html).toContain('.verification a::after');
   expect(html).toContain('attr(href)');
+});
+
+test('withholding device metadata strips it from technical details and evidence too', async ({ page }) => {
+  await page.goto('/');
+  const OS = 'iPhone OS 18.5 (22F76)';
+  const TS = '2026-07-01 10:00:00.00 +0000';
+  const result = await page.evaluate(async ({ os, ts }) => {
+    const { readableReportDocument } = await import('./readable-report.js');
+    const report = {
+      schema_version: 3,
+      verdict: 'clear',
+      generated_at: '2026-07-17T00:00:00.000Z',
+      tool: { name: 'Trace', version: '0.7.3', build_commit: null },
+      source_file: { name: 'x.tar.gz', size: 100, sha256: 'a'.repeat(64) },
+      device: { os_version: os, source: 'crashes_and_spins/a.ips', timestamp: ts },
+      indicator_provenance: [],
+      artifacts: [{
+        path: 'crashes_and_spins/a.ips', kind: 'crash_log', status: 'parsed',
+        details: { process: 'a', os_version: os, timestamp: ts, bug_type: '309' },
+      }],
+      missing_artifacts: [],
+      findings: [{
+        severity: 'note', kind: 'heuristic', artifact: 'crashes_and_spins/a.ips',
+        summary: 'note', evidence: { timestamp: ts, process: 'a' },
+      }],
+      scan_limits: [],
+      coverage: { examined: [], not_examined: [], note: '' },
+    };
+    return {
+      // Device withheld but technical details on: the redaction promise must
+      // still hold - the OS build and capture timestamp identify the device.
+      withheld: readableReportDocument(report, { includeDevice: false, includeTechnical: true }),
+      // Device included: the same fields are present.
+      shown: readableReportDocument(report, { includeDevice: true, includeTechnical: true }),
+    };
+  }, { os: OS, ts: TS });
+  expect(result.withheld).toContain('Device metadata redacted from this readable copy');
+  expect(result.withheld).not.toContain(OS);
+  expect(result.withheld).not.toContain(TS);
+  expect(result.shown).toContain(OS);
+  expect(result.shown).toContain(TS);
 });
 
 test('readable report labels unpinned references and surfaces result limits early', async ({ page }) => {

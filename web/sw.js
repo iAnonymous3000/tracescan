@@ -12,6 +12,7 @@ const SHELL = [
   './style.css',
   './main.js',
   './readable-report.js',
+  './indicator-floor.js',
   './worker.js',
   './report.schema.json',
   './pkg/trace_core.js',

@@ -1,6 +1,10 @@
 /* Trace - calm, credible, self-contained. No external assets by design (CSP). */
 
 :root {
+  /* Let native controls (checkboxes, scrollbars, text selection, the progress
+     track) follow the OS theme; the custom-property palette below only styles
+     Trace's own elements. */
+  color-scheme: light dark;
   --bg: #fafaf8;
   --surface: #ffffff;
   --text: #1d2126;
@@ -156,7 +160,12 @@ main { padding: 28px 0 8px; }
 }
 #dropzone:hover, #dropzone:focus-visible, #dropzone.dragover {
   border-color: var(--accent);
-  outline: none;
+}
+/* Keyboard focus needs its own indicator: without this, a focused dropzone
+   looks identical to a hovered or drag-over one. */
+#dropzone:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 .dz-icon { font-size: 2rem; color: var(--muted); }
 .dz-title { font-size: 1.15rem; font-weight: 600; margin: 8px 0 2px; }

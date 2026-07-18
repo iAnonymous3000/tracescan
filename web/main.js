@@ -1,5 +1,6 @@
 import init, { Scanner } from './pkg/trace_core.js';
-import { readableReportDocument, readableReportFragment } from './readable-report.js';
+import { readableReportDocument, readableReportFragment, esc } from './readable-report.js';
+import { meetsReviewedFloor } from './indicator-floor.js';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -15,11 +16,8 @@ const state = {
 
 /* ---------- utilities ---------- */
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
+// esc() and meetsReviewedFloor() are imported above so their single definition
+// is shared with the readable export and the scan worker respectively.
 
 function fmtBytes(n) {
   if (!Number.isFinite(n) || n < 0) return 'size unavailable';
@@ -93,17 +91,6 @@ function isPlausibleUpdate(set, text) {
   } catch {
     return false;
   }
-}
-
-function meetsReviewedFloor(set, stats) {
-  return Number.isSafeInteger(set.min_indicators)
-    && set.min_indicators >= 0
-    && Number.isSafeInteger(set.min_applicable)
-    && set.min_applicable >= 0
-    && Number.isSafeInteger(stats?.extracted)
-    && stats.extracted >= set.min_indicators
-    && Number.isSafeInteger(stats?.applicable)
-    && stats.applicable >= set.min_applicable;
 }
 
 async function loadIndicators() {
@@ -195,6 +182,12 @@ const WORKER_SCAN_INACTIVITY_TIMEOUT_MS = Number.isSafeInteger(
 ) && globalThis.__TRACE_TEST_WORKER_TIMEOUT_MS > 0
   ? globalThis.__TRACE_TEST_WORKER_TIMEOUT_MS
   : 45_000;
+// finish() is a single blocking WASM call (parse, match, verdict assembly)
+// that emits no heartbeats, so once the worker signals it has entered that
+// phase the streaming inactivity window no longer applies. This deadline is
+// sized for worst-case finalization on a capped-size input; it is generous
+// because failing here rejects a valid scan of a healthy worker.
+const WORKER_SCAN_FINALIZE_TIMEOUT_MS = 120_000;
 const WORKER_SCAN_FAILURE =
   'The background scanner stopped while reading this file. Trace did not retry it on the main page because doing so could freeze or crash the tab. Keep the original file, reload this page, and contact a digital security helpline if the problem repeats.';
 
@@ -633,6 +626,13 @@ function scanWithWorker(file) {
         }
         armInactivityTimeout();
         updateProgress(m.processed, file.size);
+      } else if (m.type === 'finalizing') {
+        // Streaming is done and the worker is now inside the blocking finish()
+        // call, which cannot post progress until it returns. Swap the
+        // inactivity window for a single finalize deadline so a legitimately
+        // slow finish is not failed closed as if the worker had hung.
+        clearTimeout(inactivityTimeout);
+        inactivityTimeout = setTimeout(failClosed, WORKER_SCAN_FINALIZE_TIMEOUT_MS);
       } else if (m.type === 'report') {
         cleanup();
         if (!isCompleteReportEnvelope(m.report, file, 'worker')) {
@@ -749,6 +749,9 @@ async function handleFile(file) {
   // for the duration of a new scan.
   $('#results').replaceChildren();
   showSection('scanning');
+  // The control that had focus lives inside the now-hidden landing section, so
+  // move focus to the scanning view instead of letting it fall back to <body>.
+  $('#scanning').focus();
   updateProgress(0, file.size);
   try {
     // A file dropped before the indicator sets finish loading must wait:
@@ -1032,8 +1035,17 @@ function renderReport(report) {
   $('#export-btn').addEventListener('click', exportReport);
   $('#rescan-btn').addEventListener('click', backToLanding);
   showSection('results');
-  // Move focus to the verdict so screen readers announce the outcome.
-  $('#results').focus();
+  // Announce the outcome by focusing the verdict heading itself. Focusing the
+  // unnamed results container does not reliably read its contents in NVDA/JAWS,
+  // so the tool's most important output could go unspoken; a focused heading is
+  // read out. Every known verdict renders exactly one .verdict > h2.
+  const verdictHeading = $('#results .verdict h2');
+  if (verdictHeading) {
+    verdictHeading.setAttribute('tabindex', '-1');
+    verdictHeading.focus();
+  } else {
+    $('#results').focus();
+  }
 }
 
 function renderError(err) {

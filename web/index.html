@@ -32,8 +32,8 @@
   </div>
 </div>
 
-<dialog id="prove-dialog">
-  <h2>Check the local-processing claim</h2>
+<dialog id="prove-dialog" aria-labelledby="prove-dialog-title">
+  <h2 id="prove-dialog-title">Check the local-processing claim</h2>
   <ol>
     <li>Load this page.</li>
     <li>Turn on <strong>Airplane Mode</strong> (or unplug your network).</li>
@@ -102,7 +102,7 @@
     </section>
   </section>
 
-  <section id="scanning" hidden>
+  <section id="scanning" tabindex="-1" hidden>
     <h2>Scanning…</h2>
     <progress id="progress" max="100" value="0" aria-label="Scan progress"></progress>
     <p id="progress-text" class="fine" role="status"></p>

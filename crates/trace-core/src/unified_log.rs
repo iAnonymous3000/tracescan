@@ -171,8 +171,8 @@ fn image_path(ut: &UUIDText) -> Result<Option<String>, &'static str> {
         .take(MAX_PATH_BYTES + 1)
         .position(|&b| b == 0)
         .ok_or("uuidtext path is not terminated within the path budget")?;
-    let path = std::str::from_utf8(&footer[..end])
-        .map_err(|_| "uuidtext path is not valid UTF-8")?;
+    let path =
+        std::str::from_utf8(&footer[..end]).map_err(|_| "uuidtext path is not valid UTF-8")?;
     // A .dext DriverExtension bundle records its path with a trailing slash
     // (/System/Library/DriverExtensions/AppleCentauriControl.dext/); accept it
     // by dropping the single trailing separator so it reads as a normal path.
@@ -186,18 +186,12 @@ fn image_path(ut: &UUIDText) -> Result<Option<String>, &'static str> {
     // can neither lexically match nor escape a directory, but not counted as
     // failures that would make every real iOS capture inconclusive. A whole
     // inventory that resolves nothing still degrades via the resolved==0 path.
-    if !is_absolute_canonical_path(path) {
+    // The same canonical-path predicate the IOC matcher gates on, so an
+    // observed binary path is judged safe to compare in exactly one place.
+    if !crate::ioc::is_canonical_observed_path(path) {
         return Ok(None);
     }
     Ok(Some(path.to_string()))
-}
-
-fn is_absolute_canonical_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() > 1
-        && path[1..]
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn valid_catalog_uuid(uuid: &str) -> bool {
