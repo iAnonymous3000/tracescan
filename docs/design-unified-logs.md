@@ -52,13 +52,21 @@ at a time and dropped after their durable process facts have been retained:
    case-sensitive process/file basenames and full paths, plus canonical
    descendants of trailing-slash directory path indicators. Path heuristics are
    applied separately. Report evidence includes the path, UUID, retained PID
-   count and sample, and catalog-appearance count.
+   sample, whether that sample was truncated, and catalog-appearance count.
 
 The resulting `ArtifactSummary` reports file, catalog, process, resolution,
-failure, truncation, and conflict counts, plus retained PID/path-byte counts and
-cap state. It does not claim first or last event timestamps or a precisely
-measured log window, because this catalog-only path does not derive those
-fields.
+failure, truncation, and conflict counts, plus retained PID/path-byte counts,
+identity-cap state, and PID-history sampling state. It does not claim first or
+last event timestamps or a precisely measured log window, because this
+catalog-only path does not derive those fields.
+
+`identity_cap_hit` is the explicit detection-coverage field. The legacy
+`cap_hit` key now aliases that identity/path meaning; before this distinction it
+also became true for PID-sample overflow, so consumers that need any bounded
+sampling state must additionally inspect `pid_retention_cap_hit`.
+`pid_retention_cap_hit` and `pid_observations_dropped` describe only bounded
+evidence sampling; per-finding evidence preserves the historical `pid_count`
+key alongside the unambiguous `retained_pid_count` and lower-bound flag.
 
 ## Bounds and fail-closed behavior
 
@@ -76,10 +84,14 @@ limits:
 A tracev3 file cut short by the outer member cap or rejected by framing
 validation is not partially inventoried. Trace also degrades the surface when
 the parser drops or collapses catalog data, a UUID or uuidtext file is invalid,
-conflicting UUID mappings appear, an inventory cap is reached, no process is
-inventoried, or any inventoried process cannot be resolved to a path. Surviving
-findings from structurally usable catalogs remain visible, but a no-finding
-result with one of these conditions is inconclusive rather than reassuring.
+conflicting UUID mappings appear, an identity/path inventory cap is reached, no
+process is inventoried, or any inventoried process cannot be resolved to a path.
+Surviving findings from structurally usable catalogs remain visible, but a
+no-finding result with one of these conditions is inconclusive rather than
+reassuring. Per-process and aggregate PID limits bound report evidence only:
+when they fill, Trace retains and checks the already-known UUID/path identity,
+records how many later PID observations were dropped, and does not misstate
+that evidence sampling as lost detection coverage.
 
 The catalog-only parser boundary removes the chunkset size-declaration
 allocation and retained-firehose hazards. These limits do not prove bounded

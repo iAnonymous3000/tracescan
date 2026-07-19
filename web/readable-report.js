@@ -279,7 +279,7 @@ export function readableReportFragment(report, options = {}) {
 
     <section class="report-section">
       <h2>Scan limits</h2>
-      ${list(limits, 'No scan safety limit was reached.')}
+      ${list(limits, 'No verdict-relevant scan limit was recorded.')}
     </section>
 
     <section class="report-section">

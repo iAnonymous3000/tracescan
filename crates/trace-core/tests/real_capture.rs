@@ -75,14 +75,17 @@ fn real_capture_end_to_end() {
         .unwrap();
     let failures = unified.details["tracev3_parse_failures"].as_u64().unwrap();
     println!(
-        "unified log: {} tracev3 files ({} failures), {} catalogs, {} uuidtext files ({} failures), {} processes seen, {} resolved to paths",
+        "unified log: {} tracev3 files ({} failures), {} catalogs, {} uuidtext files ({} failures), {} processes seen, {} resolved to paths, {} PID samples retained, {} PID observations dropped (sampling cap: {})",
         unified.details["tracev3_files"],
         failures,
         unified.details["catalogs"],
         unified.details["uuidtext_files"],
         unified.details["uuidtext_parse_failures"],
         seen,
-        resolved
+        resolved,
+        unified.details["retained_pids"],
+        unified.details["pid_observations_dropped"],
+        unified.details["pid_retention_cap_hit"]
     );
     assert!(seen > 50, "a real device logs from many binaries");
     assert!(

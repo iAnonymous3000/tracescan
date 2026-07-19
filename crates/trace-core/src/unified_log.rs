@@ -21,8 +21,10 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 
-/// A real logarchive holds a few hundred binaries; these caps only matter
-/// for hostile input, and hitting one surfaces in the artifact details.
+/// A real logarchive holds a few hundred binaries. Identity/path caps only
+/// matter for hostile input and make the scan incomplete. PID history is
+/// evidence sampling: a long-lived binary can legitimately appear under many
+/// PIDs, while matching still depends only on its retained UUID and path.
 const MAX_TRACKED_UUIDS: usize = 65_536;
 const MAX_PIDS_PER_PROCESS: usize = 4_096;
 /// Aggregate budgets keep the per-process/per-path caps from multiplying into
@@ -281,6 +283,7 @@ impl Read for CatalogOnlyReader<'_> {
 struct ProcStat {
     pids: BTreeSet<u32>,
     catalog_appearances: u64,
+    dropped_pid_samples: u64,
 }
 
 #[derive(Default)]
@@ -302,7 +305,13 @@ pub struct Aggregator {
     pub(crate) uuidtext_failures: u64,
     pub(crate) uuidtext_conflicts: u64,
     catalogs: u64,
+    /// A process UUID, UUID-to-path mapping, or path byte budget was exhausted.
+    /// Unlike PID evidence sampling, this means a matchable identity was lost.
     pub(crate) cap_hit: bool,
+    /// PID observations dropped after their bounded evidence sample filled.
+    /// The UUID/path identity remains retained and fully matchable.
+    pub(crate) pid_retention_cap_hit: bool,
+    dropped_pid_samples: u64,
     /// Files our own size cap cut short; parsing a partial file would
     /// silently under-report, so they are skipped and surfaced instead.
     /// Aggregate retained for the engine's shared unified-log limit message;
@@ -425,7 +434,9 @@ impl Aggregator {
                     stat.pids.insert(entry.pid);
                     self.retained_pids += 1;
                 } else {
-                    self.cap_hit = true;
+                    stat.dropped_pid_samples = stat.dropped_pid_samples.saturating_add(1);
+                    self.dropped_pid_samples = self.dropped_pid_samples.saturating_add(1);
+                    self.pid_retention_cap_hit = true;
                 }
             }
         }
@@ -503,8 +514,14 @@ impl Aggregator {
             let evidence = json!({
                 "process_path": path,
                 "binary_uuid": uuid,
+                // Retained sample count kept under the historical key for
+                // report compatibility; the explicit name carries semantics.
                 "pid_count": stat.pids.len(),
+                "retained_pid_count": stat.pids.len(),
                 "pids_sample": pid_sample,
+                "pid_history_truncated": stat.dropped_pid_samples > 0,
+                "pid_count_is_lower_bound": stat.dropped_pid_samples > 0,
+                "pid_observations_dropped": stat.dropped_pid_samples,
                 "catalog_appearances": stat.catalog_appearances,
             });
             for ind in db.match_process(path) {
@@ -543,15 +560,19 @@ impl Aggregator {
             "processes_resolved_to_path": resolved,
             "processes_unresolved": self.procs.len().saturating_sub(resolved),
             "retained_pids": self.retained_pids,
+            "pid_retention_cap_hit": self.pid_retention_cap_hit,
+            "pid_observations_dropped": self.dropped_pid_samples,
             "retained_path_bytes": self.retained_path_bytes,
+            "identity_cap_hit": self.cap_hit,
+            // Legacy alias retained for report consumers.
             "cap_hit": self.cap_hit,
         });
         // Anything less than a fully readable surface downgrades the
         // status, which the engine turns into a scan limit and the
         // assurance block reports as partial: parse failures (whole or
-        // partial), truncated files, a capped inventory, an inventory in
-        // with any process unresolved to a binary path (that process could
-        // not be matched), or tracev3 that parsed to an empty inventory
+        // partial), truncated files, a capped UUID/path inventory, an
+        // inventory with any process unresolved to a binary path (that process
+        // could not be matched), or tracev3 that parsed to an empty inventory
         // (real tracev3 always carries catalog processes).
         let degraded = self.tracev3_failures > 0
             || self.tracev3_incomplete > 0
@@ -573,6 +594,72 @@ impl Aggregator {
             ArtifactSummary::parsed("system_logs.logarchive", "unified_log", details)
         })
     }
+}
+
+#[cfg(test)]
+fn test_catalog_chunk(entries: &[(u16, u64, u32, u32)]) -> Vec<u8> {
+    let process_region_size = entries
+        .len()
+        .checked_mul(48)
+        .and_then(|size| size.checked_add(16))
+        .and_then(|size| u16::try_from(size).ok())
+        .expect("test catalog process region must fit its u16 offset");
+    let mut body = Vec::new();
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    body.extend_from_slice(&process_region_size.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&[0u8; 6]);
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&[0xAA; 16]);
+    for (main_uuid_index, first_proc_id, second_proc_id, pid) in entries {
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&main_uuid_index.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&first_proc_id.to_le_bytes());
+        body.extend_from_slice(&second_proc_id.to_le_bytes());
+        body.extend_from_slice(&pid.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&CHUNK_CATALOG.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend(std::iter::repeat_n(0u8, (8 - body.len() % 8) % 8));
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn test_pid_retention_cap_tracev3() -> Vec<u8> {
+    let entries: Vec<_> = (0..=MAX_PIDS_PER_PROCESS)
+        .map(|pid| (0, pid as u64, 0, pid as u32))
+        .collect();
+    let mut tracev3 = Vec::new();
+    for entries in entries.chunks(1_024) {
+        tracev3.extend_from_slice(&test_catalog_chunk(entries));
+    }
+    tracev3
+}
+
+#[cfg(test)]
+pub(crate) fn test_uuidtext(path: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x66778899u32.to_le_bytes());
+    out.extend_from_slice(&UUIDTEXT_MAJOR_VERSION.to_le_bytes());
+    out.extend_from_slice(&UUIDTEXT_MINOR_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(path.as_bytes());
+    out.push(0);
+    out
 }
 
 #[cfg(test)]
@@ -1101,17 +1188,8 @@ mod tests {
     }
 
     #[test]
-    fn pid_retention_caps_are_disclosed() {
-        let mut agg = Aggregator {
-            retained_pids: MAX_TOTAL_TRACKED_PIDS,
-            ..Default::default()
-        };
-        agg.consume_tracev3(
-            "Persist/global-cap.tracev3",
-            &catalog_chunk(&[(0, 1, 2, 42)]),
-        );
-        assert!(agg.cap_hit);
-
+    fn per_process_pid_retention_cap_is_disclosed_without_dropping_identity() {
+        const UUID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let entries: Vec<_> = (0..=MAX_PIDS_PER_PROCESS)
             .map(|pid| (0, pid as u64, 0, pid as u32))
             .collect();
@@ -1121,11 +1199,109 @@ mod tests {
         }
         let mut agg = Aggregator::default();
         agg.consume_tracev3("Persist/per-process-cap.tracev3", &tracev3);
-        assert!(agg.cap_hit);
-        assert_eq!(
-            agg.procs["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"].pids.len(),
-            MAX_PIDS_PER_PROCESS
+        assert!(!agg.cap_hit);
+        assert!(agg.pid_retention_cap_hit);
+        assert_eq!(agg.dropped_pid_samples, 1);
+        assert_eq!(agg.procs[UUID].pids.len(), MAX_PIDS_PER_PROCESS);
+        assert_eq!(agg.procs[UUID].dropped_pid_samples, 1);
+
+        // The retained UUID/path is still fully matchable. Sampling the PID
+        // history changes evidence only and must not degrade the surface.
+        agg.paths.insert(UUID.into(), "/usr/libexec/bh".into());
+        let mut findings = Findings::new();
+        let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["cap_hit"], false);
+        assert_eq!(summary.details["pid_retention_cap_hit"], true);
+        assert_eq!(summary.details["pid_observations_dropped"], 1);
+        let hit = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .unwrap();
+        assert_eq!(hit.evidence["pid_history_truncated"], true);
+        assert_eq!(hit.evidence["retained_pid_count"], MAX_PIDS_PER_PROCESS);
+        assert_eq!(hit.evidence["pid_count_is_lower_bound"], true);
+        assert_eq!(hit.evidence["pid_observations_dropped"], 1);
+    }
+
+    #[test]
+    fn aggregate_pid_retention_cap_is_disclosed_without_dropping_identity() {
+        const TARGET_UUID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        const SINGLETON_UUID: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let mut agg = Aggregator::default();
+
+        // Construct a reachable aggregate state: 63 full per-process samples,
+        // one target with one slot left, and one singleton together retain the
+        // exact aggregate maximum. The next target PID must be dropped solely
+        // because of the aggregate evidence budget, not the per-process cap.
+        for index in 1..=63u32 {
+            let uuid = format!("{index:032X}");
+            let pids = (0..MAX_PIDS_PER_PROCESS as u32).collect();
+            let path = format!("/usr/libexec/safe-process-{index}");
+            agg.retained_path_bytes += path.len();
+            agg.paths.insert(uuid.clone(), path);
+            agg.procs.insert(
+                uuid,
+                ProcStat {
+                    pids,
+                    catalog_appearances: 1,
+                    dropped_pid_samples: 0,
+                },
+            );
+            agg.retained_pids += MAX_PIDS_PER_PROCESS;
+        }
+        let target_pids = (0..(MAX_PIDS_PER_PROCESS as u32 - 1)).collect();
+        let target_path = "/usr/libexec/bh".to_string();
+        agg.retained_path_bytes += target_path.len();
+        agg.paths.insert(TARGET_UUID.into(), target_path);
+        agg.procs.insert(
+            TARGET_UUID.into(),
+            ProcStat {
+                pids: target_pids,
+                catalog_appearances: 1,
+                dropped_pid_samples: 0,
+            },
         );
+        agg.retained_pids += MAX_PIDS_PER_PROCESS - 1;
+        let singleton_path = "/usr/libexec/singleton".to_string();
+        agg.retained_path_bytes += singleton_path.len();
+        agg.paths.insert(SINGLETON_UUID.into(), singleton_path);
+        agg.procs.insert(
+            SINGLETON_UUID.into(),
+            ProcStat {
+                pids: std::iter::once(7).collect(),
+                catalog_appearances: 1,
+                dropped_pid_samples: 0,
+            },
+        );
+        agg.retained_pids += 1;
+        assert_eq!(agg.retained_pids, MAX_TOTAL_TRACKED_PIDS);
+        assert!(agg.procs[TARGET_UUID].pids.len() < MAX_PIDS_PER_PROCESS);
+
+        agg.consume_tracev3(
+            "Persist/aggregate-cap.tracev3",
+            &catalog_chunk(&[(0, 9_999, 0, 9_999)]),
+        );
+        assert!(!agg.cap_hit);
+        assert!(agg.pid_retention_cap_hit);
+        assert_eq!(agg.dropped_pid_samples, 1);
+        assert_eq!(agg.procs[TARGET_UUID].dropped_pid_samples, 1);
+
+        let mut findings = Findings::new();
+        let summary = agg.finalize(&seeded_db(), &mut findings).unwrap();
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["cap_hit"], false);
+        assert_eq!(summary.details["pid_retention_cap_hit"], true);
+        assert_eq!(summary.details["pid_observations_dropped"], 1);
+        assert_eq!(summary.details["retained_pids"], MAX_TOTAL_TRACKED_PIDS);
+        let hit = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .unwrap();
+        assert_eq!(hit.evidence["process_path"], "/usr/libexec/bh");
+        assert_eq!(hit.evidence["pid_history_truncated"], true);
+        assert_eq!(hit.evidence["retained_pid_count"], MAX_PIDS_PER_PROCESS - 1);
+        assert_eq!(hit.evidence["pid_observations_dropped"], 1);
     }
 
     #[test]

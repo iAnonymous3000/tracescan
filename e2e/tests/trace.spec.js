@@ -303,6 +303,7 @@ test('readable report previews redactions and downloads self-contained HTML', as
     'Example report - no device was scanned.'
   );
   await expect(preview).toContainText(identity.hash);
+  await expect(preview).toContainText('No verdict-relevant scan limit was recorded.');
   await expect(preview).toContainText('redacted from this readable copy');
   await expect(preview).not.toContainText(identity.name);
   await expect(preview).not.toContainText(identity.artifact);
@@ -344,6 +345,7 @@ test('readable report previews redactions and downloads self-contained HTML', as
   expect(html).toContain('not digitally signed');
   expect(html).toContain('redacted from this readable copy');
   expect(html).toContain('This readable HTML is a reduced convenience copy');
+  expect(html).toContain('No verdict-relevant scan limit was recorded.');
   expect(html).toContain('.verification a::after');
   expect(html).toContain('attr(href)');
   expect(html).toContain('<title>Example Trace report -');

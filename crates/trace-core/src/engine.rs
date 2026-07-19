@@ -371,8 +371,9 @@ impl Engine {
             });
         }
 
-        // Any safety limit hit means part of the archive went unanalyzed.
-        // A real sysdiagnose never comes close to these caps.
+        // Any verdict-relevant safety limit means part of the archive went
+        // unanalyzed. Evidence-only sampling is bounded and reported by its
+        // artifact without creating a scan limit.
         let mut scan_limits: Vec<String> = Vec::new();
         if collector.entry_cap_hit {
             scan_limits.push(
@@ -510,7 +511,7 @@ impl Engine {
         }
         if unified_cap_hit {
             scan_limits.push(
-                "The unified log process inventory reached its tracking cap; processes beyond it were not recorded.".into(),
+                "The unified log identity inventory reached its memory safety cap; some process identities or binary paths were not retained.".into(),
             );
         }
         // A checksum failure after valid entries means the archive is
@@ -853,6 +854,44 @@ mod tests {
             matched.indicator.as_ref().unwrap().value,
             "/private/var/tmp/trace-alias"
         );
+    }
+
+    #[test]
+    fn unified_pid_evidence_sampling_does_not_degrade_verdict() {
+        let tracev3 = crate::unified_log::test_pid_retention_cap_tracev3();
+        let uuidtext = crate::unified_log::test_uuidtext("/usr/libexec/safe-process");
+        let uuidtext_path = format!("root/system_logs.logarchive/AA/{}", "A".repeat(30));
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&test_util::entry(
+            "root/system_logs.logarchive/Persist/0000000000000001.tracev3",
+            &tracev3,
+        ));
+        tar.extend_from_slice(&test_util::entry(&uuidtext_path, &uuidtext));
+        let tar = test_util::finish(tar);
+
+        let mut engine = Engine::new();
+        engine.load_stix("pegasus-mini", PEGASUS_MINI).unwrap();
+        engine.push(&tar).unwrap();
+        let report = engine.finish().unwrap();
+
+        assert_eq!(report.verdict, Verdict::Clear);
+        assert!(report.scan_limits.is_empty());
+        assert!(report.assurance.complete);
+        let unified = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "unified_log")
+            .unwrap();
+        assert_eq!(unified.status, "parsed");
+        assert_eq!(unified.details["cap_hit"], false);
+        assert_eq!(unified.details["identity_cap_hit"], false);
+        assert_eq!(unified.details["pid_retention_cap_hit"], true);
+        assert_eq!(unified.details["pid_observations_dropped"], 1);
+        assert!(report
+            .assurance
+            .surfaces
+            .iter()
+            .any(|surface| { surface.kind == "unified_log" && surface.state == "complete" }));
     }
 
     #[test]

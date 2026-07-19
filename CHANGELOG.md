@@ -25,6 +25,16 @@ untagged production builds remain identified by `tool.build_commit`.
   anchors only for absolute HTTPS URLs.
 - Release WASM no longer installs the verbose debug panic hook. Dead crash-kind
   handling, missing-path wording, and binary-size units were also corrected.
+- iOS stack inventories now accept key-consistent signed PIDs and narrowly
+  recognize Apple's exact type-1, five-field, fully terminating anonymous task
+  rows. Those tombstones are counted and surfaced as informational notes but
+  never become IOC candidates or checked-process coverage; arbitrary blank
+  identities, alternate identity fields, malformed notes, and PID mismatches
+  still fail closed.
+- Unified-log PID retention is now reported as bounded evidence sampling, not a
+  lost process identity. UUID/path caps still make a scan inconclusive, while a
+  long-lived binary exceeding the per-process PID sample retains full IOC
+  matching coverage and discloses the dropped sample count.
 
 ## v0.7.4 - 2026-07-17
 

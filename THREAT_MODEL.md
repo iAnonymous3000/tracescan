@@ -126,8 +126,9 @@ questions for an adopting organization.
   re-derive or soften it.
 - A clear verdict requires recognizable evidence, loaded applicable
   indicators, no indicator-match or suspicious finding, no parser degradation,
-  and no resource or integrity limit. Missing surface types remain explicitly
-  absent rather than implicitly examined.
+  and no verdict-relevant resource or integrity limit. Bounded evidence
+  sampling that cannot hide an identity remains separately disclosed. Missing
+  surface types remain explicitly absent rather than implicitly examined.
 - Every archive byte received by the engine contributes to
   `source_file.sha256`; the exact loaded text for each indicator set contributes
   to its `indicator_provenance[].sha256`.
@@ -230,6 +231,14 @@ size declarations cannot trigger LZ4 allocation or retained firehose parsing.
 These catalog checks sit inside the outer archive and retained-member limits
 above.
 
+Unified-log identity and path budgets are verdict-relevant because exhausting
+them can hide a matchable binary. PID retention is different: catalogs can
+legitimately contain thousands of PID observations for one long-lived binary,
+while matching uses its already-retained UUID and canonical path. Per-process
+and aggregate PID sample limits therefore remain bounded and disclosed as
+evidence truncation, but do not set the identity cap or make a complete surface
+inconclusive.
+
 The controls do not prove bounded aggregate CPU use or browser-tab
 responsiveness for every hostile archive. An attacker can still supply many
 individually valid files that consume repeated parser work within the outer
@@ -250,6 +259,16 @@ verdict. `match` and `suspicious` take precedence over incomplete status, while
 a no-finding scan with degradation becomes `inconclusive`. Regression tests and
 property tests cover hostile bytes and vacuous-clear cases, but new parser
 formats remain a continuing false-negative risk.
+
+The observed iOS stackshot format has one narrowly recognized exception: a
+type-1 transition row with the exact five-field task shape, an empty procname,
+at least one thread, and every thread's state containing both `TH_TERMINATE` and
+`TH_TERMINATE2`. Trace discloses that anonymous tombstone as a `note`, never
+uses it as an IOC candidate or checked-process count, and refuses transition-only
+inventories as process-bearing coverage. Alternate identity fields, unknown
+transition types, noncanonical PIDs, and arbitrary blank names remain partial.
+This is a format policy, not proof that a compromised phone reported every
+process truthfully; device-side omission remains the acquisition limit above.
 
 ### Indicator substitution, staleness, and scope
 

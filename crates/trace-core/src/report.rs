@@ -328,9 +328,10 @@ pub struct SurfaceState {
 #[derive(Serialize)]
 pub struct Assurance {
     /// Processing completeness, not surface coverage: true when the input
-    /// was recognizably a sysdiagnose, no safety limit was hit, and every
-    /// parser succeeded fully. A scan can be complete with absent
-    /// surfaces - those are in `surfaces` and `missing_artifacts`.
+    /// was recognizably a sysdiagnose, no verdict-relevant safety limit was
+    /// hit, and every parser succeeded fully. Bounded evidence sampling may
+    /// still be disclosed. A scan can be complete with absent surfaces - those
+    /// are in `surfaces` and `missing_artifacts`.
     pub complete: bool,
     pub surfaces: Vec<SurfaceState>,
     pub surfaces_examined: usize,
@@ -421,9 +422,10 @@ pub struct Report {
     pub missing_artifacts: Vec<MissingArtifact>,
     pub findings: Vec<Finding>,
     pub stats: ScanStats,
-    /// Non-empty when the scan hit a safety limit or a parser failed on
-    /// part of the input, so not everything was analyzed. Any entry here
-    /// forces the verdict away from `Clear`.
+    /// Non-empty when the scan hit a verdict-relevant safety limit or a parser
+    /// failed on part of the input, so not everything was analyzed. Any entry
+    /// here forces the verdict away from `Clear`; evidence-only sampling limits
+    /// are disclosed in artifact details instead.
     pub scan_limits: Vec<String>,
     pub assurance: Assurance,
     pub coverage: Coverage,

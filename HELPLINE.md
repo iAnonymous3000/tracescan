@@ -117,16 +117,31 @@ of the scan was incomplete.
 | --- | --- | --- |
 | `match` | At least one observed process identity, executable basename, or canonical executable path matched a published indicator loaded for this scan. Names use exact, case-sensitive equality. Full file paths use exact, case-sensitive equality after treating Apple's `/var`, `/tmp`, and `/etc` aliases as equivalent to `/private/...`; a trailing-slash directory path matches descendants under the same comparison. Raw observed paths and published IOC values remain unchanged in evidence. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
 | `suspicious` | No published-indicator match was found, but at least one anomaly documented in public spyware research was found. It can have a benign cause and can coexist with an incomplete scan. | Review the evidence in context. Escalate when the person's risk, other observations, or scan limits warrant it. |
-| `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a recorded limit; applicable indicators were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings may remain, and other supported surface types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
-| `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap was hit, the archive was truncated or corrupt, or no applicable indicators were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
+| `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a verdict-relevant limit; applicable indicators were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings and disclosed evidence-sampling limits may remain, and other supported surface types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
+| `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap that could hide detection evidence was hit, the archive was truncated or corrupt, or no applicable indicators were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
 | `invalid` | The input contained none of the supported artifacts needed to recognize it as a sysdiagnose. | Confirm that the correct, unmodified `sysdiagnose_….tar.gz` was selected. Do not describe this as a negative scan. |
 
 `assurance.complete` means that the recognizable input was processed without a
-recorded parser or resource-limit failure. It is a processing statement, not a
-coverage statement. A report can have `assurance.complete: true` while one or
-more entries in `assurance.surfaces` are `absent`. Use
+recorded parser or verdict-relevant resource-limit failure. It is a processing
+statement, not a coverage statement. A report can have
+`assurance.complete: true` while bounded evidence samples were truncated or one
+or more entries in `assurance.surfaces` are `absent`. Use
 `assurance.surfaces`, `missing_artifacts`, and `coverage` to understand what was
 actually available.
+
+For unified logs, `identity_cap_hit` (and its legacy alias `cap_hit`) means a
+matchable UUID or path may have been lost and is verdict-relevant.
+`pid_retention_cap_hit` with `pid_observations_dropped` means only that bounded
+PID evidence samples were shortened after their UUID/path identities were
+retained; it does not by itself make the scan inconclusive.
+
+Stackshot diagnostics can contain an Apple type-1 transition tombstone whose
+process name is empty and whose threads are all terminating. Trace accepts only
+the exact validated tombstone shape, records the count as
+`unidentified_transitional_processes`, and emits a visible informational note;
+it does not invent or IOC-match an identity. Other blank rows remain partial,
+and an inventory containing only transition tombstones cannot satisfy the
+primary process-bearing prerequisite for `clear`.
 
 Finding severities are similarly descriptive:
 

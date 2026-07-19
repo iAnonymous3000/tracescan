@@ -41,8 +41,11 @@ The archive streams through a bounded WASM pipeline: gzip -> tar -> artifact
 parsers. Trace retains only selected artifact files and reduces unified-log
 files to process facts as they pass. Limits cover retained bytes, individual
 files, archive entries, findings, unified-log allocations, and total
-decompressed output. A parser failure, truncated archive, or reached safety cap
-is disclosed as incomplete and can never produce a `clear` verdict.
+decompressed output. A parser failure, truncated archive, or detection-relevant
+identity/path safety cap is disclosed as incomplete and can never produce a
+`clear` verdict. PID history has separate bounded evidence samples: filling one
+does not lose the already-retained UUID/path identity, and the report discloses
+the dropped observations without falsely degrading detection coverage.
 
 The browser keeps file, drop, and demo controls disabled until WASM and every
 bundled indicator floor validate. A worker or streaming read can be cancelled
@@ -60,6 +63,14 @@ they can contribute evidence but never substitute for phone coverage.
 | Supplemental | `logs/ProxiedDevice*/*.ips` | Process identities or inventories from paired-device diagnostic formats that contain them, normally from an Apple Watch. Metadata-only reports provide no process evidence; all paired reports are labeled separately and excluded from phone metadata and phone crash-surface completeness. |
 | Primary | `ps.txt`, `ps_thread.txt` | Processes running at capture time. |
 | Primary | `system_logs.logarchive` tracev3 and uuidtext | Process identities represented in successfully parsed catalog data, resolved to canonical paths through uuidtext. Trace derives no precise log window or event timestamps; messages are never rendered, and each input file is reduced and dropped. |
+
+An Apple stackshot can include a type-1 transition tombstone with an empty
+process name while every retained thread is terminating. Trace recognizes only
+the exact observed row shape, counts it as
+`unidentified_transitional_processes`, and emits an informational note; it is
+never treated as an IOC-checkable process. Arbitrary blank identities remain
+partial, and a transition-only inventory cannot provide process-bearing crash
+coverage.
 
 The rotated iOS 26 shutdown format, including indented client lines and trailing
 binary-UUID path components, was validated against a private iOS 26.5.2

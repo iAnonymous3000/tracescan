@@ -18,13 +18,14 @@ snapshot.
 
 ## Real-capture validation matrix
 
-Privacy-preserving labels distinguish the two private captures without
+Privacy-preserving labels distinguish the three private captures without
 publishing their filenames or device identifiers.
 
 | Corpus | Access | Scanner revision and run date | Recorded result | Current qualification |
 |---|---|---|---|---|
 | Private capture A, iOS 26.5.2 | Maintainer only | v0.7.3, `c685cf6`, 2026-07-13 | 64 tracev3 files, 2,656 catalogs, 689 uuidtext files, and 617 of 617 process paths resolved; no match or suspicious finding | Historical v0.7.3 receipt; not an independently reproducible or population-level false-positive study |
 | Private capture B, iOS 26.5.2 (23F84) | Maintainer only | v0.7.4 candidate beginning at `8ff0208`, 2026-07-17 | 62 tracev3 files, 4,402 catalogs, 754 uuidtext files, and 623 of 623 process paths resolved; all four primary surfaces complete, no scan limits, verdict `clear`, and no match or suspicious finding | Pre-final candidate receipt for one clean OS build, not an exact final-tree release gate; private bytes prevent independent reproduction |
+| Private capture C, iOS 18.7.9 (22H355) | Maintainer only | Unreleased fix tree based on `9c41718`, 2026-07-19 | Two stacks inventories accepted the observed signed-PID and exact terminating-transition variants; 63 tracev3 files, 2,847 catalogs, and 598 uuidtext files parsed with zero failures; 499 of 499 process paths resolved; 11,465 PID samples retained and 11,272 observations dropped under the disclosed evidence-only sampling cap; all four primary surfaces complete, no scan limits, one informational transition-tombstone note, verdict `clear`, and no match or suspicious finding | Compatibility receipt for one clean OS build and an untagged tree; private bytes prevent independent reproduction or independent archive-integrity review |
 | EC-DIGIT-CSIRC iOS 15 capture | Public, hash-pinned below | v0.7.4 release-candidate tree based on `8ff0208`, 2026-07-17 | All supported artifacts parsed; 27 tracev3 files, 659 catalogs, and 426 uuidtext files parsed with zero failures; 341 of 341 process paths resolved; all eight sets loaded at 2,887/148; no scan limits, verdict `clear`, and no match or suspicious finding | Current public compatibility receipt; input bytes are independently obtainable and hash-pinned |
 
 The private harness reads one archive only from the explicit
@@ -45,9 +46,9 @@ the archive is truthful or representative.
 | Surface | Automated evidence |
 |---|---|
 | Archive streaming | Property tests over arbitrary bytes and chunking; unit tests for single and concatenated gzip members, tar streaming, PAX and GNU long names, canonical and undecodable paths, checksums, metadata ambiguity, truncation, end markers, retained-file limits, entry limits, and decompression limits |
-| Unified logs | Unit tests for tracev3 framing, catalog-only parser isolation under hostile chunkset size declarations, catalog-count consistency, uuidtext structure and conflicts, canonical path resolution, unresolved processes, per-process and aggregate retention caps, and fail-closed partial status |
+| Unified logs | Unit tests for tracev3 framing, catalog-only parser isolation under hostile chunkset size declarations, catalog-count consistency, uuidtext structure and conflicts, canonical path resolution, unresolved processes, detection-relevant identity/path caps, and separately disclosed per-process and aggregate PID-evidence sampling while UUID/path IOC matching remains active; an engine-level regression requires PID-only sample saturation to remain complete and `clear` |
 | Shutdown logs | Classic one-line and iOS 26 rotated/header-plus-client parsing; reboot-block boundaries; malformed delay blocks; binary-UUID suffix stripping; direct-child versus nested staging-path heuristics |
-| Crash and diagnostic `.ips` | Ordinary crash reports, kernel panics, disk-write diagnostics, Jetsam, stacks, forceReset, Siri feedback, ResetCounter, security analytics (`bug_type` 226), CPU resource (`202`), and proactive event tracker (`303`), including malformed rows, schema drift, and the fail-closed 10,000-candidate cap |
+| Crash and diagnostic `.ips` | Ordinary crash reports, kernel panics, disk-write diagnostics, Jetsam, stacks, forceReset, Siri feedback, ResetCounter, security analytics (`bug_type` 226), CPU resource (`202`), and proactive event tracker (`303`), including signed stack PIDs, the exact type-1 terminating tombstone policy, malformed/alternate rows, schema drift, and the fail-closed 10,000-candidate cap |
 | Process listings | Real-format `ps.txt` and `ps_thread.txt`; commands containing spaces; wide and overflowing numeric columns; thread continuations; full-path command columns; iOS 26 `?` process state; malformed rows; valid header-only auxiliary listings |
 | STIX extraction and matching | Fully anchored single-equality parsing; rejection of compound, qualified, malformed, and non-STIX patterns; exact case-sensitive names and alias-equivalent canonical paths; `/var`, `/tmp`, and `/etc` compatibility aliases; directory-prefix indicators; non-applicable relative, dot-segment, and slash-bearing name indicators; per-set duplicate-value reduction; exact reviewed manifest counts and one malware object per snapshot; hostile JSON properties |
 | Verdict and report | Fail-closed invalid/inconclusive paths, anchored primary-phone surface classification, severity- and indicator-diversity-aware findings retention, process-bearing versus metadata-only surface accounting, producer parity, schema version 3 validation, engine-measured archive size, archive and indicator hashing, and golden field shape |
@@ -132,11 +133,11 @@ have checked those values merely because they were loaded.
 
 ## What has not been validated
 
-- **No broad false-positive study.** Two private iOS 26.5.2 captures, one public
-  iOS 15 capture, and synthetic fixtures cannot estimate a false-positive rate
+- **No broad false-positive study.** Two private iOS 26.5.2 captures, one private
+  iOS 18.7.9 capture, one public iOS 15 capture, and synthetic fixtures cannot estimate a false-positive rate
   across devices, regions, configurations, and iOS versions.
 - **No real infected-device ground truth.** No infected sysdiagnose is included
-  in or linked from this validation corpus as of 2026-07-17. Kaspersky published
+  in or linked from this validation corpus as of 2026-07-19. Kaspersky published
   iShutdown patterns rather than a raw infected sysdiagnose; MVT's published
   test artifacts and the EC-DIGIT-CSIRC capture do not provide infected-device
   ground truth. The demo is synthetic from published patterns and a real

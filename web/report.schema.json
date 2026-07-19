@@ -406,7 +406,7 @@
       "properties": {
         "complete": {
           "type": "boolean",
-          "description": "Processing completeness, not comprehensive surface coverage: true when the input was recognizably a sysdiagnose, no safety limit was hit, and every parser that ran succeeded fully. A scan can be complete while primary surfaces are absent; absence is reported in surfaces[] and missing_artifacts. A no-match scan with no primary process-bearing phone surface is inconclusive rather than clear."
+          "description": "Processing completeness, not comprehensive surface coverage: true when the input was recognizably a sysdiagnose, no verdict-relevant safety limit was hit, and every parser that ran succeeded fully. Bounded evidence sampling may still be disclosed. A scan can be complete while primary surfaces are absent; absence is reported in surfaces[] and missing_artifacts. A no-match scan with no primary process-bearing phone surface is inconclusive rather than clear."
         },
         "surfaces": {
           "type": "array",

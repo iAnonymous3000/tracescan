@@ -48,6 +48,54 @@ fn valid_process_name(name: &str) -> bool {
     !name.is_empty() && name == name.trim() && !name.contains('/')
 }
 
+/// Stackshots can retain a task while it is terminating but omit its process
+/// name. Apple explains that exact condition in the report notes. Accept only
+/// the canonical, fully consumed note shape so an arbitrary blank process name
+/// does not become a silently ignored inventory row.
+fn transition_note_pid(note: &str) -> Option<i64> {
+    let rest = note.strip_prefix("Process ")?;
+    let (pid_text, transition_text) = rest.split_once(" is in transition type ")?;
+    let pid = pid_text.parse::<i64>().ok()?;
+    let transition = transition_text.parse::<u64>().ok()?;
+    (pid.to_string() == pid_text && transition == 1 && transition.to_string() == transition_text)
+        .then_some(pid)
+}
+
+/// A transition note is corroborating metadata, not enough by itself. The
+/// anonymous row must also contain at least one thread and every thread must be
+/// explicitly in both terminating states observed in Apple's stackshot format.
+fn is_terminating_transition(entry: &Value) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    const FIELDS: [&str; 5] = [
+        "pid",
+        "procname",
+        "threadById",
+        "userTimeTask",
+        "systemTimeTask",
+    ];
+    if object.len() != FIELDS.len()
+        || !FIELDS.iter().all(|field| object.contains_key(*field))
+        || object.get("procname").and_then(Value::as_str) != Some("")
+        || !object.get("userTimeTask").is_some_and(Value::is_number)
+        || !object.get("systemTimeTask").is_some_and(Value::is_number)
+    {
+        return false;
+    }
+    let Some(threads) = object.get("threadById").and_then(Value::as_object) else {
+        return false;
+    };
+    !threads.is_empty()
+        && threads.values().all(|thread| {
+            let Some(states) = thread.get("state").and_then(Value::as_array) else {
+                return false;
+            };
+            let has = |expected: &str| states.iter().any(|state| state.as_str() == Some(expected));
+            has("TH_TERMINATE") && has("TH_TERMINATE2")
+        })
+}
+
 fn panic_pid_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\bpid (\d+)[:\s]+\(?([A-Za-z0-9_.-]+)\)?").unwrap())
@@ -138,7 +186,7 @@ pub fn analyze(
 
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     let mut candidate_sources: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
-    let mut candidate_pids: BTreeMap<String, u64> = BTreeMap::new();
+    let mut candidate_pids: BTreeMap<String, Value> = BTreeMap::new();
     let mut candidate_cap_hit = false;
     let mut proc_path: Option<String> = None;
     let mut proc_name: Option<String> = None;
@@ -150,6 +198,7 @@ pub fn analyze(
     let mut special_complete = false;
     let mut processes_seen = 0usize;
     let mut skipped_processes = 0usize;
+    let mut transitional_processes = 0usize;
     let mut detection_relevant = true;
     let paired_device = is_paired_device_path(path);
     let mut header_process_names = BTreeSet::new();
@@ -311,24 +360,47 @@ pub fn analyze(
                 .and_then(|b| b.get("processByPid"))
                 .and_then(Value::as_object)
             {
+                let transition_pids: BTreeSet<i64> = if kind == "288" {
+                    body.as_ref()
+                        .and_then(|b| b.get("notes"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter_map(transition_note_pid)
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
                 for (pid_key, entry) in inventory {
-                    let Some(key_pid) = pid_key.parse::<u64>().ok() else {
+                    let Some(key_pid) = pid_key.parse::<i64>().ok() else {
                         skipped_processes += 1;
                         continue;
                     };
-                    let Some(pid) = entry.get("pid").and_then(Value::as_u64) else {
+                    let Some(pid) = entry.get("pid").and_then(Value::as_i64) else {
                         skipped_processes += 1;
                         continue;
                     };
-                    let Some(name) = entry
-                        .get("procname")
-                        .and_then(Value::as_str)
-                        .filter(|name| valid_process_name(name))
-                    else {
+                    if pid != key_pid || pid_key != &pid.to_string() || (kind != "288" && pid < 0) {
+                        skipped_processes += 1;
+                        continue;
+                    }
+                    let Some(name) = entry.get("procname").and_then(Value::as_str) else {
                         skipped_processes += 1;
                         continue;
                     };
-                    if pid != key_pid {
+                    if name.is_empty()
+                        && kind == "288"
+                        && transition_pids.contains(&pid)
+                        && is_terminating_transition(entry)
+                    {
+                        // This is a structurally understood tombstone, not a
+                        // process identity. It is disclosed separately and
+                        // never becomes an IOC candidate or checked process.
+                        transitional_processes += 1;
+                        continue;
+                    }
+                    if !valid_process_name(name) {
                         skipped_processes += 1;
                         continue;
                     }
@@ -341,13 +413,15 @@ pub fn analyze(
                         "processByPid.procname",
                     );
                     if retained {
-                        candidate_pids.entry(name).or_insert(pid);
+                        candidate_pids
+                            .entry(name)
+                            .or_insert_with(|| Value::from(pid));
                         processes_seen += 1;
                     } else {
                         skipped_processes += 1;
                     }
                 }
-                special_complete = !inventory.is_empty() && skipped_processes == 0;
+                special_complete = processes_seen > 0 && skipped_processes == 0;
             }
         }
         Some("298") => {
@@ -388,7 +462,9 @@ pub fn analyze(
                         "processes.name",
                     );
                     if retained {
-                        candidate_pids.entry(name).or_insert(pid);
+                        candidate_pids
+                            .entry(name)
+                            .or_insert_with(|| Value::from(pid));
                         processes_seen += 1;
                     } else {
                         skipped_processes += 1;
@@ -844,6 +920,26 @@ pub fn analyze(
         }
     }
 
+    if transitional_processes > 0 {
+        let label = if transitional_processes == 1 {
+            "task"
+        } else {
+            "tasks"
+        };
+        findings.push(Finding::heuristic(
+            Severity::Note,
+            path,
+            format!(
+                "{transitional_processes} terminating stackshot {label} omitted its process name; Trace recognized the exact transition-tombstone shape and did not treat it as an IOC-checkable identity"
+            ),
+            json!({
+                "format": format,
+                "unidentified_transitional_processes": transitional_processes,
+                "paired_device": paired_device,
+            }),
+        ));
+    }
+
     // Same yardstick as the ps and shutdown.log surfaces.
     let process_location = if paired_device {
         "The paired-device crashing process ran from"
@@ -892,6 +988,7 @@ pub fn analyze(
                 "format": format,
                 "processes": processes_seen,
                 "skipped_processes": skipped_processes,
+                "unidentified_transitional_processes": transitional_processes,
                 "candidate_cap": MAX_CRASH_CANDIDATES,
                 "candidate_cap_hit": candidate_cap_hit,
                 "detection_relevant": detection_relevant,
@@ -1552,6 +1649,192 @@ not json"#;
     }
 
     #[test]
+    fn stacks_signed_pid_is_checked_and_preserved_in_evidence() {
+        let sample = r#"{"bug_type":"288"}
+{"bug_type":"288","processByPid":{"-21242":{"pid":-21242,"procname":"bh"}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["processes"], 1);
+        assert_eq!(summary.details["skipped_processes"], 0);
+        let hit = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Match)
+            .unwrap();
+        assert_eq!(hit.evidence["pid"], -21242);
+    }
+
+    #[test]
+    fn stacks_terminating_transition_tombstone_is_understood_not_matched() {
+        let sample = r#"{"bug_type":"288"}
+{"bug_type":"288","notes":["Process 169 is in transition type 1"],"processByPid":{"169":{"pid":169,"procname":"","threadById":{"630105":{"state":["TH_WAIT","TH_UNINT","TH_TERMINATE","TH_TERMINATE2"]}},"userTimeTask":0.7,"systemTimeTask":0},"2143":{"pid":2143,"procname":"bh"}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["processes"], 1);
+        assert_eq!(summary.details["unidentified_transitional_processes"], 1);
+        assert_eq!(summary.details["skipped_processes"], 0);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Match)
+                .count(),
+            1
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::Note && finding.summary.contains("transition-tombstone")
+        }));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.evidence["process"] != ""));
+    }
+
+    #[test]
+    fn stacks_blank_process_requires_exact_terminating_transition_evidence() {
+        for (label, note, states) in [
+            (
+                "missing note",
+                "unrelated",
+                vec!["TH_TERMINATE", "TH_TERMINATE2"],
+            ),
+            (
+                "wrong pid",
+                "Process 170 is in transition type 1",
+                vec!["TH_TERMINATE", "TH_TERMINATE2"],
+            ),
+            (
+                "trailing note text",
+                "Process 169 is in transition type 1 ignored",
+                vec!["TH_TERMINATE", "TH_TERMINATE2"],
+            ),
+            (
+                "not fully terminating",
+                "Process 169 is in transition type 1",
+                vec!["TH_WAIT", "TH_TERMINATE"],
+            ),
+            (
+                "unsupported transition type",
+                "Process 169 is in transition type 2",
+                vec!["TH_TERMINATE", "TH_TERMINATE2"],
+            ),
+        ] {
+            let body = json!({
+                "bug_type": "288",
+                "notes": [note],
+                "processByPid": {
+                    "169": {
+                        "pid": 169,
+                        "procname": "",
+                        "threadById": {"1": {"state": states}},
+                        "userTimeTask": 0.7,
+                        "systemTimeTask": 0,
+                    },
+                },
+            });
+            let sample = format!("{{\"bug_type\":\"288\"}}\n{body}");
+            let mut findings = Findings::new();
+            let (summary, _) = analyze(
+                "root/crashes_and_spins/stacks-2026.ips",
+                &sample,
+                &IocDb::new(),
+                &mut findings,
+            );
+            assert_eq!(summary.status, "parsed_partial", "{label}");
+            assert_eq!(summary.details["processes"], 0, "{label}");
+            assert_eq!(
+                summary.details["unidentified_transitional_processes"], 0,
+                "{label}"
+            );
+            assert_eq!(summary.details["skipped_processes"], 1, "{label}");
+            assert!(findings.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn stacks_transition_tombstone_rejects_alternate_identity_fields() {
+        let sample = r#"{"bug_type":"288"}
+{"bug_type":"288","notes":["Process 169 is in transition type 1"],"processByPid":{"169":{"pid":169,"procname":"","procPath":"/private/var/tmp/bh","threadById":{"1":{"state":["TH_TERMINATE","TH_TERMINATE2"]}},"userTimeTask":0.7,"systemTimeTask":0},"1":{"pid":1,"procname":"launchd"}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 1);
+        assert_eq!(summary.details["unidentified_transitional_processes"], 0);
+        assert_eq!(summary.details["skipped_processes"], 1);
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Match));
+    }
+
+    #[test]
+    fn stacks_transition_tombstone_requires_every_thread_to_be_terminating() {
+        let body = json!({
+            "bug_type": "288",
+            "notes": ["Process 169 is in transition type 1"],
+            "processByPid": {
+                "169": {
+                    "pid": 169,
+                    "procname": "",
+                    "threadById": {
+                        "1": {"state": ["TH_TERMINATE", "TH_TERMINATE2"]},
+                        "2": {"state": ["TH_WAIT", "TH_TERMINATE"]},
+                    },
+                    "userTimeTask": 0.7,
+                    "systemTimeTask": 0,
+                },
+            },
+        });
+        let sample = format!("{{\"bug_type\":\"288\"}}\n{body}");
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            &sample,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 0);
+        assert_eq!(summary.details["unidentified_transitional_processes"], 0);
+        assert_eq!(summary.details["skipped_processes"], 1);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn stacks_transition_only_inventory_does_not_supply_process_coverage() {
+        let sample = r#"{"bug_type":"288","timestamp":"2026-07-19 10:51:13.00 -0400"}
+{"bug_type":"288","notes":["Process 169 is in transition type 1"],"processByPid":{"169":{"pid":169,"procname":"","threadById":{"1":{"state":["TH_TERMINATE","TH_TERMINATE2"]}},"userTimeTask":0.7,"systemTimeTask":0}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 0);
+        assert_eq!(summary.details["unidentified_transitional_processes"], 1);
+        assert_eq!(summary.details["skipped_processes"], 0);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings.iter().next().unwrap().severity, Severity::Note);
+    }
+
+    #[test]
     fn stacks_pid_mismatch_is_partial() {
         let sample = r#"{"bug_type":"288"}
 {"bug_type":"288","processByPid":{"1":{"pid":1,"procname":"launchd"},"2143":{"pid":99,"procname":"bh"}}}"#;
@@ -1564,6 +1847,72 @@ not json"#;
         );
         assert_eq!(summary.status, "parsed_partial");
         assert_eq!(summary.details["processes"], 1);
+        assert_eq!(summary.details["skipped_processes"], 1);
+        assert!(!findings.iter().any(|f| f.severity == Severity::Match));
+    }
+
+    #[test]
+    fn stacks_signed_pid_mismatch_is_partial() {
+        let sample = r#"{"bug_type":"288"}
+{"bug_type":"288","processByPid":{"-21242":{"pid":21242,"procname":"bh"}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 0);
+        assert_eq!(summary.details["skipped_processes"], 1);
+        assert!(!findings.iter().any(|f| f.severity == Severity::Match));
+    }
+
+    #[test]
+    fn stacks_noncanonical_or_out_of_range_pid_is_partial() {
+        for (label, key, pid) in [
+            ("leading plus", "+1", json!(1)),
+            ("leading zero", "01", json!(1)),
+            ("negative zero", "-0", json!(0)),
+            (
+                "above signed range",
+                "9223372036854775808",
+                json!(u64::MAX / 2 + 1),
+            ),
+        ] {
+            let mut inventory = serde_json::Map::new();
+            inventory.insert(key.into(), json!({"pid": pid, "procname": "bh"}));
+            let sample = format!(
+                "{{\"bug_type\":\"288\"}}\n{}",
+                json!({"bug_type": "288", "processByPid": inventory})
+            );
+            let mut findings = Findings::new();
+            let (summary, _) = analyze(
+                "root/crashes_and_spins/stacks-2026.ips",
+                &sample,
+                &db_with_bh(),
+                &mut findings,
+            );
+            assert_eq!(summary.status, "parsed_partial", "{label}");
+            assert_eq!(summary.details["processes"], 0, "{label}");
+            assert_eq!(summary.details["skipped_processes"], 1, "{label}");
+            assert!(!findings.iter().any(|f| f.severity == Severity::Match));
+        }
+    }
+
+    #[test]
+    fn force_reset_does_not_inherit_signed_stack_pid_compatibility() {
+        let sample = r#"{"bug_type":"151"}
+{"bug_type":"151","processByPid":{"-1":{"pid":-1,"procname":"bh"}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/forceReset-full-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+        assert_eq!(summary.status, "parsed_partial");
+        assert_eq!(summary.details["processes"], 0);
         assert_eq!(summary.details["skipped_processes"], 1);
         assert!(!findings.iter().any(|f| f.severity == Severity::Match));
     }
