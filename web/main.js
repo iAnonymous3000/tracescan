@@ -11,6 +11,8 @@ import {
 } from './report-validator.js';
 
 const $ = (sel) => document.querySelector(sel);
+const observedInstallingWorkers = new WeakSet();
+const observedServiceWorkerRegistrations = new WeakSet();
 
 const state = {
   stix: [],          // { name, source, url, text, loaded_from, date, stats }
@@ -25,6 +27,8 @@ const state = {
   lastScanVia: null, // 'worker' | 'inline'
   scanning: false,   // a scan is in flight; new files are ignored until done
   demoLoading: false,
+  serviceWorkerRegistration: null,
+  waitingWorker: null, // a complete newer release waiting for every old client to close
   activeScan: null,
   scanIntent: 0,
 };
@@ -128,11 +132,83 @@ function showSection(name) {
 }
 
 function updateLandingControls() {
-  const enabled = state.indicatorsReady && !state.scanning && !state.demoLoading;
+  const enabled = state.indicatorsReady && !state.scanning && !state.demoLoading
+    && !state.waitingWorker;
   $('#file-input').disabled = !enabled;
   $('#demo-clean').disabled = !enabled;
   $('#demo-infected').disabled = !enabled;
   $('#dropzone').setAttribute('aria-disabled', String(!enabled));
+  refreshUpdateNotice();
+}
+
+function refreshUpdateNotice() {
+  const notice = $('#update-notice');
+  if (!notice) return;
+  if (!state.waitingWorker) {
+    notice.hidden = true;
+    $('#update-announcer').textContent = '';
+    return;
+  }
+  notice.hidden = false;
+  const common = ' Close every Trace tab and window, then reopen Trace. Reloading this tab alone may leave the older release active.';
+  if (state.scanning || state.demoLoading) {
+    $('#update-message').textContent =
+      `This scan will finish with the currently loaded release. After it finishes, save any report you need.${common}`;
+  } else if (state.lastReport) {
+    $('#update-message').textContent =
+      `Save this result if you need it; results exist only in this tab.${common} Do that before scanning another file.`;
+  } else {
+    $('#update-message').textContent =
+      `Reopen Trace before scanning so the page, scanner, indicators, and offline cache all come from one release.${common}`;
+  }
+}
+
+function markWaitingRelease(worker) {
+  // On a first-ever visit there is no older controlled page to update. The
+  // initial worker activates normally, so presenting an update warning would
+  // be both wrong and needlessly disable scanning.
+  if (!navigator.serviceWorker?.controller || !worker) return;
+  const firstAnnouncement = !state.waitingWorker;
+  state.waitingWorker = worker;
+  updateLandingControls();
+  if (firstAnnouncement) {
+    $('#update-announcer').textContent =
+      'A newer Trace release is ready. New scans are disabled. Finish or save current work, close every Trace tab and window, then reopen Trace.';
+  }
+}
+
+function observeInstallingRelease(registration, installing) {
+  if (!installing || observedInstallingWorkers.has(installing)) return;
+  observedInstallingWorkers.add(installing);
+  const onStateChange = () => {
+    if (installing.state === 'installed') {
+      markWaitingRelease(registration.waiting || installing);
+    } else if (installing.state === 'redundant' && state.waitingWorker === installing) {
+      state.waitingWorker = null;
+      updateLandingControls();
+    }
+  };
+  installing.addEventListener('statechange', onStateChange);
+  // register() can resolve while an update is already installing. Observe its
+  // current state as well as later transitions so that race cannot be missed.
+  onStateChange();
+}
+
+function observeServiceWorkerRegistration(registration) {
+  state.serviceWorkerRegistration = registration;
+  if (registration.waiting) markWaitingRelease(registration.waiting);
+  observeInstallingRelease(registration, registration.installing);
+  if (observedServiceWorkerRegistrations.has(registration)) return;
+  observedServiceWorkerRegistrations.add(registration);
+  registration.addEventListener('updatefound', () => {
+    observeInstallingRelease(registration, registration.installing);
+  });
+}
+
+function requestServiceWorkerUpdate() {
+  const registration = state.serviceWorkerRegistration;
+  if (!navigator.onLine || typeof registration?.update !== 'function') return;
+  registration.update().catch(() => { /* advisory while online; scanning remains local */ });
 }
 
 function setScannerStatus(kind, message) {
@@ -179,7 +255,7 @@ function backToLanding() {
   if (state.indicatorsReady) {
     setScannerStatus('ready', 'Scanner ready. Bundled, reviewed indicators passed their integrity checks.');
   }
-  $('#dropzone').focus();
+  (state.waitingWorker ? $('#update-notice') : $('#dropzone')).focus();
 }
 
 /* ---------- indicator loading ---------- */
@@ -668,6 +744,14 @@ function cancelCurrentScan() {
 async function handleFile(file, context = {}, intent = null) {
   const resolvedIntent = intent ?? ++state.scanIntent;
   if (resolvedIntent !== state.scanIntent) return;
+  // A completed newer release means this page is knowingly stale. Never start
+  // another scan under it: all Trace clients must close so the already-cached
+  // release can activate as one page/worker/WASM/indicator generation.
+  if (state.waitingWorker) {
+    refreshUpdateNotice();
+    $('#update-notice').focus();
+    return;
+  }
   // One scan at a time: a second file racing the first (double-clicked
   // demo button, scripted calls) must not interleave results.
   if (state.scanning) return;
@@ -724,7 +808,7 @@ async function handleFile(file, context = {}, intent = null) {
       setScanPhase('reading', file, control);
       report = await scanInline(file, expectedSets, control);
     }
-    // Schema v3: the report arrives complete from Rust - no fields are
+    // Schema v4: the report arrives complete from Rust - no fields are
     // appended here. What the UI renders is exactly what exports.
     renderReport(report, { example: context.example === true });
   } catch (err) {
@@ -743,7 +827,7 @@ async function handleFile(file, context = {}, intent = null) {
         'ready',
         'Scan canceled. No report was created. Scanner ready with bundled, reviewed indicators.'
       );
-      $('#dropzone').focus();
+      (state.waitingWorker ? $('#update-notice') : $('#dropzone')).focus();
     }
   }
 }
@@ -1192,7 +1276,7 @@ function wireUi() {
     // Native dialogs make the page inert, but a bubbled drop still reaches
     // this document listener. Ignore it: starting a hidden background scan
     // beneath a report preview can bind the person's handoff to the wrong file.
-    if (file && state.indicatorsReady && !state.scanning
+    if (file && state.indicatorsReady && !state.scanning && !state.waitingWorker
         && $('#scanning').hidden && !$('dialog[open]')) {
       handleFile(file);
     }
@@ -1221,7 +1305,7 @@ function wireUi() {
   // Loading a demonstration and scanning a real file are separate intents.
   // A delayed demo response must never replace a later real-file result.
   const demo = (path, name) => async () => {
-    if (!state.indicatorsReady || state.scanning || state.demoLoading) return;
+    if (!state.indicatorsReady || state.scanning || state.demoLoading || state.waitingWorker) return;
     const intent = ++state.scanIntent;
     state.demoLoading = true;
     setScannerStatus('preparing', 'Loading the synthetic example archive…');
@@ -1255,8 +1339,14 @@ function wireUi() {
   $('#demo-infected').addEventListener('click',
     demo('./fixtures/sysdiagnose_demo_infected.tar.gz', 'sysdiagnose_demo_infected.tar.gz'));
 
-  window.addEventListener('online', setOnlineState);
+  window.addEventListener('online', () => {
+    setOnlineState();
+    requestServiceWorkerUpdate();
+  });
   window.addEventListener('offline', setOnlineState);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestServiceWorkerUpdate();
+  });
   setOnlineState();
 }
 
@@ -1268,11 +1358,20 @@ async function boot() {
   // and successful scanner initialization do not prove that a reload can work
   // offline; only a ready service worker establishes that separate state.
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js')
-      .then(() => navigator.serviceWorker.ready)
-      .then(() => {
+    // ready resolves immediately for an existing active registration, even if
+    // register() is still performing a network update check. Inspect that
+    // registration first so an already-waiting release can never leave a brief
+    // window in which stale scan controls become enabled.
+    navigator.serviceWorker.ready
+      .then((registration) => {
+        observeServiceWorkerRegistration(registration);
         state.cacheReady = true;
         setOnlineState();
+      })
+      .catch(() => { /* cache readiness is useful but non-fatal */ });
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+      .then((registration) => {
+        observeServiceWorkerRegistration(registration);
       })
       .catch(() => { /* cache readiness is useful but non-fatal */ });
   }
@@ -1319,6 +1418,7 @@ window.__trace = {
   get ready() { return state.indicatorsReady; },
   get freshnessReady() { return state.freshnessReady; },
   get cacheReady() { return state.cacheReady; },
+  get updateReady() { return Boolean(state.waitingWorker); },
   renderReport,
   // For producer-parity tests: forces the inline path, exactly what a
   // browser without worker support gets.

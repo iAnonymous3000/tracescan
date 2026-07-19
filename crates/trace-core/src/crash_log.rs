@@ -926,11 +926,16 @@ pub fn analyze(
         } else {
             "tasks"
         };
+        let omitted_identity = if transitional_processes == 1 {
+            "its process name"
+        } else {
+            "their process names"
+        };
         findings.push(Finding::heuristic(
             Severity::Note,
             path,
             format!(
-                "{transitional_processes} terminating stackshot {label} omitted its process name; Trace recognized the exact transition-tombstone shape and did not treat it as an IOC-checkable identity"
+                "{transitional_processes} terminating stackshot {label} omitted {omitted_identity}; Trace recognized the exact transition-tombstone shape and did not treat it as an IOC-checkable identity"
             ),
             json!({
                 "format": format,
@@ -1717,9 +1722,37 @@ not json"#;
         assert!(findings.iter().any(|finding| {
             finding.severity == Severity::Note && finding.summary.contains("transition-tombstone")
         }));
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::Note
+                && finding
+                    .summary
+                    .starts_with("1 terminating stackshot task omitted its process name;")
+        }));
         assert!(findings
             .iter()
             .all(|finding| finding.evidence["process"] != ""));
+    }
+
+    #[test]
+    fn stacks_multiple_transition_tombstones_use_plural_wording() {
+        let sample = r#"{"bug_type":"288"}
+{"bug_type":"288","notes":["Process 169 is in transition type 1","Process 170 is in transition type 1"],"processByPid":{"1":{"pid":1,"procname":"launchd"},"169":{"pid":169,"procname":"","threadById":{"630105":{"state":["TH_WAIT","TH_UNINT","TH_TERMINATE","TH_TERMINATE2"]}},"userTimeTask":0.7,"systemTimeTask":0},"170":{"pid":170,"procname":"","threadById":{"630106":{"state":["TH_WAIT","TH_UNINT","TH_TERMINATE","TH_TERMINATE2"]}},"userTimeTask":0.8,"systemTimeTask":0}}}"#;
+        let mut findings = Findings::new();
+        let (summary, _) = analyze(
+            "root/crashes_and_spins/stacks-2026.ips",
+            sample,
+            &db_with_bh(),
+            &mut findings,
+        );
+
+        assert_eq!(summary.status, "parsed");
+        assert_eq!(summary.details["unidentified_transitional_processes"], 2);
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::Note
+                && finding
+                    .summary
+                    .starts_with("2 terminating stackshot tasks omitted their process names;")
+        }));
     }
 
     #[test]

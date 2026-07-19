@@ -2194,12 +2194,263 @@ test.describe('worker failure boundaries', () => {
 
 });
 
+test('a waiting release is announced and blocks new scans without activating itself', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'service-worker lifecycle mocks are exercised once in Chromium');
+  await page.addInitScript(() => {
+    const waiting = new EventTarget();
+    waiting.state = 'installed';
+    waiting.postMessage = (message) => { waiting.messages.push(message); };
+    waiting.messages = [];
+    const registration = new EventTarget();
+    registration.waiting = waiting;
+    registration.installing = null;
+    registration.updateCalls = 0;
+    registration.update = async () => {
+      registration.updateCalls += 1;
+      return registration;
+    };
+    const serviceWorker = new EventTarget();
+    serviceWorker.controller = { scriptURL: 'https://example.invalid/trace-old/sw.js' };
+    serviceWorker.ready = Promise.resolve(registration);
+    serviceWorker.register = async (url, options) => {
+      registration.registerArgs = { url, options };
+      return registration;
+    };
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: serviceWorker,
+    });
+    window.__traceServiceWorkerMock = { registration, serviceWorker, waiting };
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await expect(page.locator('#update-notice')).toBeVisible();
+  await expect(page.locator('#update-message')).toContainText('Close every Trace tab and window');
+  await expect(page.locator('#update-message')).toContainText('Reloading this tab alone');
+  await expect(page.locator('#update-announcer')).toContainText('New scans are disabled');
+  await expect(page.locator('#file-input')).toBeDisabled();
+  await expect(page.locator('#demo-clean')).toBeDisabled();
+
+  const lifecycle = await page.evaluate(() => ({
+    registerArgs: window.__traceServiceWorkerMock.registration.registerArgs,
+    updateReady: window.__trace.updateReady,
+    messages: window.__traceServiceWorkerMock.waiting.messages,
+  }));
+  expect(lifecycle.registerArgs).toEqual({
+    url: './sw.js',
+    options: { updateViaCache: 'none' },
+  });
+  expect(lifecycle.updateReady).toBe(true);
+  expect(lifecycle.messages).toEqual([]);
+});
+
+test('an existing waiting release wins the race with a delayed register check', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'service-worker lifecycle mocks are exercised once in Chromium');
+  await page.addInitScript(() => {
+    const waiting = new EventTarget();
+    waiting.state = 'installed';
+    const registration = new EventTarget();
+    registration.waiting = waiting;
+    registration.installing = null;
+    registration.update = async () => registration;
+    const serviceWorker = new EventTarget();
+    serviceWorker.controller = { scriptURL: 'https://example.invalid/trace-old/sw.js' };
+    serviceWorker.ready = Promise.resolve(registration);
+    serviceWorker.register = () => new Promise(() => {});
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: serviceWorker,
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await expect(page.locator('#update-notice')).toBeVisible();
+  await expect(page.locator('#file-input')).toBeDisabled();
+  expect(await page.evaluate(() => window.__trace.updateReady)).toBe(true);
+});
+
+test('an update already installing when registration resolves is still observed', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'service-worker lifecycle mocks are exercised once in Chromium');
+  await page.addInitScript(() => {
+    const installing = new EventTarget();
+    installing.state = 'installing';
+    const registration = new EventTarget();
+    registration.waiting = null;
+    registration.installing = installing;
+    registration.update = async () => registration;
+    const serviceWorker = new EventTarget();
+    serviceWorker.controller = { scriptURL: 'https://example.invalid/trace-old/sw.js' };
+    serviceWorker.ready = Promise.resolve(registration);
+    serviceWorker.register = async () => registration;
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: serviceWorker,
+    });
+    window.__traceServiceWorkerMock = { installing, registration };
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await page.evaluate(() => {
+    const { installing, registration } = window.__traceServiceWorkerMock;
+    installing.state = 'installed';
+    registration.waiting = installing;
+    installing.dispatchEvent(new Event('statechange'));
+  });
+  await expect(page.locator('#update-notice')).toBeVisible();
+  await expect(page.locator('#file-input')).toBeDisabled();
+  expect(await page.evaluate(() => window.__trace.updateReady)).toBe(true);
+});
+
+test('an update discovered during a scan never interrupts or reloads that scan', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'service-worker lifecycle mocks are exercised once in Chromium');
+  await page.addInitScript(() => {
+    const installing = new EventTarget();
+    installing.state = 'installing';
+    const registration = new EventTarget();
+    registration.waiting = null;
+    registration.installing = null;
+    registration.update = async () => registration;
+    const serviceWorker = new EventTarget();
+    serviceWorker.controller = { scriptURL: 'https://example.invalid/trace-old/sw.js' };
+    serviceWorker.ready = Promise.resolve(registration);
+    serviceWorker.register = async () => registration;
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: serviceWorker,
+    });
+    window.__traceServiceWorkerMock = { installing, registration, serviceWorker };
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await page.evaluate(() => {
+    window.__trace.disableWorker();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const delayedFile = {
+      name: 'sysdiagnose_delayed.tar.gz',
+      size: bytes.byteLength,
+      stream() {
+        return new ReadableStream({
+          start(controller) {
+            window.__releaseDelayedArchive = () => {
+              controller.enqueue(bytes);
+              controller.close();
+            };
+          },
+        });
+      },
+    };
+    void window.__trace.handleFile(delayedFile);
+  });
+  await expect(page.locator('#scan-heading')).toHaveText('Reading archive…', { timeout: 10_000 });
+
+  await page.evaluate(() => {
+    const { installing, registration } = window.__traceServiceWorkerMock;
+    registration.installing = installing;
+    registration.dispatchEvent(new Event('updatefound'));
+    installing.state = 'installed';
+    registration.waiting = installing;
+    installing.dispatchEvent(new Event('statechange'));
+  });
+
+  await expect(page.locator('#update-notice')).toBeVisible();
+  await expect(page.locator('#update-message')).toContainText(
+    'This scan will finish with the currently loaded release'
+  );
+  await expect(page.locator('#scanning')).toBeVisible();
+  await expect(page.locator('#scan-heading')).toHaveText('Reading archive…');
+
+  await page.click('#cancel-scan');
+  await expect(page.locator('#landing')).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator('#update-notice')).toBeVisible();
+  await expect(page.locator('#update-notice')).toBeFocused();
+  await expect(page.locator('#file-input')).toBeDisabled();
+  expect(await page.evaluate(() => window.__trace.updateReady)).toBe(true);
+});
+
+test('the first service-worker install is not mislabeled as an update', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'service-worker lifecycle mocks are exercised once in Chromium');
+  await page.addInitScript(() => {
+    const installing = new EventTarget();
+    installing.state = 'installing';
+    const registration = new EventTarget();
+    registration.waiting = null;
+    registration.installing = null;
+    registration.update = async () => registration;
+    const serviceWorker = new EventTarget();
+    serviceWorker.controller = null;
+    serviceWorker.ready = Promise.resolve(registration);
+    serviceWorker.register = async () => registration;
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: serviceWorker,
+    });
+    window.__traceServiceWorkerMock = { installing, registration };
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await page.evaluate(() => {
+    const { installing, registration } = window.__traceServiceWorkerMock;
+    registration.installing = installing;
+    registration.dispatchEvent(new Event('updatefound'));
+    installing.state = 'installed';
+    registration.waiting = installing;
+    installing.dispatchEvent(new Event('statechange'));
+  });
+  await expect(page.locator('#update-notice')).toBeHidden();
+  await expect(page.locator('#file-input')).toBeEnabled();
+  expect(await page.evaluate(() => window.__trace.updateReady)).toBe(false);
+});
+
+test('the active worker never serves an asset from a different Trace cache', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'CacheStorage generation isolation is exercised once in Chromium');
+  await page.goto('/?offline-shell-proof=1');
+  await page.evaluate(() => navigator.serviceWorker.ready);
+  await page.reload();
+  await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const probe = await page.evaluate(async () => {
+    const probeUrl = new URL('./__trace_waiting_cache_probe__', location.href).href;
+    const traceCacheName = (await caches.keys()).find((name) => name.startsWith('trace-'));
+    const traceCache = await caches.open(traceCacheName);
+    const traceKeys = await traceCache.keys();
+    const unqualifiedGlobalMatch = await caches.match(new URL('./main.js', location.href).href);
+    const foreignCache = await caches.open('trace-future-test-only');
+    await foreignCache.put(probeUrl, new Response('future-release-bytes', {
+      status: 200,
+      headers: { 'content-type': 'text/plain' },
+    }));
+    try {
+      const response = await fetch(probeUrl);
+      return {
+        status: response.status,
+        text: await response.text(),
+        traceCacheName,
+        everyKeyIsReleaseQualified: traceKeys.every((request) =>
+          new URL(request.url).searchParams.get('__trace_release') === traceCacheName
+        ),
+        unqualifiedGlobalMatch: Boolean(unqualifiedGlobalMatch),
+      };
+    } finally {
+      await caches.delete('trace-future-test-only');
+    }
+  });
+  expect(probe.status).toBe(404);
+  expect(probe.text).not.toContain('future-release-bytes');
+  expect(probe.traceCacheName).toBe('trace-v1');
+  expect(probe.everyKeyIsReleaseQualified).toBe(true);
+  expect(probe.unqualifiedGlobalMatch).toBe(false);
+});
+
 test('scanning still works fully offline once the app is cached', async ({ page, context, browserName }) => {
   test.skip(
     browserName === 'webkit',
     'Playwright WebKit cannot emulate offline across a service-worker navigation (internal error on reload); the offline path is proven on chromium and firefox'
   );
-  await page.goto('/');
+  await page.goto('/?offline-shell-proof=1');
   await page.evaluate(() => navigator.serviceWorker.ready);
   await context.setOffline(true);
   await page.reload();

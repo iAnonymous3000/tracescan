@@ -8,6 +8,31 @@ tree is exactly what that version shipped.
 
 No changes yet.
 
+## v0.7.6 - 2026-07-19
+
+Browser release-lifecycle hardening after a retained v0.7.4 Brave tab produced
+a spurious incomplete result already fixed in v0.7.5 for a capture that the
+current scanner handles completely.
+
+An already-open pre-v0.7.6 page cannot load this notice retroactively. Those
+users need one final close of every Trace tab/window and then a fresh reopen;
+the lifecycle warning protects subsequent upgrades after v0.7.6 has loaded.
+
+- The app now detects both an already-waiting service worker and a newly
+  installed update. It shows a persistent, accessible update notice, blocks
+  new scans under the known-old release, and explains that every Trace tab
+  must close before reopening. It never activates an update automatically,
+  reloads a tab, interrupts a scan, or discards an unexported result.
+- Service-worker script checks bypass the HTTP cache. Returning visible tabs
+  and newly online tabs ask the browser to check again without making update
+  availability part of scan correctness.
+- Every precached request key is now release-qualified, and the active service
+  worker reads only its own commit-named cache. Even a pre-v0.7.6 worker's
+  origin-wide cache lookup therefore cannot see assets installed by the
+  waiting v0.7.6 release before the normal all-clients-closed activation
+  boundary.
+- Transition-tombstone notes use correct singular and plural wording.
+
 ## v0.7.5 - 2026-07-19
 
 Post-v0.7.4 audit hardening. The report contract is schema v4 because

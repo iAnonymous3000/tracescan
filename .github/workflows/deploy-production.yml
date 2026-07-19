@@ -161,9 +161,14 @@ jobs:
             grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers" || return 1
             curl -fsSL "https://tracescan.pages.dev/" > "$live_dir/root.html" || return 1
             cmp -s "$live_dir/root.html" web/index.html || return 1
+            curl -fsSL "https://tracescan.pages.dev/?__trace_release=trace-${HEAD_SHA}" \
+              > "$live_dir/root-qualified.html" || return 1
+            cmp -s "$live_dir/root-qualified.html" web/index.html || return 1
             # Verify every scanner asset the new service worker will persist.
             # Per-file edge-cache skew must not let a coherent old manifest and
             # IOC bundle, or mixed JS/WASM generations, pass this deploy gate.
+            # Check both the bare URL used by runtime cache misses and the
+            # release-qualified URL Cache.addAll() persists during install.
             for asset in \
               index.html style.css main.js readable-report.js report-validator.js \
               indicator-floor.js worker.js report.schema.json \
@@ -175,12 +180,16 @@ jobs:
               fixtures/sysdiagnose_demo_infected.tar.gz
             do
               live_asset="$live_dir/${asset//\//_}"
+              qualified_asset="${live_asset}.qualified"
               # Follow redirects just as fetch()/Cache.addAll() do. Cloudflare
               # normally redirects /index.html to /; comparing the redirect
               # response body would never validate what the browser caches.
               curl -fsSL "https://tracescan.pages.dev/${asset}" \
                 > "$live_asset" || return 1
               cmp -s "$live_asset" "web/$asset" || return 1
+              curl -fsSL "https://tracescan.pages.dev/${asset}?__trace_release=trace-${HEAD_SHA}" \
+                > "$qualified_asset" || return 1
+              cmp -s "$qualified_asset" "web/$asset" || return 1
             done
             # The report schema must resolve at its declared $id, not fall
             # back to the SPA's index.html.

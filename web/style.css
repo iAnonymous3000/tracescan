@@ -95,6 +95,16 @@ h1, h2, h3 { line-height: 1.25; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); align-self: start; margin-top: 7px; }
 .dot.offline { background: #c9a227; }
 
+.update-strip {
+  background: var(--susp-bg);
+  color: var(--susp-ink);
+  border-bottom: 1px solid var(--susp-line);
+  padding: 12px 0;
+}
+.update-strip h2 { font-size: 1rem; margin: 0 0 2px; }
+.update-strip p { margin: 0; }
+.update-strip:focus-visible { outline: 2px solid var(--susp-ink); outline-offset: -4px; }
+
 .linklike {
   background: none; border: none; padding: 0; font: inherit;
   color: var(--accent); text-decoration: underline; cursor: pointer;
