@@ -149,7 +149,7 @@ jobs:
             # Use the bare URLs a normal client and service worker request.
             # A cache-busted query could bypass a stale per-key edge entry and
             # falsely bless bytes that the browser would not actually persist.
-            curl -fsS "https://tracescan.pages.dev/sw.js" > "$live_sw" || return 1
+            curl -fsSL "https://tracescan.pages.dev/sw.js" > "$live_sw" || return 1
             live=$(grep -o "trace-[0-9a-f]\{40\}" "$live_sw" || true)
             [ "$live" = "trace-${HEAD_SHA}" ] || return 1
             cmp -s "$live_sw" web/sw.js || return 1
@@ -159,7 +159,7 @@ jobs:
             grep -Eqi '^cross-origin-opener-policy:[[:space:]]*same-origin([[:space:]]|$)' "$headers" || return 1
             grep -Eqi '^x-content-type-options:[[:space:]]*nosniff([[:space:]]|$)' "$headers" || return 1
             grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers" || return 1
-            curl -fsS "https://tracescan.pages.dev/" > "$live_dir/root.html" || return 1
+            curl -fsSL "https://tracescan.pages.dev/" > "$live_dir/root.html" || return 1
             cmp -s "$live_dir/root.html" web/index.html || return 1
             # Verify every scanner asset the new service worker will persist.
             # Per-file edge-cache skew must not let a coherent old manifest and
@@ -175,7 +175,10 @@ jobs:
               fixtures/sysdiagnose_demo_infected.tar.gz
             do
               live_asset="$live_dir/${asset//\//_}"
-              curl -fsS "https://tracescan.pages.dev/${asset}" \
+              # Follow redirects just as fetch()/Cache.addAll() do. Cloudflare
+              # normally redirects /index.html to /; comparing the redirect
+              # response body would never validate what the browser caches.
+              curl -fsSL "https://tracescan.pages.dev/${asset}" \
                 > "$live_asset" || return 1
               cmp -s "$live_asset" "web/$asset" || return 1
             done
