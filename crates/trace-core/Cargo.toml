@@ -1,6 +1,6 @@
 [package]
 name = "trace-core"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 description = "Local-first iOS sysdiagnose spyware-trace scanner (WASM core)"
 license = "MIT"
@@ -11,7 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-console_error_panic_hook = "0.1"
 chrono = { version = "0.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

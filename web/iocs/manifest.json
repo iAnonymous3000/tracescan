@@ -1,29 +1,32 @@
 {
   "bundled_date": "2026-07-08",
-  "comment": "Bundled snapshots are the only indicator data scans use; live upstream data never reaches a verdict. The app fetches each set's url at load time only to detect plausible upstream content that differs from the reviewed snapshot. A hash difference does not prove that the upstream body is chronologically newer, so it is a review prompt rather than trusted update data. Selection criterion: iOS-relevant campaigns from reputable public sources (Amnesty, Citizen Lab, Kaspersky, Google TIG, Microsoft, iVerify), via the AmnestyTech and mvt-project repos. Excluded from the MVT indicator index by scope: Android-only sets (2023-03-29_android_campaign, wyrmspy_dragonegg, novispy, stalkerware, residentbat), Windows-focused Candiru, and cellebrite (single app:id, nothing checkable in any artifact this tool reads). min_indicators/min_applicable are reviewed plausibility floors for runtime checks and exact reviewed counts in CI (regenerate with `cargo run --example ioc_stats`). Snapshot changes ship through the weekly reviewed-PR workflow.",
+  "comment": "Bundled snapshots are the only indicator data scans use; live upstream data never reaches a verdict. Each sha256 value pins the exact reviewed bundle bytes and is verified before loading, while the exact ordered set roster is fixed in application code. The app fetches each set's url at load time only to detect plausible upstream content that differs from the reviewed snapshot. A hash difference does not prove that the upstream body is chronologically newer, so it is a review prompt rather than trusted update data. Selection criterion: iOS-relevant campaigns from reputable public sources (Amnesty, Citizen Lab, Kaspersky, Google TIG, Microsoft, iVerify), via the AmnestyTech and mvt-project repos. Excluded from the MVT indicator index by scope: Android-only sets (2023-03-29_android_campaign, wyrmspy_dragonegg, novispy, stalkerware, residentbat), Windows-focused Candiru, and cellebrite (single app:id, no process-observable value in any artifact this tool reads). min_indicators/min_applicable are reviewed plausibility floors for runtime checks and exact reviewed counts in CI (regenerate with `cargo run --example ioc_stats`). Snapshot changes ship through the weekly reviewed-PR workflow.",
   "sets": [
     {
       "name": "pegasus",
       "campaign_hint": "Pegasus (NSO Group)",
       "file": "iocs/pegasus.stix2",
+      "sha256": "df1bcaa78abc7b85781b1ebc2daa3cc225371e2024d9ef96e84f80f927256586",
       "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2021-07-18_nso/pegasus.stix2",
       "source": "Amnesty International Security Lab",
       "min_indicators": 1549,
-      "min_applicable": 82
+      "min_applicable": 81
     },
     {
       "name": "predator",
       "campaign_hint": "Predator (Cytrox/Intellexa)",
       "file": "iocs/predator.stix2",
+      "sha256": "74852711457069b37189d554b19baf641acbb8d08291be13b2ec7f2422726de9",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/intellexa_predator/predator.stix2",
       "source": "Meta, Amnesty, Citizen Lab, Cisco (MVT aggregate)",
       "min_indicators": 585,
-      "min_applicable": 15
+      "min_applicable": 4
     },
     {
       "name": "kingspawn",
       "campaign_hint": "KingSpawn (QuaDream)",
       "file": "iocs/kingspawn.stix2",
+      "sha256": "f214079289b015a266bd996d651ee7ce4b228258b633cc02e5a671deaf3ca2ce",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2023-04-11_quadream/kingspawn.stix2",
       "source": "Citizen Lab, Microsoft (via MVT)",
       "min_indicators": 167,
@@ -33,6 +36,7 @@
       "name": "triangulation",
       "campaign_hint": "Operation Triangulation",
       "file": "iocs/triangulation.stix2",
+      "sha256": "6e7361aeae471b1a9560f3015b0709067169ae3828bdbdde031122d5c746d92c",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2023-06_01_operation_triangulation/operation_triangulation.stix2",
       "source": "Kaspersky Lab (via MVT)",
       "min_indicators": 112,
@@ -42,6 +46,7 @@
       "name": "rcs",
       "campaign_hint": "RCS Lab (Hermit)",
       "file": "iocs/rcs.stix2",
+      "sha256": "7d390e0c298704944bbed681b8d650be5b3109c11eaffcaa8fa4c29a9f7fb383",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2022-06-23_rcs_lab/rcs.stix2",
       "source": "Google, Lookout (via MVT)",
       "min_indicators": 40,
@@ -51,6 +56,7 @@
       "name": "wintego_helios",
       "campaign_hint": "Wintego Helios",
       "file": "iocs/wintego_helios.stix2",
+      "sha256": "d0d546c388207e8a162eb3901259ee20c0ddd03efeff145d3cc9b3a0a02a5419",
       "url": "https://raw.githubusercontent.com/AmnestyTech/investigations/master/2024-05-02_wintego_helios/wintego_helios.stix2",
       "source": "Amnesty International Security Lab",
       "min_indicators": 175,
@@ -60,19 +66,21 @@
       "name": "coruna",
       "campaign_hint": "Coruna",
       "file": "iocs/coruna.stix2",
+      "sha256": "0046552adf6127ebcaeac9f825a8082a9fa201dd7c921bb7d596fb0c02f12c24",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2026-03-03_coruna_cryptowaters/coruna.stix2",
       "source": "Google Threat Intelligence Group (via MVT)",
       "min_indicators": 216,
-      "min_applicable": 18
+      "min_applicable": 0
     },
     {
       "name": "darksword",
       "campaign_hint": "DarkSword",
       "file": "iocs/darksword.stix2",
+      "sha256": "a2387f14ae7e7f176b0bd543be9b5ff151c77a22377cee5ae38ac5c3c4973a20",
       "url": "https://raw.githubusercontent.com/mvt-project/mvt-indicators/main/2026-03-30_darksword/darksword.stix2",
       "source": "iVerify, Google Threat Intelligence Group (via MVT)",
       "min_indicators": 43,
-      "min_applicable": 29
+      "min_applicable": 0
     }
   ]
 }

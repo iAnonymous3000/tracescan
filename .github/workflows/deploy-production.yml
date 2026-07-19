@@ -136,35 +136,67 @@ jobs:
         if: steps.pre.outputs.deploy == 'true'
         run: |
           set -euo pipefail
-          for i in $(seq 1 20); do
-            live=$(curl -fsS "https://tracescan.pages.dev/sw.js" | grep -o "trace-[0-9a-f]\{40\}" || true)
-            [ "$live" = "trace-${HEAD_SHA}" ] && break
-            sleep 15
-          done
-          [ "$live" = "trace-${HEAD_SHA}" ] || { echo "production still serves ${live:-unknown}"; exit 1; }
           headers=$(mktemp)
-          schema=$(mktemp)
-          trap 'rm -f "$headers" "$schema"' EXIT
-          curl -fsSI "https://tracescan.pages.dev/" > "$headers"
+          live_dir=$(mktemp -d)
+          trap 'rm -f "$headers"; rm -rf "$live_dir"' EXIT
           expected_csp=$(sed -n 's/^  Content-Security-Policy: //p' web/_headers)
           expected_permissions_policy=$(sed -n 's/^  Permissions-Policy: //p' web/_headers)
           [ -n "$expected_csp" ]
           [ -n "$expected_permissions_policy" ]
-          grep -Fqi "content-security-policy: ${expected_csp}" "$headers"
-          grep -Fqi "permissions-policy: ${expected_permissions_policy}" "$headers"
-          grep -Eqi '^cross-origin-opener-policy:[[:space:]]*same-origin([[:space:]]|$)' "$headers"
-          grep -Eqi '^x-content-type-options:[[:space:]]*nosniff([[:space:]]|$)' "$headers"
-          grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers"
-          curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_clean.tar.gz"
-          curl -fsS -o /dev/null "https://tracescan.pages.dev/fixtures/sysdiagnose_demo_infected.tar.gz"
-          # The report schema must resolve at its declared $id, not fall
-          # back to the SPA's index.html.
-          curl -fsS "https://tracescan.pages.dev/report.schema.json" > "$schema"
-          cmp -s "$schema" web/report.schema.json || {
-            echo "production report schema differs from the validated source file" >&2
+
+          verify_production() {
+            live_sw="$live_dir/sw.js"
+            # Use the bare URLs a normal client and service worker request.
+            # A cache-busted query could bypass a stale per-key edge entry and
+            # falsely bless bytes that the browser would not actually persist.
+            curl -fsS "https://tracescan.pages.dev/sw.js" > "$live_sw" || return 1
+            live=$(grep -o "trace-[0-9a-f]\{40\}" "$live_sw" || true)
+            [ "$live" = "trace-${HEAD_SHA}" ] || return 1
+            cmp -s "$live_sw" web/sw.js || return 1
+            curl -fsSI "https://tracescan.pages.dev/" > "$headers" || return 1
+            grep -Fqi "content-security-policy: ${expected_csp}" "$headers" || return 1
+            grep -Fqi "permissions-policy: ${expected_permissions_policy}" "$headers" || return 1
+            grep -Eqi '^cross-origin-opener-policy:[[:space:]]*same-origin([[:space:]]|$)' "$headers" || return 1
+            grep -Eqi '^x-content-type-options:[[:space:]]*nosniff([[:space:]]|$)' "$headers" || return 1
+            grep -Eqi '^referrer-policy:[[:space:]]*no-referrer([[:space:]]|$)' "$headers" || return 1
+            curl -fsS "https://tracescan.pages.dev/" > "$live_dir/root.html" || return 1
+            cmp -s "$live_dir/root.html" web/index.html || return 1
+            # Verify every scanner asset the new service worker will persist.
+            # Per-file edge-cache skew must not let a coherent old manifest and
+            # IOC bundle, or mixed JS/WASM generations, pass this deploy gate.
+            for asset in \
+              index.html style.css main.js readable-report.js report-validator.js \
+              indicator-floor.js worker.js report.schema.json \
+              pkg/trace_core.js pkg/trace_core_bg.wasm iocs/manifest.json \
+              iocs/pegasus.stix2 iocs/predator.stix2 iocs/kingspawn.stix2 \
+              iocs/triangulation.stix2 iocs/rcs.stix2 iocs/wintego_helios.stix2 \
+              iocs/coruna.stix2 iocs/darksword.stix2 \
+              fixtures/sysdiagnose_demo_clean.tar.gz \
+              fixtures/sysdiagnose_demo_infected.tar.gz
+            do
+              live_asset="$live_dir/${asset//\//_}"
+              curl -fsS "https://tracescan.pages.dev/${asset}" \
+                > "$live_asset" || return 1
+              cmp -s "$live_asset" "web/$asset" || return 1
+            done
+            # The report schema must resolve at its declared $id, not fall
+            # back to the SPA's index.html.
+            jq -e --arg schema_id 'https://tracescan.pages.dev/report.schema.json' \
+              '.["$id"] == $schema_id and .properties.schema_version.const == 4' \
+              "$live_dir/report.schema.json" > /dev/null || return 1
+          }
+
+          verified=false
+          for attempt in $(seq 1 20); do
+            if verify_production; then
+              verified=true
+              break
+            fi
+            echo "production verification attempt ${attempt}/20 did not yet observe the complete validated artifact"
+            [ "$attempt" -eq 20 ] || sleep 15
+          done
+          [ "$verified" = true ] || {
+            echo "production did not converge to the complete validated artifact; last service-worker marker was ${live:-unknown}" >&2
             exit 1
           }
-          jq -e --arg schema_id 'https://tracescan.pages.dev/report.schema.json' \
-            '.["$id"] == $schema_id and .properties.schema_version.const == 3' \
-            "$schema" > /dev/null
           echo "production verified at trace-${HEAD_SHA}"

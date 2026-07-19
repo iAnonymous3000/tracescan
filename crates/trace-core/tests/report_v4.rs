@@ -1,11 +1,11 @@
-//! Report v3 contract tests: the exported report validates against the
+//! Report v4 contract tests: the exported report validates against the
 //! checked-in JSON Schema, and its field shape matches the golden path
 //! list that the browser producers (worker and inline, see
 //! e2e/tests/trace.spec.js) are held to as well. A shape change that
 //! shows up here without a schema_version discussion is a regression.
 //!
 //! Regenerate the golden after an intentional change:
-//!   TRACE_UPDATE_GOLDEN=1 cargo test --test report_v3
+//!   TRACE_UPDATE_GOLDEN=1 cargo test --test report_v4
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -132,7 +132,7 @@ fn artifact_status_contract_matches_the_engine() {
         report["artifacts"][0]["status"] = serde_json::Value::String(status.into());
         assert!(
             validator.is_valid(&report),
-            "engine artifact status {status:?} must remain valid in report v3"
+            "engine artifact status {status:?} must remain valid in report v4"
         );
     }
 
@@ -146,7 +146,7 @@ fn artifact_status_contract_matches_the_engine() {
 
 #[test]
 fn field_shape_matches_golden() {
-    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/report_fields_v3.json");
+    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/report_fields_v4.json");
     let report = scan_fixture("sysdiagnose_demo_infected.tar.gz");
     let paths = paths_of(&report);
     if std::env::var("TRACE_UPDATE_GOLDEN").is_ok() {
@@ -166,14 +166,14 @@ fn field_shape_matches_golden() {
     let extra: Vec<&String> = paths.difference(&golden).collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
-        "report field shape drifted from tests/report_fields_v3.json\nmissing: {missing:?}\nextra: {extra:?}\nIf intentional, regenerate with TRACE_UPDATE_GOLDEN=1 and update the browser parity test expectations."
+        "report field shape drifted from tests/report_fields_v4.json\nmissing: {missing:?}\nextra: {extra:?}\nIf intentional, regenerate with TRACE_UPDATE_GOLDEN=1 and update the browser parity test expectations."
     );
 }
 
 #[test]
 fn producer_metadata_lands_in_envelope() {
     let report = scan_fixture("sysdiagnose_demo_clean.tar.gz");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(report["scanned_via"], "native");
     assert_eq!(
         report["source_file"]["name"],

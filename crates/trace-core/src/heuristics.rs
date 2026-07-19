@@ -1,8 +1,13 @@
-//! Path-based heuristic classification shared by all three artifact parsers,
-//! so the definition of "suspicious location" - and the finding text it
-//! produces - cannot drift between surfaces.
+//! Path-based heuristic classification shared by the process-bearing artifact
+//! parsers, so the definition of "suspicious location" - and the finding text
+//! it produces - cannot drift between surfaces.
 
 use crate::report::{Finding, Severity};
+
+// Exact executable leaves observed in Apple's numeric role-account execution
+// workspace. This is a narrow false-positive exception, not an authenticity
+// check: paths carrying any other leaf must retain the staging heuristic.
+const KNOWN_APPLE_ROLEACCOUNT_EXECUTABLES: &[&str] = &["com.apple.NRD.UpdateBrainService"];
 
 /// How a process path should be flagged, if at all.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -39,9 +44,10 @@ pub fn path_flag(path: &str) -> Option<PathFlag> {
         // roleaccountd.staging (for example `rolexd`, `bh`, `subridged`).
         // iOS itself legitimately uses the observed
         // exec/<numeric>.<numeric>.xpc/<executable> workspace shape here.
-        // Require that exact component shape: accepting an arbitrary `.xpc`
-        // directory or additional descendants would let a suspicious path
-        // hide behind the false-positive exception.
+        // Require both that component shape and an exact observed executable:
+        // accepting an arbitrary leaf, `.xpc` directory, or additional
+        // descendant would let a suspicious path hide behind the
+        // false-positive exception.
         let mut components = relative.split('/');
         let is_apple_exec_workspace = match (
             components.next(),
@@ -59,7 +65,7 @@ pub fn path_flag(path: &str) -> Option<PathFlag> {
                             && !instance.is_empty()
                             && instance.bytes().all(|byte| byte.is_ascii_digit())
                     })
-                    && !executable.is_empty()
+                    && KNOWN_APPLE_ROLEACCOUNT_EXECUTABLES.contains(&executable)
             }
             _ => false,
         };
@@ -122,6 +128,28 @@ mod tests {
             "Apple's nested role-account execution workspace is not the published direct-child Pegasus shape"
         );
         assert_eq!(
+            path_flag(
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/42.999.xpc/com.apple.NRD.UpdateBrainService"
+            ),
+            Some(PathFlag::UnusualLocation),
+            "numeric workspace identifiers may vary without broadening the executable exception"
+        );
+        for executable in [
+            "bh",
+            "implant",
+            "com.apple.fake.UpdateBrainService",
+            "com.apple.NRD.updatebrainservice",
+        ] {
+            let path = format!(
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/{executable}"
+            );
+            assert_eq!(
+                path_flag(&path),
+                Some(PathFlag::Staging),
+                "an unrecognized executable must not inherit the Apple workspace exception: {executable}"
+            );
+        }
+        assert_eq!(
             path_flag("/private/var/db/com.apple.xpc.roleaccountd.staging/drop/bh"),
             Some(PathFlag::Staging),
             "arbitrary nested staging paths must remain suspicious"
@@ -179,6 +207,11 @@ mod tests {
                 "/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/com.apple.NRD.UpdateBrainService",
                 "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/com.apple.NRD.UpdateBrainService",
                 Some(PathFlag::UnusualLocation),
+            ),
+            (
+                "/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/implant",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/implant",
+                Some(PathFlag::Staging),
             ),
             (
                 "/var/db/agent",

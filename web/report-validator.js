@@ -63,7 +63,7 @@ export function isCompleteReportEnvelope(report, file, expectedVia, expectedSets
     'assurance', 'coverage',
   ];
   if (!hasExactKeys(report, topLevelKeys, ['device'])
-      || report.schema_version !== 3
+      || report.schema_version !== 4
       || !hasExactKeys(report.tool, ['name', 'version', 'build_commit'])
       || report.tool.name !== 'Trace'
       || typeof report.tool.version !== 'string'

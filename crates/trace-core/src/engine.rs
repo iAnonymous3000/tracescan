@@ -569,15 +569,19 @@ impl Engine {
                 "The archive ended before its end-of-archive marker, so it may be incomplete; anything after the cut-off was not analyzed.".into(),
             );
         }
-        // A scan without applicable indicators cannot match anything, so
-        // "no known spyware traces found" would be vacuously true. The
-        // browser always loads the bundled sets before scanning; this
-        // guards the native harness and any embedder that does not. Gated
-        // on artifacts being present so garbage input still reads as "not
-        // a sysdiagnose" rather than inconclusive.
-        if self.db.applicable_total() == 0 && (!collector.files.is_empty() || unified_seen) {
+        // File-system indicators that are not process-observable remain
+        // indexed for exact positive matches, but they do not establish
+        // negative-result coverage. A positive match remains decisive; only
+        // a no-match process scan with no policy-accepted observable indicators must
+        // fail closed. Gate on recognizable artifacts so arbitrary input still
+        // reads as invalid rather than inconclusive.
+        let has_indicator_match = findings.iter().any(|f| f.severity == Severity::Match);
+        if self.db.applicable_total() == 0
+            && !has_indicator_match
+            && (!collector.files.is_empty() || unified_seen)
+        {
             scan_limits.push(
-                "No process or file indicators were loaded, so nothing in this archive could be checked against known spyware.".into(),
+                "No process-observable indicators accepted by the negative-coverage policy were loaded, so a no-match process scan cannot provide a conclusive negative result.".into(),
             );
         }
         // Paired-device diagnostics and process-free phone metadata are
@@ -599,7 +603,7 @@ impl Engine {
         // The verdict is decided here, in one place, from everything above.
         // Consumers render it; they never re-derive safety semantics.
         let has = |sev: Severity| findings.iter().any(|f| f.severity == sev);
-        let verdict = if has(Severity::Match) {
+        let verdict = if has_indicator_match {
             Verdict::Match
         } else if has(Severity::Suspicious) {
             Verdict::Suspicious
@@ -701,7 +705,7 @@ impl Engine {
         };
 
         Ok(Report {
-            schema_version: 3,
+            schema_version: 4,
             tool: ToolInfo {
                 name: "Trace",
                 version: env!("CARGO_PKG_VERSION"),
@@ -738,14 +742,14 @@ impl Engine {
                 examined,
                 not_examined: vec![
                     "OTA update logs (logs/OTAUpdateLogs/*.ips) - an undocumented restore-time text format, not the crash-report schema, so their contents are not checked",
-                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing, so file-name indicators are checked only against observed process basenames and file-path indicators only against observed canonical executable paths (with Apple's /var, /tmp, and /etc aliases resolved to /private/... for comparison)",
+                    "File-system presence of file indicators - a sysdiagnose has no filesystem listing. Safe file-name and file-path indicators remain available for exact positive matches against observed process identities, but only process-image paths accepted by this build's negative-coverage policy contribute to a conclusive no-match process scan (with Apple's /var, /tmp, and /etc aliases resolved to /private/... for comparison)",
                     "Unified log message contents - domain and URL indicators inside log text are not checked",
                     "Safari browsing history - lives in device backups, where most domain indicators would be checked",
                     "SMS/iMessage link payloads - device backups only",
                     "Per-process network usage (DataUsage) - device backups only",
                     "Installed apps and configuration profiles - device backups only",
                 ],
-                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. Process and file indicators are checked only against observed process names and canonical paths; Apple's /var, /tmp, and /etc aliases are resolved to /private/... for path comparison, and a directory-valued path indicator matches observed descendants of that directory. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
+                note: "Domain, URL, email and other network indicators in the loaded sets cannot be checked against sysdiagnose artifacts. Process-name indicators and process-image paths accepted by this build's negative-coverage policy establish limited negative coverage over observed process identities. Other safe file indicators remain indexed for exact positive matches, but their absence from process observations cannot establish file-system absence. Apple's /var, /tmp, and /etc aliases are resolved to /private/... for path comparison, and a directory-valued path indicator matches observed descendants of that directory. A result with no matches means these artifacts contained no known traces - it does not examine everything, and it cannot prove a device is clean.",
             },
         })
     }
@@ -844,6 +848,8 @@ mod tests {
 
         let report = engine.finish().unwrap();
         assert_eq!(report.verdict, Verdict::Match);
+        assert_eq!(report.stats.applicable_indicators, 0);
+        assert!(report.scan_limits.is_empty());
         let matched = report
             .findings
             .iter()
@@ -854,6 +860,28 @@ mod tests {
             matched.indicator.as_ref().unwrap().value,
             "/private/var/tmp/trace-alias"
         );
+    }
+
+    #[test]
+    fn unreviewed_file_only_set_cannot_produce_a_clear_no_match() {
+        let ps = "USER PID COMMAND\nroot 1 /usr/libexec/safe-process\n";
+        let tar = test_util::finish(test_util::entry("sysdiagnose_t/ps.txt", ps.as_bytes()));
+        let mut engine = Engine::new();
+        engine
+            .load_stix(
+                "file-only",
+                r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/tmp/unobserved-payload']"}]}"#,
+            )
+            .unwrap();
+        engine.push(&tar).unwrap();
+
+        let report = engine.finish().unwrap();
+        assert_eq!(report.stats.total_indicators, 1);
+        assert_eq!(report.stats.applicable_indicators, 0);
+        assert_eq!(report.verdict, Verdict::Inconclusive);
+        assert!(report.scan_limits.iter().any(|limit| {
+            limit.contains("No process-observable indicators accepted by the negative-coverage policy were loaded")
+        }));
     }
 
     #[test]
@@ -1303,7 +1331,7 @@ mod tests {
             .examined
             .iter()
             .any(|line| line.starts_with("iOS crash")));
-        // Keep report v3's closed artifact-kind enum stable. The artifact's
+        // Keep report v4's closed artifact-kind enum stable. The artifact's
         // device scope is explicit in details and coverage.
         assert_eq!(report.artifacts[0].kind, "crash_log");
         assert_eq!(report.artifacts[0].details["paired_device"], true);

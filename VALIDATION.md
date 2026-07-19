@@ -25,16 +25,27 @@ publishing their filenames or device identifiers.
 |---|---|---|---|---|
 | Private capture A, iOS 26.5.2 | Maintainer only | v0.7.3, `c685cf6`, 2026-07-13 | 64 tracev3 files, 2,656 catalogs, 689 uuidtext files, and 617 of 617 process paths resolved; no match or suspicious finding | Historical v0.7.3 receipt; not an independently reproducible or population-level false-positive study |
 | Private capture B, iOS 26.5.2 (23F84) | Maintainer only | v0.7.4 candidate beginning at `8ff0208`, 2026-07-17 | 62 tracev3 files, 4,402 catalogs, 754 uuidtext files, and 623 of 623 process paths resolved; all four primary surfaces complete, no scan limits, verdict `clear`, and no match or suspicious finding | Pre-final candidate receipt for one clean OS build, not an exact final-tree release gate; private bytes prevent independent reproduction |
-| Private capture C, iOS 18.7.9 (22H355) | Maintainer only | Unreleased fix tree based on `9c41718`, 2026-07-19 | Two stacks inventories accepted the observed signed-PID and exact terminating-transition variants; 63 tracev3 files, 2,847 catalogs, and 598 uuidtext files parsed with zero failures; 499 of 499 process paths resolved; 11,465 PID samples retained and 11,272 observations dropped under the disclosed evidence-only sampling cap; all four primary surfaces complete, no scan limits, one informational transition-tombstone note, verdict `clear`, and no match or suspicious finding | Compatibility receipt for one clean OS build and an untagged tree; private bytes prevent independent reproduction or independent archive-integrity review |
-| EC-DIGIT-CSIRC iOS 15 capture | Public, hash-pinned below | v0.7.4 release-candidate tree based on `8ff0208`, 2026-07-17 | All supported artifacts parsed; 27 tracev3 files, 659 catalogs, and 426 uuidtext files parsed with zero failures; 341 of 341 process paths resolved; all eight sets loaded at 2,887/148; no scan limits, verdict `clear`, and no match or suspicious finding | Current public compatibility receipt; input bytes are independently obtainable and hash-pinned |
+| Private capture C, iOS 18.7.9 (22H355) | Maintainer only | v0.7.5 pre-final candidate worktree, 2026-07-19 | All eight sets loaded at 2,887/89; two stacks inventories accepted the observed signed-PID and exact terminating-transition variants; 63 tracev3 files, 2,847 catalogs, and 598 uuidtext files parsed with zero failures; 499 of 499 process paths resolved; 11,465 PID samples retained and 11,272 observations dropped under the disclosed evidence-only sampling cap; all four primary surfaces complete, no scan limits, one informational transition-tombstone note, verdict `clear`, and no match or suspicious finding | Pre-final v0.7.5 candidate receipt, not yet an exact final-tree release gate; private bytes prevent independent reproduction or independent archive-integrity review |
+| EC-DIGIT-CSIRC iOS 15 capture | Public, hash-pinned below | v0.7.4 release-candidate tree based on `8ff0208`, 2026-07-17 | All supported artifacts parsed; 27 tracev3 files, 659 catalogs, and 426 uuidtext files parsed with zero failures; 341 of 341 process paths resolved; all eight sets loaded at 2,887/148; no scan limits, verdict `clear`, and no match or suspicious finding | Historical v0.7.4 public compatibility receipt; input bytes remain independently obtainable and hash-pinned, but this is not a v0.7.5 release-tree run |
 
 The private harness reads one archive only from the explicit
 `TRACE_REAL_SYSDIAGNOSE` path and is ignored by default:
 
 ```sh
 TRACE_REAL_SYSDIAGNOSE=/controlled/path/sysdiagnose.tar.gz \
-  cargo test --release --test real_capture -- --ignored --nocapture
+  cargo test --locked --release -p trace-core --test real_capture -- --ignored --nocapture
 ```
+
+The same opt-in path can exercise the browser file-input, Worker, WASM, and UI
+verdict pipeline once in Chromium:
+
+```sh
+TRACE_REAL_SYSDIAGNOSE=/controlled/path/sysdiagnose.tar.gz \
+  npx playwright test --project=chromium --grep 'opt-in real capture'
+```
+
+Run the browser command from `e2e/` after `./build.sh`; the capture path is read
+locally and is never committed by the test.
 
 It loads all eight bundled indicator sets and requires all four primary surfaces,
 no scan limits, no match or suspicious finding, and a `clear` verdict. A passing
@@ -47,11 +58,11 @@ the archive is truthful or representative.
 |---|---|
 | Archive streaming | Property tests over arbitrary bytes and chunking; unit tests for single and concatenated gzip members, tar streaming, PAX and GNU long names, canonical and undecodable paths, checksums, metadata ambiguity, truncation, end markers, retained-file limits, entry limits, and decompression limits |
 | Unified logs | Unit tests for tracev3 framing, catalog-only parser isolation under hostile chunkset size declarations, catalog-count consistency, uuidtext structure and conflicts, canonical path resolution, unresolved processes, detection-relevant identity/path caps, and separately disclosed per-process and aggregate PID-evidence sampling while UUID/path IOC matching remains active; an engine-level regression requires PID-only sample saturation to remain complete and `clear` |
-| Shutdown logs | Classic one-line and iOS 26 rotated/header-plus-client parsing; reboot-block boundaries; malformed delay blocks; binary-UUID suffix stripping; direct-child versus nested staging-path heuristics |
+| Shutdown logs | Classic one-line and iOS 26 rotated/header-plus-client parsing; reboot-block boundaries; malformed delay blocks; binary-UUID suffix stripping; direct-child versus nested staging-path heuristics; the exact `roleaccountd.staging/exec/<number>.<number>.xpc/com.apple.NRD.UpdateBrainService` exception and rejection of other leaves, case variants, and deeper shapes |
 | Crash and diagnostic `.ips` | Ordinary crash reports, kernel panics, disk-write diagnostics, Jetsam, stacks, forceReset, Siri feedback, ResetCounter, security analytics (`bug_type` 226), CPU resource (`202`), and proactive event tracker (`303`), including signed stack PIDs, the exact type-1 terminating tombstone policy, malformed/alternate rows, schema drift, and the fail-closed 10,000-candidate cap |
 | Process listings | Real-format `ps.txt` and `ps_thread.txt`; commands containing spaces; wide and overflowing numeric columns; thread continuations; full-path command columns; iOS 26 `?` process state; malformed rows; valid header-only auxiliary listings |
-| STIX extraction and matching | Fully anchored single-equality parsing; rejection of compound, qualified, malformed, and non-STIX patterns; exact case-sensitive names and alias-equivalent canonical paths; `/var`, `/tmp`, and `/etc` compatibility aliases; directory-prefix indicators; non-applicable relative, dot-segment, and slash-bearing name indicators; per-set duplicate-value reduction; exact reviewed manifest counts and one malware object per snapshot; hostile JSON properties |
-| Verdict and report | Fail-closed invalid/inconclusive paths, anchored primary-phone surface classification, severity- and indicator-diversity-aware findings retention, process-bearing versus metadata-only surface accounting, producer parity, schema version 3 validation, engine-measured archive size, archive and indicator hashing, and golden field shape |
+| STIX extraction and matching | Fully anchored single-equality parsing; rejection of compound, qualified, malformed, and non-STIX patterns; exact case-sensitive names and alias-equivalent canonical paths; `/var`, `/tmp`, and `/etc` compatibility aliases; directory-prefix indicators; exact-positive matching for file indicators that do not establish negative process coverage; non-applicable relative, dot-segment, and slash-bearing name indicators; per-set duplicate-value reduction; exact ordered roster, per-set SHA-256 pins, reviewed counts, and one malware object per snapshot; hostile JSON properties |
+| Verdict and report | Fail-closed invalid/inconclusive paths, anchored primary-phone surface classification, severity- and indicator-diversity-aware findings retention, process-bearing versus metadata-only surface accounting, producer parity, schema version 4 validation, engine-measured archive size, archive and indicator hashing, and golden field shape |
 | Browser application | Playwright on Chromium, Firefox, and WebKit, including worker and inline producers, demo scans, rendering, accessibility flows, exports, scan limits, and service-worker behavior; cached offline scanning runs on Chromium and Firefox, while Playwright WebKit is skipped because it cannot reliably emulate offline service-worker navigation |
 
 CI fixtures are synthetic. They exercise real parser and indicator paths, but
@@ -83,7 +94,7 @@ The public compatibility archive is EC-DIGIT-CSIRC's
   `4491d5e4b6f4349311df3b3fc671f1dd040c8ccda9f97e3a0debef151e613114`;
 - externally hosted size: approximately 94 MB.
 
-The current v0.7.4 release-candidate run recorded:
+The historical v0.7.4 release-candidate run recorded:
 
 - `ps.txt` and `ps_thread.txt` parsed completely, with 244 process rows each
   and no match or suspicious finding;
@@ -100,24 +111,52 @@ The archive is intentionally not committed to this repository. The filename and
 SHA-256 above bind this receipt to the independently obtainable public input;
 the matrix records the source-tree basis and run date.
 
-## What 148 checkable indicators means
+## Current reviewed applicability: 89 of 2,887
 
-The snapshots dated 2026-07-08 contain 2,887 extracted indicators:
+The snapshots dated 2026-07-08 contain 2,887 extracted indicators. Under the
+v0.7.5 negative-coverage policy, 89 establish reviewed coverage for the
+process-bearing evidence Trace observes:
 
 | Applicable kind | Count | Matching rule |
 |---|---:|---|
 | Process name | 83 | Exact, case-sensitive observed basename |
-| File name | 15 | Exact, case-sensitive observed basename |
-| File path | 50 | Exact, case-sensitive canonical absolute path after resolving `/var`, `/tmp`, and `/etc` to `/private/...` for comparison, or a descendant of a trailing-slash directory indicator under the same rule |
+| File name | 0 | File names remain exact-positive matchable but do not establish negative process-scan coverage |
+| Reviewed process-image file path | 6 | Exact, case-sensitive canonical executable path after resolving `/var`, `/tmp`, and `/etc` to `/private/...` for comparison, or a descendant of a reviewed trailing-slash process-image path |
+| **Total** | **89** | Coverage available to support a no-match process scan |
+
+The reviewed per-set accounting is:
+
+| Indicator set | Extracted | Applicable to negative process coverage |
+|---|---:|---:|
+| Pegasus | 1,549 | 81 |
+| Predator | 585 | 4 |
+| KingSpawn (QuaDream) | 167 | 3 |
+| Operation Triangulation | 112 | 1 |
+| RCS Lab | 40 | 0 |
+| Wintego Helios | 175 | 0 |
+| Coruna | 216 | 0 |
+| DarkSword | 43 | 0 |
+| **Total** | **2,887** | **89** |
+
+The six reviewed process-image path values are:
+
+- Predator: `/private/var/tmp/hooker`,
+  `/private/var/tmp/com.apple.WebKit.Networking`,
+  `/private/var/tmp/UserEventAgent`, and `/private/var/tmp/takePhoto`;
+- KingSpawn: `/private/var/db/com.apple.xpc.roleaccountd.staging/subridged`
+  and
+  `/private/var/db/com.apple.xpc.roleaccountd.staging/PlugIns/fud.appex/`.
 
 All four primary surfaces enumerate **process activity**. There is no complete
-filesystem listing in a sysdiagnose. File-name indicators use observed process
-identities or executable basenames; file-path indicators use only canonical
-observed executable paths. The well-known Apple `/var`, `/tmp`, and `/etc`
-aliases resolve to `/private/...` only for comparison; reports retain the raw
-observed path and published indicator. A plist, database, directory, or
-lock-file indicator does not prove file presence and matches only when the
-published value can be applied under one of those process-derived rules.
+filesystem listing in a sysdiagnose. Safe file-name indicators can still match
+an observed process identity or executable basename, and safe file-path
+indicators can still match a canonical observed executable path. Those exact
+positive matches remain reportable even when the indicator is not in the
+reviewed negative-coverage allowlist. The well-known Apple `/var`, `/tmp`, and
+`/etc` aliases resolve to `/private/...` only for comparison; reports retain the
+raw observed path and published indicator. A plist, database, directory, or
+lock-file indicator does not prove file presence and must not inflate what a
+no-match scan claims to have checked.
 
 The STIX parser accepts exactly one fully anchored equality clause. It never
 turns one side of `AND`, `OR`, `FOLLOWEDBY`, a qualifier, a comment, or malformed

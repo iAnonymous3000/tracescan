@@ -12,7 +12,7 @@ const VERDICTS = {
   },
   clear: {
     label: 'No known spyware traces found',
-    meaning: 'No applicable public indicator appeared in the artifacts Trace examined. This is not a clean bill of health and does not rule out new, private, or uncovered spyware traces.',
+    meaning: 'No published indicator matched in the artifacts Trace examined, and reviewed process-observable indicators were loaded to support this limited negative process scan. This is not a clean bill of health and does not rule out new, private, or uncovered spyware traces.',
   },
   inconclusive: {
     label: 'Scan incomplete - result inconclusive',
@@ -157,7 +157,7 @@ function provenanceHtml(report) {
   };
 
   return `<div class="table-scroll" role="region" aria-label="Indicator provenance" tabindex="0"><table>
-    <thead><tr><th>Campaign</th><th>Applicable to current matching</th><th>Snapshot date</th><th>Indicator SHA-256</th></tr></thead>
+    <thead><tr><th>Campaign</th><th>Applicable to negative process coverage</th><th>Snapshot date</th><th>Indicator SHA-256</th></tr></thead>
     <tbody>${provenanceSets.map((set) => `<tr>
       <td>${esc(set.campaign || set.name)}</td>
       <td>${esc(coverageFor(set))}</td>
@@ -165,7 +165,7 @@ function provenanceHtml(report) {
       <td><code class="hash">${esc(set.sha256 || 'unavailable')}</code></td>
     </tr>`).join('')}</tbody>
   </table></div>
-  <p class="notice">Applicable counts show how many extracted indicators Trace's current matcher treats as process names, file names, or paths checkable against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison. Trace does not inspect a filesystem listing. A count of 0 means none are classified as applicable.</p>`;
+  <p class="notice">Applicable counts show how many reviewed process-observable indicators establish negative coverage for a no-match process scan. Safe file-name and file-path indicators can still produce exact positive matches against observed process basenames or canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison, even when they are not counted as applicable. Trace does not inspect a filesystem listing, so those indicators cannot establish negative coverage. A count of 0 means this set contributes no reviewed negative process coverage.</p>`;
 }
 
 export function readableReportFragment(report, options = {}) {

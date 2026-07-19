@@ -6,8 +6,14 @@ tree is exactly what that version shipped.
 
 ## Unreleased
 
-Post-v0.7.4 audit hardening. The report schema and tool version are unchanged;
-untagged production builds remain identified by `tool.build_commit`.
+No changes yet.
+
+## v0.7.5 - 2026-07-19
+
+Post-v0.7.4 audit hardening. The report contract is schema v4 because
+`applicable` now has a deliberately narrower negative-coverage meaning; the
+tool version is 0.7.5 and production builds remain identified by
+`tool.build_commit`.
 
 - Unified-log analysis now validates complete tracev3 framing, catalog offset
   ordering, nested counts, and exact catalog-body consumption before exposing
@@ -19,12 +25,30 @@ untagged production builds remain identified by `tool.build_commit`.
   versa) while preserving the raw observed path and published IOC in evidence.
   The unusual-location heuristic likewise treats `/var/...` like
   `/private/var/...` without broadening its intentionally narrow path set.
+- The `roleaccountd.staging/exec/<number>.<number>.xpc/` heuristic exception is
+  limited to the exact reviewed `com.apple.NRD.UpdateBrainService` leaf. Other
+  leaves, Apple-looking variants, case changes, and deeper shapes remain
+  suspicious; `/var` and `/private/var` spellings stay equivalent.
 - A hard background-worker failure remains reportless and replaces the Worker;
   if that replacement cannot initialize, an explicit retry stays fail-closed
   instead of replaying the archive on the main page. Provenance links render as
   anchors only for absolute HTTPS URLs.
 - Release WASM no longer installs the verbose debug panic hook. Dead crash-kind
   handling, missing-path wording, and binary-size units were also corrected.
+- Indicator applicability now measures reviewed negative coverage for the
+  process-bearing evidence Trace actually observes. The current snapshots load
+  2,887 extracted indicators but only 89 applicable indicators: 83 process
+  names and six reviewed process-image paths. Other safe file-name and file-path
+  indicators remain available for exact positive matches, but no longer
+  overstate what a no-match process scan checked.
+- Report schema v4 makes that changed applicability meaning explicit instead
+  of silently reinterpreting historical schema-v3 reports from v0.7.4 and
+  earlier.
+- The browser now requires the exact ordered eight-set IOC roster and verifies
+  a reviewed SHA-256 pin for every bundled snapshot before enabling a scan.
+  CI continues to require exact extraction/applicability counts and one malware
+  object per set, so content substitution, roster drift, and count drift each
+  fail closed.
 - iOS stack inventories now accept key-consistent signed PIDs and narrowly
   recognize Apple's exact type-1, five-field, fully terminating anonymous task
   rows. Those tombstones are counted and surfaced as informational notes but
@@ -35,6 +59,11 @@ untagged production builds remain identified by `tool.build_commit`.
   lost process identity. UUID/path caps still make a scan inconclusive, while a
   long-lived binary exceeding the per-process PID sample retains full IOC
   matching coverage and discloses the dropped sample count.
+- Production verification now retries the complete served-build invariant set
+  during cache propagation: the commit-bearing service worker, security
+  headers, every scanner asset it persists (including JS, WASM, fixtures,
+  manifest, and IOC bytes), and the schema's identifier and version must all
+  agree with the validated artifact before deployment is accepted.
 
 ## v0.7.4 - 2026-07-17
 

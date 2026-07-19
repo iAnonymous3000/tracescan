@@ -1129,6 +1129,27 @@ mod tests {
     }
 
     #[test]
+    fn kernel_panic_unknown_roleaccount_workspace_executable_is_suspicious() {
+        let panic = r#"{"name":"kernel","bug_type":"210"}
+{"panicString":"pid 2143: implant ran from /private/var/db/com.apple.xpc.roleaccountd.staging/exec/16777224.1.xpc/implant"}"#;
+        let mut findings = Findings::new();
+        analyze(
+            "root/crashes_and_spins/Panics/panic-full-2026-07-06.ips",
+            panic,
+            &IocDb::new(),
+            &mut findings,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Suspicious)
+                .count(),
+            1,
+            "a valid-shaped numeric workspace must not downgrade an unrecognized executable"
+        );
+    }
+
+    #[test]
     fn file_path_indicator_matches_full_proc_path() {
         let mut db = IocDb::new();
         db.load_stix(

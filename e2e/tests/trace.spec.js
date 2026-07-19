@@ -5,6 +5,14 @@ const { test, expect } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
 
+const BUNDLED_IOC_MANIFEST = path.join(__dirname, '../../web/iocs/manifest.json');
+const CORUNA_IOC = path.join(__dirname, '../../web/iocs/coruna.stix2');
+const EMPTY_BUNDLE_SHA256 = '736520c9db846d6eb9b018e064d7db14c108b04d27d92032fe34dd4a34710741';
+
+function readBundledIocManifest() {
+  return JSON.parse(fs.readFileSync(BUNDLED_IOC_MANIFEST, 'utf8'));
+}
+
 // Builds a minimal ustar archive in the page and hands it to the same
 // handleFile the drop zone uses. Used for inputs no fixture should ship.
 const buildTarInPage = ([entryCount]) => {
@@ -91,6 +99,46 @@ test('clean demo produces the clear verdict', async ({ page }) => {
     return Boolean(actions && firstDetail
       && (actions.compareDocumentPosition(firstDetail) & Node.DOCUMENT_POSITION_FOLLOWING));
   })).toBe(true);
+});
+
+test('opt-in real capture passes through the browser UI', async ({ page, browserName }) => {
+  const capture = process.env.TRACE_REAL_SYSDIAGNOSE;
+  test.skip(!capture, 'set TRACE_REAL_SYSDIAGNOSE to a local sysdiagnose archive');
+  test.skip(browserName !== 'chromium', 'one Chromium run is sufficient for this private release gate');
+  if (!fs.existsSync(capture)) throw new Error(`real capture does not exist: ${capture}`);
+
+  await page.goto('/');
+  await page.waitForFunction(() => window.__trace?.ready === true, null, { timeout: 30_000 });
+  await page.locator('#file-input').setInputFiles(capture);
+  await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 180_000 });
+
+  const summary = await page.evaluate(() => {
+    const report = window.__trace.lastReport;
+    const unified = report.artifacts.find((artifact) => artifact.kind === 'unified_log');
+    return {
+      verdict: report.verdict,
+      scanLimits: report.scan_limits,
+      missingArtifacts: report.missing_artifacts,
+      applicable: report.stats.applicable_indicators,
+      nonNoteFindings: report.findings.filter((finding) => finding.severity !== 'note').length,
+      unifiedStatus: unified?.status,
+      tracev3Failures: unified?.details?.tracev3_parse_failures,
+      resolvedProcesses: unified?.details?.processes_resolved_to_path,
+      seenProcesses: unified?.details?.processes_seen,
+    };
+  });
+  expect(summary).toMatchObject({
+    verdict: 'clear',
+    scanLimits: [],
+    missingArtifacts: [],
+    applicable: 89,
+    nonNoteFindings: 0,
+    unifiedStatus: 'parsed',
+    tracev3Failures: 0,
+  });
+  expect(summary.seenProcesses).toBeGreaterThan(50);
+  expect(summary.resolvedProcesses * 100)
+    .toBeGreaterThanOrEqual(summary.seenProcesses * 80);
 });
 
 test('a paired-device-only clear report describes its narrow evidence without saying only 0', async ({ page }) => {
@@ -359,7 +407,7 @@ test('withholding device metadata strips it from technical details and evidence 
   const result = await page.evaluate(async ({ os, ts }) => {
     const { readableReportDocument } = await import('./readable-report.js');
     const report = {
-      schema_version: 3,
+      schema_version: 4,
       verdict: 'clear',
       generated_at: '2026-07-17T00:00:00.000Z',
       tool: { name: 'Trace', version: '0.7.3', build_commit: null },
@@ -453,7 +501,7 @@ test('readable provenance reports partial and zero-applicable campaign coverage'
       indicator_sets: [
         {
           name: 'pegasus', campaign: 'Pegasus (NSO Group)',
-          extracted: 1549, applicable: 82,
+          extracted: 1549, applicable: 81,
         },
         {
           name: 'wintego_helios', campaign: 'Wintego Helios',
@@ -487,14 +535,17 @@ test('readable provenance reports partial and zero-applicable campaign coverage'
   });
 
   expect(result.headers).toEqual([
-    'Campaign', 'Applicable to current matching', 'Snapshot date', 'Indicator SHA-256',
+    'Campaign', 'Applicable to negative process coverage', 'Snapshot date', 'Indicator SHA-256',
   ]);
   expect(result.rows).toEqual([
     ['Wintego Helios', '0 of 175', '2024-05-02', 'b'.repeat(64)],
-    ['Pegasus (NSO Group)', '82 of 1549', '2021-07-18', 'a'.repeat(64)],
+    ['Pegasus (NSO Group)', '81 of 1549', '2021-07-18', 'a'.repeat(64)],
   ]);
   expect(result.note).toContain(
-    'A count of 0 means none are classified as applicable'
+    'file-name and file-path indicators can still produce exact positive matches'
+  );
+  expect(result.note).toContain(
+    'A count of 0 means this set contributes no reviewed negative process coverage'
   );
 });
 
@@ -723,10 +774,57 @@ test.describe('scanner readiness and optional freshness', () => {
     await expect(page.locator('#dropzone')).toHaveAttribute('aria-disabled', 'true');
 
     await expect(page.locator('#scanner-status')).toHaveClass(/ready/, { timeout: 30_000 });
-    await expect(page.locator('#scanner-status')).toContainText('passed their integrity floors');
+    await expect(page.locator('#scanner-status')).toContainText('passed their integrity checks');
     await expect(page.locator('#demo-clean')).toBeEnabled();
     await expect(page.locator('#file-input')).toBeEnabled();
     await expect(page.locator('#dropzone')).toHaveAttribute('aria-disabled', 'false');
+  });
+
+  test('an invalid bundled roster is rejected before any indicator set is fetched', async ({ page }) => {
+    let bundleRequests = 0;
+    await page.route('**/iocs/*.stix2', async (route) => {
+      bundleRequests += 1;
+      await route.continue();
+    });
+    await page.route('**/iocs/manifest.json', (route) => {
+      const manifest = readBundledIocManifest();
+      [manifest.sets[0], manifest.sets[1]] = [manifest.sets[1], manifest.sets[0]];
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(manifest),
+      });
+    });
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+
+    await expect(page.locator('#scanner-status')).toHaveClass(/error/, { timeout: 30_000 });
+    await expect(page.locator('#scanner-status')).toContainText(
+      'bundled indicator manifest failed its reviewed roster and SHA-256 pin check'
+    );
+    expect(bundleRequests).toBe(0);
+    expect(await page.evaluate(() => window.__trace.ready)).toBe(false);
+    await expect(page.locator('#demo-clean')).toBeDisabled();
+    await expect(page.locator('#file-input')).toBeDisabled();
+  });
+
+  test('a bundled indicator SHA-256 mismatch disables scanning', async ({ page }) => {
+    await page.route('**/iocs/coruna.stix2', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: `${fs.readFileSync(CORUNA_IOC, 'utf8')}\n`,
+    }));
+    await page.route('https://raw.githubusercontent.com/**', (route) => route.abort());
+    await page.goto('/');
+
+    await expect(page.locator('#scanner-status')).toHaveClass(/error/, { timeout: 30_000 });
+    await expect(page.locator('#scanner-status')).toContainText(
+      'Bundled indicator set "coruna" failed its reviewed SHA-256 check'
+    );
+    expect(await page.evaluate(() => window.__trace.ready)).toBe(false);
+    await expect(page.locator('#demo-clean')).toBeDisabled();
+    await expect(page.locator('#demo-infected')).toBeDisabled();
+    await expect(page.locator('#file-input')).toBeDisabled();
   });
 
   test('slow optional upstream requests do not delay scanning', async ({ page }) => {
@@ -861,6 +959,15 @@ test.describe('upstream indicator interception', () => {
   });
 
   test('a bundled indicator set below its reviewed floor disables scanning', async ({ page }) => {
+    await page.route('**/iocs/manifest.json', (route) => {
+      const manifest = readBundledIocManifest();
+      manifest.sets.find((set) => set.name === 'coruna').sha256 = EMPTY_BUNDLE_SHA256;
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(manifest),
+      });
+    });
     await page.route('**/iocs/coruna.stix2', (route) =>
       route.fulfill({
         status: 200,
@@ -1434,7 +1541,7 @@ test.describe('worker failure boundaries', () => {
               type: 'report',
               id: message.id,
               report: {
-                schema_version: 3,
+                schema_version: 4,
                 tool: { name: 'Trace' },
                 verdict: 'clear',
                 scanned_via: 'worker',
@@ -1581,7 +1688,7 @@ test.describe('worker failure boundaries', () => {
     expect(proxyState.mutations.map((entry) => entry.variant)).toEqual(variants);
     for (const entry of proxyState.mutations) {
       expect(entry.originalVerdict, entry.variant).toBe('clear');
-      expect(entry.originalSchema, entry.variant).toBe(3);
+      expect(entry.originalSchema, entry.variant).toBe(4);
       expect(entry.originalSha256, entry.variant).toMatch(/^[0-9a-f]{64}$/);
     }
   });
@@ -2100,18 +2207,18 @@ test('scanning still works fully offline once the app is cached', async ({ page,
   await expect(page.locator('.verdict.clear')).toBeVisible({ timeout: 30_000 });
   const schema = await page.evaluate(async () =>
     (await fetch('./report.schema.json')).json());
-  expect(schema.properties.schema_version.const).toBe(3);
+  expect(schema.properties.schema_version.const).toBe(4);
   // offline means the live refresh failed and bundled snapshots were used
   await expect(page.locator('#ioc-list')).toContainText('snapshot');
   await context.setOffline(false);
 });
 
-// Report v3 producer parity: the worker and inline producers must emit the
+// Report v4 producer parity: the worker and inline producers must emit the
 // exact field shape pinned by the Rust golden (which the native producer is
-// held to in crates/trace-core/tests/report_v3.rs). Same flattening rules
+// held to in crates/trace-core/tests/report_v4.rs). Same flattening rules
 // as that test: array indices normalize to [], and paths whose contents
 // legitimately vary (evidence, details, by_kind) are opaque leaves.
-const GOLDEN_FIELDS = path.join(__dirname, '../../crates/trace-core/tests/report_fields_v3.json');
+const GOLDEN_FIELDS = path.join(__dirname, '../../crates/trace-core/tests/report_fields_v4.json');
 const OPAQUE_PATHS = new Set(['/findings[]/evidence', '/artifacts[]/details', '/indicator_sets[]/by_kind']);
 
 function fieldPaths(v, prefix, out) {
@@ -2148,7 +2255,7 @@ test('worker and inline producers emit the golden report shape', async ({ page }
   expect(workerReport.scanned_via).toBe('worker');
   expect(inlineReport.scanned_via).toBe('inline');
   for (const [producer, report] of [['worker', workerReport], ['inline', inlineReport]]) {
-    expect(report.schema_version).toBe(3);
+    expect(report.schema_version).toBe(4);
     const got = new Set();
     fieldPaths(report, '', got);
     const missing = [...golden].filter((p) => !got.has(p));
@@ -2171,7 +2278,7 @@ test('the report schema is served at its declared $id path', async ({ page }) =>
   const schema = await page.evaluate(async () =>
     (await fetch('./report.schema.json')).json());
   expect(schema.$id).toBe('https://tracescan.pages.dev/report.schema.json');
-  expect(schema.properties.schema_version.const).toBe(3);
+  expect(schema.properties.schema_version.const).toBe(4);
 });
 
 test('nullable source metadata renders as unavailable, never as null', async ({ page }) => {

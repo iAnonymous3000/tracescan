@@ -29,8 +29,6 @@ pub struct Scanner {
 impl Scanner {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Scanner {
-        #[cfg(debug_assertions)]
-        console_error_panic_hook::set_once();
         #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
         let mut inner = engine::Engine::new();
         // The engine measures scan duration itself (the expensive work is

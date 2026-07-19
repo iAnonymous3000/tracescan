@@ -24,24 +24,76 @@ jobs:
       - name: Fetch latest published indicator sets
         run: |
           set -euo pipefail
+          manifest=web/iocs/manifest.json
+          jq -e '
+            (.sets | type == "array" and length > 0)
+            and all(.sets[];
+              ((.name | type) == "string" and (.name | length) > 0)
+              and ((.file | type) == "string" and (.file | length) > 0)
+              and ((.url | type) == "string" and (.url | length) > 0)
+              and ((.min_indicators | type) == "number"
+                and .min_indicators >= 0
+                and (.min_indicators | floor) == .min_indicators)
+              and ((.min_applicable | type) == "number"
+                and .min_applicable >= 0
+                and (.min_applicable | floor) == .min_applicable)
+            )
+            and (([.sets[].name] | length) == ([.sets[].name] | unique | length))
+            and (([.sets[].file] | length) == ([.sets[].file] | unique | length))
+          ' "$manifest" > /dev/null
+          reviewed_floors=$(jq -c \
+            '[.sets[] | {name, min_indicators, min_applicable}]' "$manifest")
           changed=0
-          for row in $(jq -r '.sets[] | @base64' web/iocs/manifest.json); do
-            url=$(echo "$row" | base64 -d | jq -r .url)
-            file=$(echo "$row" | base64 -d | jq -r .file)
+          while IFS= read -r row; do
+            name=$(jq -r .name <<< "$row")
+            url=$(jq -r .url <<< "$row")
+            file=$(jq -r .file <<< "$row")
             curl -fsSL --max-time 60 "$url" -o /tmp/new.stix2
             # Refuse anything the scanner would reject: it must be JSON and
             # must carry the STIX objects array (same check the app applies
             # to live fetches before trusting them).
             jq -e '.objects | type == "array"' /tmp/new.stix2 > /dev/null
+            sha256=$(sha256sum /tmp/new.stix2 | awk '{print $1}')
             if ! cmp -s /tmp/new.stix2 "web/$file"; then
               cp /tmp/new.stix2 "web/$file"
               changed=1
             fi
-          done
+            pinned_sha256=$(jq -r --arg name "$name" \
+              '.sets[] | select(.name == $name) | .sha256 // ""' "$manifest")
+            if [ "$sha256" != "$pinned_sha256" ]; then
+              jq --arg name "$name" --arg sha256 "$sha256" \
+                '(.sets[] | select(.name == $name) | .sha256) = $sha256' \
+                "$manifest" > /tmp/manifest.json
+              mv /tmp/manifest.json "$manifest"
+              changed=1
+            fi
+          done < <(jq -c '.sets[]' "$manifest")
+
+          # Snapshot automation may refresh bytes and their pins, but reviewed
+          # indicator floors only move in the resulting PR after human review.
+          test "$reviewed_floors" = "$(jq -c \
+            '[.sets[] | {name, min_indicators, min_applicable}]' "$manifest")"
+          jq -e '
+            all(.sets[];
+              ((.sha256 | type) == "string")
+              and (.sha256 | test("^[0-9a-f]{64}$"))
+            )
+          ' "$manifest" > /dev/null
           if [ "$changed" = 1 ]; then
-            jq --arg d "$(date -u +%F)" '.bundled_date = $d' web/iocs/manifest.json > /tmp/manifest.json
-            mv /tmp/manifest.json web/iocs/manifest.json
+            jq --arg d "$(date -u +%F)" '.bundled_date = $d' \
+              "$manifest" > /tmp/manifest.json
+            mv /tmp/manifest.json "$manifest"
           fi
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Recheck reviewed snapshot floors
+        id: floor_check
+        # Keep going long enough to open the review PR, then fail the refresh
+        # below so a count change cannot look like a successful update.
+        continue-on-error: true
+        run: cargo test --locked -p trace-core --test bundled_iocs
 
       - name: Open a PR if snapshots changed
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
@@ -50,11 +102,21 @@ jobs:
           title: Update bundled IOC snapshots
           commit-message: Update bundled IOC snapshots from upstream
           body: >
-            Automated refresh of the bundled STIX2 snapshots from
-            AmnestyTech/investigations. Review the indicator diff before
-            merging; merging redeploys the site with the new bundled floor.
-            If CI fails on `bundled_iocs`, an upstream set shrank below its
-            reviewed floor in `web/iocs/manifest.json` - verify the removal
-            is legitimate, then regenerate the floors with
-            `cargo run --example ioc_stats` and update the manifest in this
-            PR.
+            Automated refresh of the bundled STIX2 snapshots from their
+            reviewed upstream sources. The lowercase SHA-256 pin for each
+            fetched snapshot was regenerated automatically. The reviewed
+            `min_indicators` / `min_applicable` floors were intentionally
+            preserved and rechecked; review the indicator diff before
+            merging. The `bundled_iocs` check enforces the exact pins and
+            floors. If it fails because an upstream set's reviewed counts
+            changed, verify the additions or removals, regenerate the counts
+            with `cargo run --example ioc_stats`, then deliberately update both
+            the manifest floors and `REVIEWED_SETS` in
+            `crates/trace-core/tests/bundled_iocs.rs` in this PR. Merging
+            redeploys the site with the reviewed snapshots, pins, and counts.
+
+      - name: Require reviewed snapshot floors to match
+        if: steps.floor_check.outcome == 'failure'
+        run: |
+          echo "::error::Updated IOC snapshots do not match the reviewed contract. Review the opened PR and deliberately update both manifest floors and bundled_iocs.rs REVIEWED_SETS counts."
+          exit 1

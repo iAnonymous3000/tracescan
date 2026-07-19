@@ -5,7 +5,7 @@ receives a Trace JSON report and, when appropriate, the corresponding iPhone
 sysdiagnose archive. It is written so the same content can later be rendered as
 a static responder page without weakening its caveats.
 
-This guide applies only to Trace report schema version 3. For any other
+This guide applies only to Trace report schema version 4. For any other
 `schema_version`, do not extrapolate these instructions. Resolve the claimed
 source revision, inspect its checked-in schema, source, and changelog in an
 isolated review environment, and seek technical review.
@@ -117,8 +117,8 @@ of the scan was incomplete.
 | --- | --- | --- |
 | `match` | At least one observed process identity, executable basename, or canonical executable path matched a published indicator loaded for this scan. Names use exact, case-sensitive equality. Full file paths use exact, case-sensitive equality after treating Apple's `/var`, `/tmp`, and `/etc` aliases as equivalent to `/private/...`; a trailing-slash directory path matches descendants under the same comparison. Raw observed paths and published IOC values remain unchanged in evidence. A match can coexist with `scan_limits`; it is a serious signal, not final proof of compromise or attribution. | Preserve the phone, archive, and report; avoid wiping or updating the phone; review the matched indicator and provenance; escalate to a digital-security specialist. |
 | `suspicious` | No published-indicator match was found, but at least one anomaly documented in public spyware research was found. It can have a benign cause and can coexist with an incomplete scan. | Review the evidence in context. Escalate when the person's risk, other observations, or scan limits warrant it. |
-| `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a verdict-relevant limit; applicable indicators were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings and disclosed evidence-sampling limits may remain, and other supported surface types can still be absent. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
-| `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap that could hide detection evidence was hit, the archive was truncated or corrupt, or no applicable indicators were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
+| `clear` | At least one primary process-bearing iPhone detection surface was examined; every **present** supported artifact parsed without a verdict-relevant limit; process-observable indicators accepted by this build's negative-coverage policy were loaded; and no indicator-match or suspicious finding was found. Paired-only or metadata-only diagnostics cannot satisfy the primary-surface prerequisite. Informational `note` findings and disclosed evidence-sampling limits may remain, and other supported surface types can still be absent. The official browser additionally requires its reviewed, hash-pinned roster before scanning. | Treat it only as “no known traces in the artifacts examined.” Check missing surfaces and threat context before deciding whether to close or escalate. |
+| `inconclusive` | No match or suspicious finding was found, but parsing failed or was partial, a safety cap that could hide detection evidence was hit, the archive was truncated or corrupt, or no process-observable indicators accepted by this build's negative-coverage policy were loaded. | Read every `scan_limits` entry. Preserve the failed input, try one fresh capture when safe, and escalate if the problem repeats or risk is high. |
 | `invalid` | The input contained none of the supported artifacts needed to recognize it as a sysdiagnose. | Confirm that the correct, unmodified `sysdiagnose_….tar.gz` was selected. Do not describe this as a negative scan. |
 
 `assurance.complete` means that the recognizable input was processed without a
@@ -179,13 +179,21 @@ parse or match their contents. The report always discloses that exclusion in
 `coverage.not_examined`; their presence must never be described as checked
 evidence.
 
-The report's `stats.applicable_indicators` is the number of loaded process-name,
-file-name, and file-path indicators that this scanner could apply. File-name
-indicators use observed process identities and executable basenames. File-path
-indicators use only canonical observed executable paths, resolving the
-well-known Apple `/var`, `/tmp`, and `/etc` aliases to `/private/...` for
-comparison and using descendant matching for a trailing-slash directory
-indicator. A sysdiagnose does not provide a complete filesystem inventory.
+The report's `stats.applicable_indicators` is the number of loaded
+process-observable indicators accepted by that build's negative-coverage
+policy for a no-match process scan. In the official browser's current reviewed,
+hash-pinned snapshots that means 89 total: 83 process names and six reviewed
+process-image paths, not every syntactically safe file indicator. A native or
+custom report binds supplied indicator text by hash but does not attest that the
+source or its policy was reviewed.
+File-name indicators can still match observed process identities or executable
+basenames, and file-path indicators can still match canonical observed
+executable paths, resolving the well-known Apple `/var`, `/tmp`, and `/etc`
+aliases to `/private/...` for comparison and using descendant matching for a
+trailing-slash directory indicator. Such an exact positive match remains a
+`match` even when that indicator is not counted as applicable; a sysdiagnose
+does not provide a complete filesystem inventory, so it cannot establish the
+corresponding negative coverage.
 
 Trace does not currently examine, among other things:
 
@@ -304,8 +312,8 @@ import json, re
 with open("trace-report-2026-07-14.json", encoding="utf-8") as handle:
     report = json.load(handle)
 
-if report.get("schema_version") != 3:
-    raise SystemExit("This guide supports schema version 3 only")
+if report.get("schema_version") != 4:
+    raise SystemExit("This guide supports schema version 4 only")
 if report.get("tool", {}).get("name") != "Trace":
     raise SystemExit("Unexpected tool name")
 
@@ -359,7 +367,7 @@ if git cat-file -e "${commit}:web/report.schema.json" 2>/dev/null; then
 elif git cat-file -e "${commit}:docs/report.schema.json" 2>/dev/null; then
   schema_path=docs/report.schema.json
 else
-  echo "the claimed revision has no known schema-v3 contract path" >&2
+  echo "the claimed revision has no known schema-v4 contract path" >&2
   exit 1
 fi
 git show "${commit}:${schema_path}" > ../report.schema.pinned.json
@@ -468,13 +476,13 @@ This map explains how responders should use the top-level fields.
 
 | Field | Responder meaning |
 | --- | --- |
-| `schema_version` | Incompatible report-contract version; currently `3` |
+| `schema_version` | Incompatible report-contract version; currently `4`. v0.7.4 and earlier used schema v3, where applicability had the older broad-matchability meaning. |
 | `tool` | Tool name, package version, and exact build commit when recorded |
 | `verdict` | Engine-owned outcome described above |
 | `generated_at`, `duration_ms`, `scanned_via` | Nullable host/time/producer metadata; useful context, not evidence of authenticity |
 | `source_file` | Producer-supplied name plus engine-computed size and SHA-256 of every archive byte received |
 | `device` | Optional OS metadata derived from an artifact in the archive, including its source and sometimes a timestamp |
-| `indicator_sets` | Counts for every loaded STIX set, including how many indicators were applicable here |
+| `indicator_sets` | Counts for every loaded STIX set, including how many process-observable indicators the producing build accepted for negative process-scan coverage; other safe file indicators can still produce exact positive matches. Only the official browser's pinned roster carries Trace's reviewed-bundle claim. |
 | `indicator_provenance` | Source metadata and engine-computed SHA-256 for the exact loaded indicator text; `upstream` is informational only |
 | `artifacts` | Retained and processed artifacts plus the reduced unified-log summary, with parser status and details; artifacts dropped at a cap are disclosed through `scan_limits` rather than listed individually |
 | `missing_artifacts` | Primary detection surfaces unavailable to this scan and the consequence; a surface can be unavailable even when related metadata-only files exist |
@@ -484,7 +492,7 @@ This map explains how responders should use the top-level fields.
 | `assurance` | Processing completeness plus `absent`/`partial`/`complete` state for each of the four supported surfaces |
 | `coverage` | Plain-language lists of what this scan examined and did not examine, plus the non-cleanliness caveat |
 
-All top-level fields are required by schema version 3 except the content-derived
+All top-level fields are required by schema version 4 except the content-derived
 `device` field. A finding's `indicator` is present only for an indicator-backed
 match under the rules above. Producer metadata is retained as explicit `null`
 when unavailable.

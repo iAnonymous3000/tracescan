@@ -1,6 +1,9 @@
 import init, { Scanner } from './pkg/trace_core.js';
 import { readableReportDocument, readableReportFragment, esc } from './readable-report.js';
-import { meetsReviewedFloor } from './indicator-floor.js';
+import {
+  hasExpectedBundledSetRoster,
+  meetsReviewedFloor,
+} from './indicator-floor.js';
 import {
   isCompleteReportEnvelope,
   isNonnegativeInteger,
@@ -93,11 +96,12 @@ async function fetchTextWithTimeout(url, ms, maxBytes = UPSTREAM_BODY_LIMIT) {
 
 // Identifies the exact indicator revision a scan used; "live" plus a date is
 // not provenance. Null only in non-secure contexts, where subtle is absent.
-async function sha256hex(text) {
+async function sha256hex(value) {
   if (!globalThis.crypto?.subtle) return null;
+  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
   const digest = await globalThis.crypto.subtle.digest(
     'SHA-256',
-    new TextEncoder().encode(text)
+    bytes
   );
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
@@ -173,7 +177,7 @@ function backToLanding() {
   $('#results').replaceChildren();
   showSection('landing');
   if (state.indicatorsReady) {
-    setScannerStatus('ready', 'Scanner ready. Bundled, reviewed indicators passed their integrity floors.');
+    setScannerStatus('ready', 'Scanner ready. Bundled, reviewed indicators passed their integrity checks.');
   }
   $('#dropzone').focus();
 }
@@ -205,12 +209,36 @@ async function loadBundledIndicators() {
   // otherwise leave heuristically cached stale copies in play. In
   // production the service worker answers these before HTTP caching
   // matters, so this only costs a conditional request on first load.
-  const manifest = await (await fetch('./iocs/manifest.json', { cache: 'no-cache' })).json();
+  const manifestResponse = await fetch('./iocs/manifest.json', { cache: 'no-cache' });
+  if (!manifestResponse.ok) {
+    throw new Error(
+      `The bundled indicator manifest could not be loaded (HTTP ${manifestResponse.status}).`
+    );
+  }
+  const manifest = await manifestResponse.json();
+  if (!hasExpectedBundledSetRoster(manifest?.sets)) {
+    throw new Error(
+      'The bundled indicator manifest failed its reviewed roster and SHA-256 pin check.'
+    );
+  }
   state.stix = await Promise.all(manifest.sets.map(async (set) => {
-    const text = await (await fetch(set.file, { cache: 'no-cache' })).text();
-    const sha256 = await sha256hex(text);
+    const response = await fetch(set.file, { cache: 'no-cache' });
+    if (!response.ok) {
+      throw new Error(
+        `Bundled indicator set "${set.name}" could not be loaded (HTTP ${response.status}).`
+      );
+    }
+    const bytes = await response.arrayBuffer();
+    const sha256 = await sha256hex(bytes);
+    if (sha256 === null || sha256 !== set.sha256) {
+      throw new Error(
+        `Bundled indicator set "${set.name}" failed its reviewed SHA-256 check.`
+      );
+    }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     // Catalog metadata recorded as provenance in the report envelope; the
-    // engine hashes the set text itself, so nothing here is trusted.
+    // engine hashes the set text itself too, so the recorded identity is
+    // independently bound to the exact bytes verified here.
     const meta = {
       date: manifest.bundled_date, url: set.url, source: set.source,
       loaded_from: 'bundled', upstream: 'unknown',
@@ -290,7 +318,7 @@ function renderIocPanel() {
       <span><span class="campaign">${esc(s.stats.campaign)}</span>
         <span class="badge bundled">reviewed snapshot · ${esc(s.date)}</span>
         <span class="badge ${freshnessClass}">${freshnessLabel}</span></span>
-      <span class="meta">${s.stats.extracted} indicators, ${s.stats.applicable} checkable here · ${esc(s.source)}${s.sha256 ? ` · <code title="SHA-256 of the indicator file used: ${esc(s.sha256)}">sha256:${esc(s.sha256.slice(0, 12))}…</code>` : ''}</span>
+      <span class="meta">${s.stats.extracted} indicators, ${s.stats.applicable} reviewed for negative process coverage · ${esc(s.source)}${s.sha256 ? ` · <code title="SHA-256 of the indicator file used: ${esc(s.sha256)}">sha256:${esc(s.sha256.slice(0, 12))}…</code>` : ''}</span>
     </div>`;
   }).join('');
   $('#ioc-list').innerHTML = rows;
@@ -304,7 +332,7 @@ function renderIocPanel() {
       ? ` Upstream freshness is currently unknown for ${unknown} indicator set${unknown > 1 ? 's' : ''}; scans still use the dated, reviewed snapshots shown above.`
       : ' The published upstream files matched all reviewed snapshots at this check.';
   $('#ioc-note').textContent =
-    `${applicable} of ${total} loaded indicators are process names, file names, or paths that can be checked against process-bearing sysdiagnose evidence. File-name indicators check observed process basenames; file-path indicators check observed canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison (and matching descendants when an indicator is a directory ending in /). Trace does not inspect a filesystem listing. ` +
+    `${applicable} of ${total} loaded indicators establish reviewed negative coverage over the process identities Trace observes. Other safe file-name and file-path indicators remain available for exact positive matches against observed process basenames or canonical executable paths, treating Apple /var, /tmp, and /etc aliases as equivalent to /private/... for comparison (and matching descendants when an indicator is a directory ending in /). Trace does not inspect a filesystem listing, so those other file indicators cannot establish negative coverage. ` +
     `The rest are mostly domains, URLs and emails, which live in artifacts (browsing history, messages) found in device backups - this version does not read those, and results never imply they were checked.` +
     freshnessNote;
   $('#ioc-panel').hidden = false;
@@ -815,7 +843,7 @@ function verdictHtml(report) {
     : '';
   return `<div class="verdict clear">
     <h2>No known spyware traces found</h2>
-    <p>None of the ${applicable} applicable public indicators appeared in the artifacts this tool reads${noteCount ? `, though ${noteCount} informational note${noteCount > 1 ? 's are' : ' is'} listed below` : ''}.</p>
+    <p>No loaded public indicator matched in the artifacts this tool reads. ${applicable} reviewed process-observable indicators established the limited negative coverage for this process scan${noteCount ? `; ${noteCount} informational note${noteCount > 1 ? 's are' : ' is'} listed below` : ''}.</p>
     ${coverageNote}
     <p><strong>This is not the same as "your phone is clean."</strong> It means: no publicly documented implant left its known traces in these artifacts. Spyware that is new, undocumented, or leaves traces elsewhere would not appear here. If you face real risk, treat this as one data point and consider expert help - <a href="https://www.accessnow.org/help/" target="_blank" rel="noopener noreferrer">Access Now's helpline</a> is free.</p>
   </div>`;
@@ -1216,7 +1244,7 @@ function wireUi() {
         if (!$('#landing').hidden) {
           setScannerStatus(
             'ready',
-            'Scanner ready. Bundled, reviewed indicators passed their integrity floors.'
+            'Scanner ready. Bundled, reviewed indicators passed their integrity checks.'
           );
         }
       }
@@ -1259,7 +1287,7 @@ async function boot() {
     renderIocPanel();
     setScannerStatus(
       'ready',
-      'Scanner ready. Bundled, reviewed indicators passed their integrity floors.'
+      'Scanner ready. Bundled, reviewed indicators passed their integrity checks.'
     );
     // Optional public-feed freshness is advisory and may time out. It never
     // delays or disables scanning with the reviewed snapshots.

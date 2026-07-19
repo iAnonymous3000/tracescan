@@ -124,11 +124,15 @@ questions for an adopting organization.
   include scan data.
 - The Rust engine is the only verdict authority. Browser rendering must not
   re-derive or soften it.
-- A clear verdict requires recognizable evidence, loaded applicable
-  indicators, no indicator-match or suspicious finding, no parser degradation,
-  and no verdict-relevant resource or integrity limit. Bounded evidence
-  sampling that cannot hide an identity remains separately disclosed. Missing
-  surface types remain explicitly absent rather than implicitly examined.
+- A clear verdict requires recognizable evidence, process-observable indicators
+  accepted by the producing build's negative-coverage policy, no indicator-match
+  or suspicious finding, no parser degradation, and no verdict-relevant
+  resource or integrity limit. The official browser additionally requires its
+  reviewed, hash-pinned roster before scanning. Other safe file indicators can
+  still produce an exact positive match without inflating negative coverage.
+  Bounded evidence sampling that cannot hide an identity remains separately
+  disclosed. Missing surface types remain explicitly absent rather than
+  implicitly examined.
 - Every archive byte received by the engine contributes to
   `source_file.sha256`; the exact loaded text for each indicator set contributes
   to its `indicator_provenance[].sha256`.
@@ -276,12 +280,20 @@ The official browser's runtime matching uses committed, reviewed STIX
 snapshots. The engine hashes the exact loaded text into
 `indicator_provenance`; live upstream content is parsed only to detect a
 different plausible file and never replaces the snapshot. A difference is not
-proof that the upstream file is newer or safer. The browser rejects a bundled
-set below its reviewed floor, and CI requires exact reviewed
-indicator/applicable counts plus one malware object, so count regression or
-inflation cannot ship without an explicit reviewed metadata change. The native
-harness can be supplied explicit STIX paths; its provenance binds the report to
-the exact supplied text rather than asserting that the files were reviewed.
+proof that the upstream file is newer or safer. Before enabling a scan, the
+browser requires the exact ordered eight-set roster, verifies each set against
+its reviewed SHA-256 pin, and rejects a set below its reviewed floor. CI also
+requires the exact roster, hashes, reviewed extraction/applicability counts,
+and one malware object per set, so content substitution, roster drift, count
+regression, or count inflation cannot ship without an explicit reviewed change.
+For the official browser, applicability is deliberately limited to the reviewed
+process-observable negative-coverage policy; other safe file indicators remain
+exact-positive matchable but do not make a no-match process scan more
+conclusive. The engine's producer-neutral report field means
+“process-observable indicators accepted by this build's negative-coverage
+policy.” The native harness can be supplied explicit STIX paths; its provenance
+binds the report to the exact supplied text rather than asserting that either
+the files or the producing build's policy were reviewed.
 
 Repository or review compromise can still alter a snapshot, and correct
 snapshots can still be stale or incomplete. Most domain, URL, email, browsing,
@@ -302,8 +314,10 @@ independently prove that the served bytes match public source.
 In the official CI and deployment paths, `tool.build_commit` distinguishes
 builds of different checked-out commits even when the package version is
 unchanged. In a received report it remains an unsigned claim. Tags map releases
-to source, and deployment checks can confirm a served commit marker. Neither
-feature is a signature or a byte-for-byte reproducible-build attestation. An
+to source. The production workflow retries the complete served-build invariant
+set during cache propagation: commit marker, security headers, fixtures, and
+the schema's exact bytes, identity, and version must agree. Those checks still
+are not a signature or a byte-for-byte reproducible-build attestation. An
 adopting organization that requires this assurance needs an independently
 verified build/deployment path.
 
@@ -350,10 +364,10 @@ confidential channels.
   trust boundaries described above.
 - A report that public threat intelligence inherently lags reality is not by
   itself a repository vulnerability. Runtime influence from unreviewed live
-  data, a reviewed snapshot falling below the enforced floor, incomplete
-  snapshot loading that can still produce `clear`, or incorrect upstream-
-  comparison and provenance reporting can violate verdict integrity and remain
-  in scope.
+  data, a bundled roster or hash that bypasses its reviewed pin, a snapshot
+  falling below the enforced floor, incomplete snapshot loading that can still
+  produce `clear`, or incorrect upstream-comparison and provenance reporting
+  can violate verdict integrity and remain in scope.
 - The phone deliberately lying in its own diagnostics is an explicit evidence
   acquisition limitation. Trace remains responsible for describing it and for
   not overstating a negative result.
@@ -372,7 +386,7 @@ may be at risk.
   contents, or equivalent sensitive evidence to an unauthorized party for
   ordinary users.
 - A reachable parser, verdict, or findings-retention flaw reliably converts an
-  archive containing a known applicable indicator match into `clear` without
+  archive containing a known exact indicator match into `clear` without
   disclosing the failure.
 - A production/dependency/service-worker compromise persistently substitutes a
   scanner that exfiltrates files or fabricates reassuring results at scale.

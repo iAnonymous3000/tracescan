@@ -48,11 +48,15 @@ at a time and dropped after their durable process facts have been retained:
 3. At finalization, the two maps are joined by UUID. Correctness does not
    depend on tar member ordering: tracev3 observations and uuidtext mappings
    are both retained until the join.
-4. Each resolved path is checked against applicable indicators: exact,
-   case-sensitive process/file basenames and full paths, plus canonical
-   descendants of trailing-slash directory path indicators. Path heuristics are
-   applied separately. Report evidence includes the path, UUID, retained PID
-   sample, whether that sample was truncated, and catalog-appearance count.
+4. Each resolved path is checked against every indexed exact-positive
+   indicator: case-sensitive process/file basenames and full paths, plus
+   canonical descendants of trailing-slash directory path indicators. Only
+   process-observable values accepted by the producing build's policy
+   contribute to negative-result coverage; the official browser separately
+   requires its reviewed, hash-pinned roster before scanning;
+   path heuristics are applied separately. Report evidence includes the path,
+   UUID, retained PID sample, whether that sample was truncated, and
+   catalog-appearance count.
 
 The resulting `ArtifactSummary` reports file, catalog, process, resolution,
 failure, truncation, and conflict counts, plus retained PID/path-byte counts,

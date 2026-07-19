@@ -51,8 +51,11 @@ pub struct SetStats {
     /// Lexically ordered so report JSON is stable across processes and
     /// producers instead of inheriting `HashMap`'s randomized iteration order.
     pub by_kind: BTreeMap<String, usize>,
-    /// Indicators that can actually be checked against v1 artifacts
-    /// (process names, file names/paths). Domains, URLs, emails cannot.
+    /// Indicators that contribute to negative-result coverage over the
+    /// process-bearing artifacts Trace examines: process names plus reviewed
+    /// file paths known to name process images. Other safe file indicators
+    /// remain indexed for unexpected exact positive matches but cannot make a
+    /// no-match result more conclusive.
     pub applicable: usize,
 }
 
@@ -258,6 +261,30 @@ fn apple_alias_comparison_path(path: &str) -> Cow<'_, str> {
     Cow::Borrowed(path)
 }
 
+/// STIX `file:name` and `file:path` do not say whether a value names a process
+/// main image or an inert file-system artifact. Keep every syntactically safe
+/// value available for an exact positive match, but count only file paths
+/// explicitly reviewed as observable through Trace's process-bearing surfaces
+/// toward negative-result coverage.
+fn is_reviewed_process_observable_file(set_name: &str, kind: IocKind, value: &str) -> bool {
+    matches!(
+        (set_name, kind, value),
+        (
+            "predator",
+            IocKind::FilePath,
+            "/private/var/tmp/hooker"
+                | "/private/var/tmp/com.apple.WebKit.Networking"
+                | "/private/var/tmp/UserEventAgent"
+                | "/private/var/tmp/takePhoto"
+        ) | (
+            "kingspawn",
+            IocKind::FilePath,
+            "/private/var/db/com.apple.xpc.roleaccountd.staging/subridged"
+                | "/private/var/db/com.apple.xpc.roleaccountd.staging/PlugIns/fud.appex/"
+        )
+    )
+}
+
 impl IocDb {
     pub fn new() -> Self {
         IocDb::default()
@@ -336,9 +363,15 @@ impl IocDb {
 
             let idx = self.all.len();
             match kind {
-                IocKind::ProcessName | IocKind::FileName if !value.contains('/') => {
+                IocKind::ProcessName if !value.contains('/') => {
                     self.by_name.entry(value.clone()).or_default().push(idx);
                     stats.applicable += 1;
+                }
+                IocKind::FileName if !value.contains('/') => {
+                    self.by_name.entry(value.clone()).or_default().push(idx);
+                    if is_reviewed_process_observable_file(set_name, kind, &value) {
+                        stats.applicable += 1;
+                    }
                 }
                 // Slash-bearing values claim path structure, but name
                 // indicators can only be checked against an observed basename.
@@ -356,14 +389,18 @@ impl IocDb {
                 {
                     self.by_dir
                         .push((apple_alias_comparison_path(&value).into_owned(), idx));
-                    stats.applicable += 1;
+                    if is_reviewed_process_observable_file(set_name, kind, &value) {
+                        stats.applicable += 1;
+                    }
                 }
                 IocKind::FilePath if is_canonical_observed_path(&value) => {
                     self.by_path
                         .entry(apple_alias_comparison_path(&value).into_owned())
                         .or_default()
                         .push(idx);
-                    stats.applicable += 1;
+                    if is_reviewed_process_observable_file(set_name, kind, &value) {
+                        stats.applicable += 1;
+                    }
                 }
                 IocKind::FilePath => {}
                 _ => {}
@@ -486,7 +523,7 @@ mod tests {
         assert_eq!(stats.by_kind["process_name"], 2);
         assert_eq!(stats.by_kind["domain"], 1);
         assert_eq!(stats.by_kind["file_hash"], 1);
-        assert_eq!(stats.applicable, 3); // 2 process names + 1 file name
+        assert_eq!(stats.applicable, 2); // process-observable names accepted for negative coverage
     }
 
     #[test]
@@ -620,7 +657,7 @@ mod tests {
                 r#"{"objects":[{"type":"malware","name":"Predator"},{"type":"indicator","pattern":"[file:path='/private/var/tmp/l/']"}]}"#,
             )
             .unwrap();
-        assert_eq!(stats.applicable, 1);
+        assert_eq!(stats.applicable, 0);
         assert_eq!(db.match_process("/private/var/tmp/l/loader").len(), 1);
         assert_eq!(db.match_process("/private/var/tmp/l/a/b").len(), 1);
         assert_eq!(db.match_path("/private/var/tmp/l/loader").len(), 1);
@@ -868,7 +905,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.extracted, 5);
-        assert_eq!(stats.applicable, 4);
+        assert_eq!(stats.applicable, 1);
         assert!(db.match_path("/usr/bin/named").is_empty());
         assert!(db.match_path("/usr/bin/named-file").is_empty());
         assert_eq!(db.match_process("/usr/bin/named").len(), 1);
@@ -879,6 +916,68 @@ mod tests {
         assert_eq!(db.match_path("/private/var/tmp/l/loader").len(), 1);
         assert!(db.match_path("/private/var/tmp/l/../outside").is_empty());
         assert!(db.match_process("/private/var/tmp/l/../outside").is_empty());
+    }
+
+    #[test]
+    fn file_indicators_match_exactly_without_padding_negative_coverage() {
+        let mut db = IocDb::new();
+        let stats = db
+            .load_stix(
+                "custom",
+                r#"{"objects":[
+                    {"type":"indicator","pattern":"[file:name='unexpected-payload']"},
+                    {"type":"indicator","pattern":"[file:path='/private/var/tmp/unexpected-payload']"}
+                ]}"#,
+            )
+            .unwrap();
+
+        assert_eq!(stats.extracted, 2);
+        assert_eq!(stats.applicable, 0);
+        assert_eq!(db.match_process("unexpected-payload").len(), 1);
+        assert_eq!(
+            db.match_path("/private/var/tmp/unexpected-payload").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_policy_accepted_process_image_paths_count_toward_negative_coverage() {
+        let cases = [
+            ("predator", "/private/var/tmp/hooker"),
+            ("predator", "/private/var/tmp/com.apple.WebKit.Networking"),
+            ("predator", "/private/var/tmp/UserEventAgent"),
+            ("predator", "/private/var/tmp/takePhoto"),
+            (
+                "kingspawn",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/subridged",
+            ),
+            (
+                "kingspawn",
+                "/private/var/db/com.apple.xpc.roleaccountd.staging/PlugIns/fud.appex/",
+            ),
+        ];
+
+        for (set_name, path) in cases {
+            let mut db = IocDb::new();
+            let bundle = serde_json::json!({
+                "objects": [{
+                    "type": "indicator",
+                    "pattern": format!("[file:path='{path}']")
+                }]
+            })
+            .to_string();
+            let stats = db.load_stix(set_name, &bundle).unwrap();
+            assert_eq!(stats.applicable, 1, "{set_name}: {path}");
+        }
+
+        let mut db = IocDb::new();
+        let stats = db
+            .load_stix(
+                "predator",
+                r#"{"objects":[{"type":"indicator","pattern":"[file:path='/private/var/tmp/not-reviewed']"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(stats.applicable, 0);
     }
 
     #[test]

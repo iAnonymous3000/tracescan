@@ -47,8 +47,9 @@ identity/path safety cap is disclosed as incomplete and can never produce a
 does not lose the already-retained UUID/path identity, and the report discloses
 the dropped observations without falsely degrading detection coverage.
 
-The browser keeps file, drop, and demo controls disabled until WASM and every
-bundled indicator floor validate. A worker or streaming read can be cancelled
+The browser keeps file, drop, and demo controls disabled until WASM loads and
+validation succeeds for the exact ordered IOC roster, each snapshot's reviewed
+SHA-256, and every indicator floor. A worker or streaming read can be cancelled
 and its result discarded. The inline fallback's final WASM analysis is still a
 blocking operation; once it starts, the UI disables cancel and explains that
 limitation.
@@ -86,13 +87,15 @@ collection](https://github.com/mvt-project/mvt-indicators). The eight bundled
 campaign sets are Pegasus, Predator, KingSpawn (QuaDream), Operation
 Triangulation, RCS Lab, Wintego Helios, Coruna, and DarkSword.
 
-The snapshots dated 2026-07-08 contain 2,887 extracted indicators. Of those, 148
-are applicable to the process activity Trace observes: 83 process names, 15 file
-names, and 50 canonical file paths. The RCS Lab and Wintego Helios snapshots
-currently contribute no applicable process or file indicator, although their
-non-applicable indicators remain visible in per-set accounting. Each report
-records the actual counts and SHA-256 of every exact snapshot used, so report
-values take precedence over these dated README totals.
+The snapshots dated 2026-07-08 contain 2,887 extracted indicators. Of those, 89
+establish reviewed negative coverage for the process activity Trace observes:
+83 process names, no file names, and six reviewed process-image paths. Pegasus
+contributes 81, Predator 4, KingSpawn 3, and Operation Triangulation 1; RCS Lab,
+Wintego Helios, Coruna, and DarkSword contribute 0. Other safe file-name and
+file-path indicators remain available for exact positive matches, but they do
+not establish what a no-match process scan checked. Each report records the
+actual counts and SHA-256 of every exact snapshot used, so report values take
+precedence over these dated README totals.
 
 Matching is deliberately narrow:
 
@@ -109,13 +112,15 @@ Matching is deliberately narrow:
   `/etc` compatibility aliases to their `/private/...` forms; reports preserve
   the raw observed path and published IOC value. Directory-valued indicators
   with a trailing slash match descendants under the same comparison. Relative,
-  dot-segment, or slash-bearing name indicators remain in totals but are not
-  called checkable.
+  dot-segment, or slash-bearing name indicators remain in extraction totals but
+  are neither indexed for positive matching nor counted toward negative
+  coverage.
 - File-name indicators are compared with observed process identities and
   executable basenames. File-path indicators are compared only with canonical
-  observed executable paths under the alias rule above. A sysdiagnose is not a
-  filesystem inventory, so neither rule establishes that an arbitrary file
-  exists on disk.
+  observed executable paths under the alias rule above. These remain exact
+  positive-match rules even when the indicator is not counted toward reviewed
+  negative coverage. A sysdiagnose is not a filesystem inventory, so neither
+  rule establishes that an arbitrary file exists on disk.
 
 Most bundled indicators are domains, URLs, email addresses, hashes, or other
 values that these surfaces cannot evaluate. Trace v1 neither parses iPhone
@@ -127,13 +132,14 @@ The official browser scanner matches only against its committed snapshots.
 Live upstream data never reaches matching; optional upstream requests can
 report only that different, plausible content exists and needs review. A hash
 difference does not establish that content is newer or safer, and the
-comparison does not gate scanner readiness. The browser refuses a bundled set
-below its reviewed minimum, while CI requires every committed snapshot to match
-the exact reviewed indicator/applicable counts and contain one malware object.
-A scheduled workflow proposes upstream changes in a pull request each week; a
-human still has to review the content before it ships. The native harness can
-instead be given explicit STIX paths, and its report hashes the exact supplied
-text.
+comparison does not gate scanner readiness. The browser requires the exact
+ordered eight-set roster, verifies each committed snapshot against its reviewed
+SHA-256, and refuses a set below its reviewed minimum. CI independently requires
+the same roster and hashes, exact reviewed indicator/applicability counts, and
+one malware object per set. A scheduled workflow proposes upstream changes in a
+pull request each week; a human still has to review the content before it ships.
+The native harness can instead be given explicit STIX paths, and its report
+hashes the exact supplied text.
 
 ## Honest epistemics
 
@@ -217,7 +223,7 @@ Repository layout:
 
 - `crates/trace-core/` - streaming archive reader, artifact parsers, indicator
   matching, findings, report assembly, and the single Rust-owned verdict.
-- `web/report.schema.json` - report schema version 3. Browser worker, inline,
+- `web/report.schema.json` - report schema version 4. Browser worker, inline,
   and native producers emit the same envelope, enforced by Rust and browser
   golden-contract tests.
 - `web/` - framework-free static site, worker, service worker, styles,
@@ -238,9 +244,9 @@ pull request and every push to `main`.
 The active production path is Cloudflare Pages at `tracescan.pages.dev`.
 `.github/workflows/deploy-production.yml` deploys only a successful CI commit
 that is still the tip of `main`, embeds that commit in `tool.build_commit`, and
-verifies the service-worker marker, security headers, the deployed schema
-byte-for-byte plus its identity/version, and demo fixture availability after
-upload.
+retries the complete served-build invariant set during cache propagation: the
+service-worker marker, security headers, both demo fixtures, and the deployed
+schema byte-for-byte plus its identity/version must all agree after upload.
 
 Production safety also depends on external settings that source code cannot
 enforce. Operators must keep Cloudflare automatic production and preview builds
