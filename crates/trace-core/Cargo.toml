@@ -18,12 +18,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 regex-lite = "0.1"
 # Mandiant's unified-log parser; compiles to wasm32 unmodified. Used at
 # catalog level only (process inventory) - no message rendering, no dsc.
-macos-unifiedlogs = "0.6"
+macos-unifiedlogs = "0.7"
 sha2 = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 humantime = "2.4.0"
-jsonschema = "0.47.0"
+jsonschema = "0.52.0"
 proptest = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
